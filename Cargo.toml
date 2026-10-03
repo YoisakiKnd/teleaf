@@ -1,0 +1,30 @@
+[package]
+name = "teleaf"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight Telegram terminal client with inline media and mouse controls"
+repository = "https://github.com/YoisakiKnd/teleaf"
+
+[dependencies]
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+libloading = "0.8.9"
+serde_json = "1.0.151"
+base64 = "0.22.1"
+directories = "6.0.0"
+getrandom = "0.2.17"
+unicode-width = "0.2.2"
+unicode-segmentation = "1.13.3"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.183"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Time"] }

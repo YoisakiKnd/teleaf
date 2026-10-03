@@ -1,0 +1,12 @@
+{
+  "version": "1.8.61",
+  "release": "https://github.com/FedericoBruzzone/tdlib-rs/releases/download/v1.4.0",
+  "sha256": {
+    "macos-aarch64": "6600d1fbc6ebf7a3df669b9ae84d48265a28f3c7456a2b64cfd0327aceb88620",
+    "macos-x86_64": "2e96b32a8b92d86629b1f116f1e40fd2eed9e7373584cfd947304b90a07013a6",
+    "linux-aarch64": "1c9ef54dd34ca5a4053e22853aad763eda80b4188e5a2b22beaa1fa715efbc0a",
+    "linux-x86_64": "997069633f54306ada33776d2c4a530017d2e7325a22e0f12701d52438c37383",
+    "windows-aarch64": "ff37a0edc69c738d5b91bafea53a88983f97be4844b107f8b938f8fd4ff57559",
+    "windows-x86_64": "20f226518578b040028556bb862668f6802d16d3a5726df3dccb867dca4e9de1"
+  }
+}

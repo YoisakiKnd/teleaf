@@ -1,0 +1,105 @@
+name: Release packages
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: macos-aarch64
+          - runner: macos-15-intel
+            platform: macos-x86_64
+          - runner: ubuntu-24.04
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-aarch64
+          - runner: windows-2022
+            platform: windows-x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Linux packaging tools and TDLib runtime dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y patchelf libc++1-18 libc++abi1-18 libssl3t64
+      - name: macOS runtime dependencies
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+      - name: Check, build and package
+        shell: bash
+        env:
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+          MACOSX_DEPLOYMENT_TARGET: '15.0'
+        run: |
+          cargo fmt --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo build --locked --release
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo 'Tag must match Cargo.toml version' >&2
+            exit 1
+          fi
+          binary=target/release/teleaf
+          if [[ "$RUNNER_OS" == Windows ]]; then binary="$binary.exe"; fi
+          python scripts/package-release.py --binary "$binary" --platform "$RELEASE_PLATFORM" --version "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: target/dist/*
+          if-no-files-found: error
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: target/dist
+          merge-multiple: true
+      - name: Generate package manifests from release assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 scripts/generate-packages.py --repository "$GITHUB_REPOSITORY" --version "${RELEASE_TAG#v}" --assets target/dist --output target/packages
+          cp target/packages/Formula/teleaf.rb target/dist/teleaf.rb
+          cp target/packages/bucket/teleaf.json target/dist/teleaf.json
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          args=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then args+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" target/dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "${args[@]}"
+      - name: Update Homebrew tap and Scoop bucket in this repository
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          mkdir -p Formula bucket
+          cp target/packages/Formula/teleaf.rb Formula/teleaf.rb
+          cp target/packages/bucket/teleaf.json bucket/teleaf.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/teleaf.rb bucket/teleaf.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update Teleaf package manifests'
+            git push origin HEAD
+          fi

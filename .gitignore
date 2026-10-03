@@ -1,0 +1,9 @@
+/target/
+/data/
+/downloads/
+*.log
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.DS_Store
