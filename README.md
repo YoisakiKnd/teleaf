@@ -25,9 +25,19 @@ teleaf
 **Windows x64（Scoop）：**
 
 ```powershell
-scoop bucket add teleaf https://github.com/YoisakiKnd/teleaf
+scoop bucket add teleaf https://github.com/YoisakiKnd/scoop-teleaf
 scoop install teleaf/teleaf
 teleaf
+```
+
+Scoop 使用独立的轻量仓库 [scoop-teleaf](https://github.com/YoisakiKnd/scoop-teleaf)，添加 bucket 时只克隆安装清单、说明和更新脚本；安装包仍从主仓库的 Release 下载。它每小时检查稳定版并同步清单，GitHub 定时任务可能延迟，也可以手动运行同步。
+
+如果已添加旧的主源码仓库作为 `teleaf` bucket，请执行以下命令切换，无需卸载程序或重新登录：
+
+```powershell
+scoop bucket rm teleaf
+scoop bucket add teleaf https://github.com/YoisakiKnd/scoop-teleaf
+scoop update teleaf
 ```
 
 升级使用 `brew upgrade teleaf`，或 `scoop update` 后 `scoop update teleaf`。预编译包随附 TDLib、OpenSSL 及所需的非系统运行库，用户无需安装 Rust、Python、CMake，也无需单独编译 TDLib。首批发布目标是 macOS 15+（Apple Silicon / Intel）、Linux glibc（Ubuntu 24.04+，x64 / ARM64）及 Windows 10/11 x64；Alpine/musl 和 Windows ARM64 预编译包暂不在发布矩阵中。

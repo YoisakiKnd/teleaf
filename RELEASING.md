@@ -8,9 +8,11 @@
 2. 在 Actions 页面手动运行 **Release packages**，先检查五个平台能否构建和加载 TDLib。手动运行只生成 Actions artifacts，不发布 Release 或修改包清单。
 3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.0`。标签必须与 Cargo 版本完全一致。
 4. 标签触发构建、运行库打包和加载检查；全部成功后创建 GitHub Release，发布各平台压缩包、SHA-256、Homebrew 配方和 Scoop 清单。
-5. 发布任务将生成的 `Formula/teleaf.rb` 和 `bucket/teleaf.json` 提交到默认分支。同一个仓库同时充当显式 URL 的 Homebrew tap 和 Scoop bucket，无需另外创建两个仓库。
+5. 发布任务将生成的 `Formula/teleaf.rb` 提交到主仓库默认分支；主仓库仍充当显式 URL 的 Homebrew tap。独立的 [scoop-teleaf](https://github.com/YoisakiKnd/scoop-teleaf) 仓库每小时读取主仓库的最新稳定 Release，核对 Windows 安装包 URL、`SHA256SUMS` 和 GitHub 资产哈希，再将 Release 附带的 `teleaf.json` 提交为 `bucket/teleaf.json`。Scoop 用户无需克隆主项目源码。
 
-常规使用仓库内的 `GITHUB_TOKEN`，无需个人访问令牌。默认分支需要允许 Actions 提交这两份清单；如果分支保护拒绝自动推送，Release 仍已生成，可以将 Release 附带的 `teleaf.rb` 和 `teleaf.json` 分别提交到 `Formula/` 和 `bucket/` 后再使用包管理器安装。
+两个仓库分别使用自己的 `GITHUB_TOKEN` 写入本仓库，无需个人访问令牌或跨仓库推送权限。默认分支需要允许 Actions 提交清单；如果分支保护拒绝自动推送，Release 仍已生成，可以将附带的 `teleaf.rb` 提交到主仓库的 `Formula/`，将 `teleaf.json` 提交到 Scoop 仓库的 `bucket/`。
+
+GitHub 定时任务可能延迟，长期无活动的公开仓库也可能被停用定时任务。需要立即同步或重新启用时，在 Scoop 仓库的 **Actions → Sync Teleaf release → Run workflow** 手动运行。同步失败会保留上一次的清单，不覆盖为未经校验的数据。
 
 带 `-` 的版本标签作为 prerelease 发布，不更新默认分支上的稳定安装清单。包清单和 SHA256SUMS 始终从该次实际构建产物生成，源码中不写虚假的哈希或尚不存在的仓库 URL。
 
@@ -25,7 +27,7 @@ teleaf --check
 ```
 
 ```powershell
-scoop bucket add teleaf https://github.com/YoisakiKnd/teleaf
+scoop bucket add teleaf https://github.com/YoisakiKnd/scoop-teleaf
 scoop install teleaf/teleaf
 teleaf --check
 ```
