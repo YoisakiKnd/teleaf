@@ -22,6 +22,8 @@ jobs:
           - runner: windows-2022
             platform: windows-x86_64
     runs-on: ${{ matrix.runner }}
+    env:
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,6 +47,7 @@ jobs:
           cargo fmt --check
           cargo test --locked
           cargo clippy --locked --all-targets -- -D warnings
+          python scripts/test-packaging.py
           cargo build --locked --release
           version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then

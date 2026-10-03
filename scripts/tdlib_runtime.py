@@ -4,13 +4,21 @@ import json
 import os
 import platform
 import re
+import sys
 import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
-METADATA = json.loads((ROOT / 'packaging/tdlib.json').read_text())
+METADATA = json.loads((ROOT / 'packaging/tdlib.json').read_text(encoding='utf-8'))
+
+
+def configure_console():
+    """Windows pipes may default to CP1252 even when logs contain Chinese."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='backslashreplace')
 
 
 def current_platform():

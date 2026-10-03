@@ -3,8 +3,9 @@
 import argparse
 import sys
 from pathlib import Path
-from tdlib_runtime import ROOT, METADATA, install
+from tdlib_runtime import ROOT, METADATA, configure_console, install
 
+configure_console()
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--dest', type=Path, default=ROOT / 'target/tdlib')
 parser.add_argument('--platform', choices=METADATA['sha256'])

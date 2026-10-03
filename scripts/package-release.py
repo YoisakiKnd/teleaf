@@ -10,7 +10,7 @@ import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
-from tdlib_runtime import ROOT, METADATA, checksum, current_platform, install
+from tdlib_runtime import ROOT, METADATA, checksum, configure_console, current_platform, install
 
 
 def command(*args):
@@ -122,12 +122,13 @@ def package(binary, name, version, output, archive=None):
         extension = 'zip' if name.startswith('windows-') else 'tar.gz'
         result = output / f'teleaf-{version}-{name}.{extension}'
         write_archive(staging, result)
-    result.with_name(result.name + '.sha256').write_text(f'{checksum(result)}  {result.name}\n')
+    result.with_name(result.name + '.sha256').write_text(f'{checksum(result)}  {result.name}\n', encoding='utf-8')
     print(result)
     return result
 
 
 if __name__ == '__main__':
+    configure_console()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--platform', choices=METADATA['sha256'], default=current_platform())

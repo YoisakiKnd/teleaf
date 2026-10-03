@@ -2,8 +2,10 @@
 """Offline packaging tests: verified extraction, platform manifests and archive layout."""
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -25,6 +27,48 @@ release = module('package-release')
 
 
 class PackagingTests(unittest.TestCase):
+    def test_installer_reports_errors_with_legacy_console_encoding(self):
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Path(folder) / 'bad.zip'
+            archive.write_bytes(b'not a verified runtime')
+            environment = dict(os.environ, PYTHONIOENCODING='cp1252', PYTHONUTF8='0')
+            result = subprocess.run(
+                [sys.executable, str(ROOT / 'scripts/install-tdlib.py'),
+                 '--platform', 'windows-x86_64', '--archive', str(archive),
+                 '--dest', str(Path(folder) / 'runtime')],
+                env=environment, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('TDLib 安装失败', result.stderr.decode('utf-8'))
+            self.assertNotIn(b'UnicodeEncodeError', result.stderr)
+            self.assertFalse((Path(folder) / 'runtime').exists())
+
+    def test_download_handles_legacy_console_encoding(self):
+        # Reproduce the Windows CI pipe encoding with an offline download fixture.
+        code = '''
+import hashlib, io, sys, tempfile, zipfile
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+import tdlib_runtime
+data = io.BytesIO()
+with zipfile.ZipFile(data, 'w') as z:
+    z.writestr('tdlib/bin/tdjson.dll', b'runtime')
+payload = data.getvalue()
+tdlib_runtime.METADATA['sha256']['windows-x86_64'] = hashlib.sha256(payload).hexdigest()
+tdlib_runtime.configure_console()
+with tempfile.TemporaryDirectory() as folder:
+    with patch('urllib.request.urlopen', return_value=io.BytesIO(payload)):
+        result = tdlib_runtime.install(Path(folder) / 'runtime', 'windows-x86_64', cache=Path(folder) / 'cache')
+        assert result.read_bytes() == b'runtime'
+'''
+        result = subprocess.run(
+            [sys.executable, '-c', code, str(ROOT / 'scripts/package-release.py')],
+            env=dict(os.environ, PYTHONIOENCODING='cp1252', PYTHONUTF8='0'), capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', errors='replace'))
+        self.assertIn('下载 TDLib', result.stdout.decode('utf-8'))
+
     def test_bad_checksum_never_replaces_existing_runtime(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
