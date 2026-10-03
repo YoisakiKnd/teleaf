@@ -6,7 +6,7 @@
 
 1. 使用 `YoisakiKnd/teleaf` 仓库，将当前源码连同 `.github/`、`packaging/` 和 `scripts/` 推送到默认分支。`target/`、本地账号数据和 `.env` 不提交。
 2. 在 Actions 页面手动运行 **Release packages**，先检查五个平台能否构建和加载 TDLib。手动运行只生成 Actions artifacts，不发布 Release 或修改包清单。
-3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.0`。标签必须与 Cargo 版本完全一致。
+3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.1`。标签必须与 Cargo 版本完全一致。
 4. 标签触发构建、运行库打包和加载检查；全部成功后创建 GitHub Release，发布各平台压缩包、SHA-256、Homebrew 配方和 Scoop 清单。
 5. 发布任务将生成的 `Formula/teleaf.rb` 提交到主仓库默认分支；主仓库仍充当显式 URL 的 Homebrew tap。独立的 [scoop-teleaf](https://github.com/YoisakiKnd/scoop-teleaf) 仓库每小时读取主仓库的最新稳定 Release，核对 Windows 安装包 URL、`SHA256SUMS` 和 GitHub 资产哈希，再将 Release 附带的 `teleaf.json` 提交为 `bucket/teleaf.json`。Scoop 用户无需克隆主项目源码。
 
@@ -27,13 +27,15 @@ GitHub 定时任务可能延迟，长期无活动的公开仓库也可能被停�
 
 `v0.1.0` 首次收录 PR：[Mythos-404/eimer#1](https://github.com/Mythos-404/eimer/pull/1)。
 
+`v0.1.1` 已发布并同步自有 bucket（提交 `8bbe829`）；eimer 更新 PR：[Mythos-404/eimer#2](https://github.com/Mythos-404/eimer/pull/2)，提交时等待维护者合并。两份清单与 Release 的 `teleaf.json` 相同，Windows ZIP 的 SHA-256 为 `6b390f50c6da83fcc76323add9ea2b3c83eac1d56c82e86a53c9a440b0cb411a`。Homebrew 配方由发布工作流同步（提交 `f4302e0`）。
+
 自有 bucket 自动同步；eimer 的更新 PR 使用发布者本机已登录的 GitHub CLI 提交。仓库内的 `GITHUB_TOKEN` 没有跨仓库推送权限，因此当前并未配置无人值守的跨仓库 PR 创建。需要该功能时可另行配置专用 GitHub App 或访问令牌。
 
 项目许可证为 MIT，清单使用 `license: MIT`。第三方运行库保留自己的许可文本。新的发布包自动包含根目录 `LICENSE`；`v0.1.0` 的既有安装包保持原始哈希，MIT 文本作为额外 Release 资产提供。
 
 ## 用户安装
 
-[v0.1.0](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.0)及安装清单已发布：
+[v0.1.1](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.1)及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/teleaf https://github.com/YoisakiKnd/teleaf
@@ -58,6 +60,7 @@ teleaf                       # Windows 为 teleaf.exe
    libtdjson.dylib / libtdjson.so / tdjson.dll
    OpenSSL、zlib、libc++ 等所需运行库
  LICENSES/
+ LICENSE
  README.md
 ```
 
@@ -73,7 +76,7 @@ TDLib 上游发布包固定为 tdlib-rs `v1.4.0` 中的 TDLib `1.8.61`，平台�
 
 ```sh
 cargo build --release --locked
-python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.0
+python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.1
 python3 scripts/test-packaging.py
 ```
 
@@ -84,14 +87,16 @@ Windows 的 binary 参数为 `target/release/teleaf.exe`，打包机需要 Visua
 五个平台的产物齐全后，可以独立生成包清单：
 
 ```sh
-python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.0 --assets target/dist --output target/packages
+python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.1 --assets target/dist --output target/packages
 ```
 
 输出真实配方、Scoop 清单和 SHA256SUMS。该命令拒绝缺失的平台产物和不合法的仓库/版本输入；生成器只写本地文件，不创建远程仓库或发布内容。
 
 ## 验证范围
 
-五个平台已通过[原生 CI 验证](https://github.com/YoisakiKnd/teleaf/actions/runs/37094100770)：97 项 Rust 单元测试、7 项打包测试、Clippy、Release 构建，以及暂存发布包的 `teleaf --check` 加载检查。Windows 初次打包因 Python CP1252 无法输出中文失败，已在脚本中显式使用 UTF-8，并加入旧编码环境下的下载和错误提示回归测试。
+`v0.1.1` 五个平台已通过[原生 CI 验证](https://github.com/YoisakiKnd/teleaf/actions/runs/37119341960)：101 项 Rust 单元测试、7 项打包测试、Clippy、Release 构建，以及暂存发布包的 `teleaf --check` 加载检查。Intel CI 的离线测试在生成 PNG 时触发一秒等待超时，改为有界的总截止时间后五平台通过；全部功能断言保留。Windows 首次发布时因 Python CP1252 无法输出中文失败，此前已显式使用 UTF-8，并加入旧编码环境下的下载和错误提示回归测试。
+
+已重新下载 `v0.1.1` 全部五个平台的实际归档，逐一核对 `SHA256SUMS`、GitHub 资产摘要、主程序、TDLib、项目 MIT LICENSE 和第三方许可；Scoop 清单与 Homebrew 配方的版本、URL 和哈希全部一致。macOS ARM64 发布包在项目目录外独立解压，`--version` 返回 `Teleaf 0.1.1`，`--check` 加载随附 TDLib 1.8.61，未创建账号配置。
 
 本地还验证了 macOS ARM64 归档、依赖重定位、解压后加载及模拟 Homebrew 的符号链接路径；正式发布的 macOS ARM64 包约 11.62 MiB，Homebrew 下载后的 SHA-256 和独立解压加载检查通过。更名后的离线快捷消息 PTY 回归通过，`--help` / `--version` / `--check` 未创建账号数据。
 
