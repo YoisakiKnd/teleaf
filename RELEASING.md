@@ -2,7 +2,7 @@
 
 仓库名和命令名使用 **teleaf**。名称结合 Telegram 与 leaf，强调轻量。Cargo 包、TUI 标题和安装命令已使用新名；账号数据目录保留 `tg-tui`，兼容已有登录。
 
-## 创建仓库后
+## 发布流程
 
 1. 使用 `YoisakiKnd/teleaf` 仓库，将当前源码连同 `.github/`、`packaging/` 和 `scripts/` 推送到默认分支。`target/`、本地账号数据和 `.env` 不提交。
 2. 在 Actions 页面手动运行 **Release packages**，先检查五个平台能否构建和加载 TDLib。手动运行只生成 Actions artifacts，不发布 Release 或修改包清单。
@@ -16,7 +16,7 @@
 
 ## 用户安装
 
-首个 Release 和清单发布后：
+[v0.1.0](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.0)及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/teleaf https://github.com/YoisakiKnd/teleaf
@@ -74,6 +74,10 @@ python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.
 
 ## 验证范围
 
-本地已验证 macOS ARM64 归档、依赖重定位、解压后加载及模拟 Homebrew 的符号链接路径，归档约 11.43 MiB。97 项 Rust 单元测试、5 项打包测试、Clippy、Windows 编译检查及更名后的离线快捷消息 PTY 回归通过。`--help` / `--version` / `--check` 未创建账号数据。Linux/Windows 的实际运行库加载、远程 Homebrew/Scoop 安装及 GitHub 发布流程尚待仓库创建后的 CI 验证。
+五个平台已通过[原生 CI 验证](https://github.com/YoisakiKnd/teleaf/actions/runs/37094100770)：97 项 Rust 单元测试、7 项打包测试、Clippy、Release 构建，以及暂存发布包的 `teleaf --check` 加载检查。Windows 初次打包因 Python CP1252 无法输出中文失败，已在脚本中显式使用 UTF-8，并加入旧编码环境下的下载和错误提示回归测试。
+
+本地还验证了 macOS ARM64 归档、依赖重定位、解压后加载及模拟 Homebrew 的符号链接路径；正式发布的 macOS ARM64 包约 11.62 MiB，Homebrew 下载后的 SHA-256 和独立解压加载检查通过。更名后的离线快捷消息 PTY 回归通过，`--help` / `--version` / `--check` 未创建账号数据。
+
+Homebrew 的 tap、配方解析、下载和校验通过，本机实际安装被 Homebrew 的 Command Line Tools 版本检查阻止，尚未完成 `brew test`。遇到同样的提示，请按 Homebrew 提示更新系统开发工具，或直接下载 Release 解压运行。Scoop 实际安装及 Windows 10 实机完整交互尚未验收；Windows CI 已验证发布包包含所需 DLL 并能加载 TDLib。
 
 参照：[Homebrew tap](https://docs.brew.sh/Taps)、[Formula Cookbook](https://docs.brew.sh/Formula-Cookbook)、[Scoop manifest](https://github.com/ScoopInstaller/Scoop/wiki/App-Manifests)。

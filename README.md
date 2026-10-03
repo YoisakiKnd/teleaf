@@ -12,7 +12,7 @@
 
 ### 预编译版：Homebrew / Scoop
 
-项目仓库为 [YoisakiKnd/teleaf](https://github.com/YoisakiKnd/teleaf)，运行命令为 `teleaf`。以下命令在首次 Release 和安装清单发布后可用。
+项目仓库为 [YoisakiKnd/teleaf](https://github.com/YoisakiKnd/teleaf)，运行命令为 `teleaf`。[v0.1.0 发布包](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.0)及安装清单已发布，可按以下方式安装。
 
 **macOS / Linux（Homebrew）：**
 
@@ -58,7 +58,7 @@ cargo run --release
 
 下载脚本支持 macOS/Linux/Windows 的 x64 和 ARM64，固定 TDLib 1.8.61 并校验 SHA-256，只安装动态运行库，不解压头文件和静态库。Linux 源码版还需系统提供 TDLib 所依赖的 libc++/OpenSSL 等运行库；Ubuntu 24.04 可安装 `libc++1-18 libc++abi1-18 libssl3t64`。已有 `sh scripts/install-tdlib.sh` 命令仍可使用。自备 TDLib 可以设置 `TDLIB_PATH`。
 
-创建仓库后的自动发布、Homebrew 配方和 Scoop 清单生成方式见 [RELEASING.md](RELEASING.md)。
+自动发布、Homebrew 配方和 Scoop 清单生成方式见 [RELEASING.md](RELEASING.md)。
 
 首次启动会显示配置表单：
 
