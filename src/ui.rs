@@ -2932,12 +2932,15 @@ pub(crate) mod tests {
             MediaManager::from_picker(Picker::halfblocks()),
         );
         app.demo = true;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // The demo creates real PNG fixtures before emitting authorization.
+        // Debug builds on shared Intel CI can take longer than one second.
+        // Use one bounded deadline rather than failing on a short idle interval.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while app.auth.state != "authorizationStateReady" {
             let event = worker
                 .events
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .unwrap();
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("demo worker did not initialize before the deadline");
             if let (Some(request), _) = app.apply(event) {
                 worker.request(request).unwrap();
             }
@@ -2950,8 +2953,8 @@ pub(crate) mod tests {
         while app.store.messages.is_empty() {
             let event = worker
                 .events
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .unwrap();
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("demo worker did not load messages before the deadline");
             if let (Some(request), _) = app.apply(event) {
                 worker.request(request).unwrap();
             }
