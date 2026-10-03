@@ -32,7 +32,10 @@ try:
     typed = send(b'\x1b[200~mouse-secret\x1b[201~')
     assert '•'.encode() in typed and b'mouse-secret' not in output
     rejected = click(61,21)
-    assert 'API ID'.encode() in rejected
+    # A diff frame may skip the unchanged space between API and ID using cursor
+    # movement, particularly with NO_COLOR. Validate the actual error text.
+    validation = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', rejected).replace(b' ', b'')
+    assert 'APIID应为大于零的数字'.encode() in validation, repr(validation)
     assert not (Path(folder)/'config.json').exists()
     settings = click(65,0)
     assert '设置与连接'.encode() in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', settings)

@@ -16,6 +16,7 @@ mod store;
 mod tdlib;
 mod terminal;
 mod text;
+mod theme;
 mod ui;
 
 use std::collections::{HashMap, HashSet, VecDeque};

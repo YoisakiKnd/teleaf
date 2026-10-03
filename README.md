@@ -4,7 +4,7 @@
 
 项目采用 [MIT 许可证](LICENSE)，允许使用、修改、分发及商用，分发时需保留版权和许可声明。随附的第三方运行库遵循各自许可证，发布包中的 `LICENSES/` 提供相关文本。
 
-与 Gemini 3.8 Flash 讨论的第一阶段界面改进已实施，范围和验收记录见 [FRONTEND_REVIEW.md](FRONTEND_REVIEW.md)。
+与 Gemini 3.8 Flash 协作的导航、菜单、贴纸托盘和配色改进已实施，范围和验收记录见 [FRONTEND_REVIEW.md](FRONTEND_REVIEW.md)。
 
 已实现会话列表、历史翻页、文字/图片/文件/贴纸发送、回复、编辑、删除、转发、快速收藏、复读、回应和会话内搜索。图片和贴纸支持终端内预览；不支持图片协议时自动使用字符预览。动态贴纸目前显示缩略图。
 
@@ -14,7 +14,7 @@
 
 ### 预编译版：Homebrew / Scoop
 
-项目仓库为 [YoisakiKnd/teleaf](https://github.com/YoisakiKnd/teleaf)，运行命令为 `teleaf`。[v0.1.0 发布包](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.0)及安装清单已发布，可按以下方式安装。
+项目仓库为 [YoisakiKnd/teleaf](https://github.com/YoisakiKnd/teleaf)，运行命令为 `teleaf`。下载 [最新稳定发布包](https://github.com/YoisakiKnd/teleaf/releases/latest)，或按以下方式安装。
 
 **macOS / Linux（Homebrew）：**
 
@@ -88,6 +88,18 @@ cargo run --release
 不知道旧密钥时，点击“不知道密钥，重新登录”或按 F5，再确认重新登录。API 凭据沿用已填写的内容，新密钥自动生成，新登录使用 `sessions/<随机标识>/` 下的独立目录；旧 `tdlib/`、`files/` 和以前的会话目录保留在原处，旧配置备份在新目录的 `previous-config.json`。重新验证手机号后会同步云端聊天；旧本地数据仍需要原密钥才能读取。以后启动自动使用新的登录目录。
 
 ## 界面与操作
+
+界面采用石墨灰背景与薄荷绿强调色：选中会话保留完整行高，未读徽标靠右，长标题和摘要显示省略号；发送、保存与继续按钮突出显示。消息发送者、正文和时间分别呈现，回复/编辑输入区显示目标消息摘要。宽屏与窄屏沿用相同的鼠标操作和键盘焦点规则。
+
+`TG_THEME` 在启动时选择配色，设置页显示当前结果：
+
+| 值 | 效果 |
+| --- | --- |
+| `auto`（默认） | 根据终端声明选择真彩色或 256 色深色配色；基础终端使用 ANSI 配色 |
+| `dark` / `light` | 深色 / 浅色配色；按终端能力降低颜色精度 |
+| `terminal` | 保留终端原有背景、透明度及 ANSI 配色 |
+
+例如 macOS/Linux 使用 `TG_THEME=light teleaf` 或 `TG_THEME=terminal cargo run -- --demo`；PowerShell 先执行 `$env:TG_THEME="light"`，再运行 `teleaf`。非空的 `NO_COLOR` 或 `TERM=dumb` 启用单色模式，选中项和主按钮通过反色及加粗区分。配色只在启动时检测一次，未增加动画、定时重绘或媒体缓存；终端自定义 ANSI 色的实际对比度由终端主题决定。
 
 侧栏读取账号已有的 Telegram 聊天文件夹，保持服务器给出的分组名称与顺序；主列表和归档分别显示。点击分组标签切换，点击 `▾` 查看完整分组列表；标签栏可用滚轮和左右箭头浏览，键盘用 `[` / `]` 切换，分组弹窗用方向键和 Enter 选择。每个分组按各自的 `chat.positions` 排序，并通过 `loadChats` 分页加载，不在本地重算包含/排除规则。协议参见 [TDLib 聊天列表说明](https://core.telegram.org/tdlib/getting-started) 和 [文件夹更新](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1update_chat_folders.html)。目前支持查看和切换已有文件夹，新增、编辑文件夹规则仍需使用其他 Telegram 客户端。
 
@@ -290,6 +302,15 @@ python3 scripts/test-terminal-profiles-pty.py
 ```
 
 测试涵盖配置保存、密钥迁移和权限、登录与粘贴、消息操作、中文/emoji 换行、媒体回退，以及各页面在不同窗口尺寸下的渲染。页面文本预览会写入 `target/ui-previews/`。鼠标回归测试覆盖面板滚动、历史阅读锚点、草稿恢复、Unicode 光标、弹窗隔离及确认按钮防误触，以及跨消息选择、双击替换、拖动滚动条、缩放/平移、图片解码缓存和快速缩放队列。PTY 检查用于 macOS/Linux，会启动独立临时数据目录，不读取现有登录会话；验证真实终端输入解析、鼠标开关、静置和鼠标移动无输出，以及正常退出。
+
+可导出离线夹具的实际字符、颜色和字宽，生成 32 个页面 × 4 个窗口尺寸的 SVG / HTML 预览；此导出代码仅编入测试，不进入客户端：
+
+```sh
+NO_COLOR= TERM=xterm-256color COLORTERM=truecolor TG_UI_PREVIEW=1 cargo test all_pages_render_on_wide_and_small_terminals
+python3 scripts/render-ui-previews.py target/ui-previews
+```
+
+用浏览器打开 `target/ui-previews/index.html`，可切换页面和尺寸。设置 `TG_THEME=light` 可重新生成浅色版本。预览使用合成数据，不代表真实终端的字体、图片协议或 GPU 显示效果。
 
 恢复登录 PTY 测试使用 TDLib 创建真正加密的临时数据库，检查正确密钥、错误密钥、缺少配置、鼠标确认重新登录、旧数据库和文件不变、旧配置备份及重启后目录保持；需要先安装 TDLib。测试不填写真实手机号或验证码。
 

@@ -1,7 +1,7 @@
 //! Shared page layout. Views render only visible messages and reuse media caches.
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect, Size};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
@@ -13,11 +13,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::selection::{self, Point, Source};
 use crate::store::{MediaKind, MediaRef};
+use crate::theme::palette;
 use crate::{App, InputMode};
-
-const ACCENT: Color = Color::Cyan;
-const MUTED: Color = Color::DarkGray;
-const ERROR: Color = Color::LightRed;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Pane {
@@ -140,22 +137,45 @@ fn button(frame: &mut Frame, app: &mut App, area: Rect, label: &str, action: Act
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let pressed = app
+        .mouse_press
+        .is_some_and(|(_, target)| target == Target::Command(action));
+    let primary = matches!(action, Action::Submit | Action::Confirm);
+    let destructive =
+        action == Action::Delete || (action == Action::Confirm && app.confirm_delete.is_some());
+    let style = if primary && !destructive {
+        palette().primary()
+    } else if pressed {
+        palette()
+            .selection()
+            .fg(if destructive {
+                palette().error
+            } else {
+                palette().text
+            })
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(if destructive {
+            palette().error
+        } else {
+            palette().muted
+        })
+    };
+    // A compact filled label keeps the border and whitespace quiet. The whole
+    // original button rectangle remains clickable, including its surrounding space.
+    let label_width =
+        (UnicodeWidthStr::width(label) as u16 + if primary { 2 } else { 0 }).min(area.width);
+    let visual = Rect::new(
+        area.x + (area.width - label_width) / 2,
+        area.y,
+        label_width,
+        area.height,
+    );
     frame.render_widget(
         Paragraph::new(label)
-            .style(
-                Style::default().fg(ACCENT).bg(
-                    if app
-                        .mouse_press
-                        .is_some_and(|(_, target)| target == Target::Command(action))
-                    {
-                        Color::Indexed(238)
-                    } else {
-                        Color::Reset
-                    },
-                ),
-            )
+            .style(style)
             .alignment(Alignment::Center),
-        area,
+        visual,
     );
     app.hit_targets.push((area, Target::Command(action)));
 }
@@ -164,20 +184,23 @@ fn target_button(frame: &mut Frame, app: &mut App, area: Rect, label: &str, targ
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let selected = matches!(target, Target::Folder(list) if list == app.store.selected_list);
+    let pressed = app
+        .mouse_press
+        .is_some_and(|(_, pressed)| pressed == target);
+    let style = if selected {
+        palette()
+            .selection()
+            .fg(palette().accent)
+            .add_modifier(Modifier::BOLD)
+    } else if pressed {
+        palette().selection()
+    } else {
+        Style::default().fg(palette().muted)
+    };
     frame.render_widget(
         Paragraph::new(label)
-            .style(
-                Style::default().fg(ACCENT).bg(
-                    if app
-                        .mouse_press
-                        .is_some_and(|(_, pressed)| pressed == target)
-                    {
-                        Color::Indexed(238)
-                    } else {
-                        Color::Reset
-                    },
-                ),
-            )
+            .style(style)
             .alignment(Alignment::Center),
         area,
     );
@@ -203,14 +226,17 @@ fn folder_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
             8.min(area.width.saturating_sub(6)),
             1,
         );
-        let label = format!(
-            "{}{}",
-            if *list == app.store.selected_list {
-                "●"
-            } else {
-                " "
-            },
-            name
+        let label = crate::text::ellipsize(
+            &format!(
+                "{}{}",
+                if *list == app.store.selected_list {
+                    "●"
+                } else {
+                    " "
+                },
+                name
+            ),
+            usize::from(rect.width),
         );
         target_button(frame, app, rect, &label, Target::Folder(*list));
     }
@@ -257,7 +283,11 @@ fn scrollbar(frame: &mut Frame, app: &mut App, area: Rect, pane: Pane, top: usiz
             } else {
                 "│"
             })
-            .style(Style::default().fg(ACCENT)),
+            .style(Style::default().fg(if usize::from(row) == thumb {
+                palette().accent
+            } else {
+                palette().border
+            })),
             cell,
         );
         app.hit_targets.push((
@@ -307,15 +337,72 @@ fn anchor_at(app: &mut App, top: usize) {
 }
 
 fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
+    let title = title.into().style(
+        Style::default()
+            .fg(if focused {
+                palette().accent
+            } else {
+                palette().text
+            })
+            .add_modifier(Modifier::BOLD),
+    );
     Block::default()
+        .style(palette().base())
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if focused { ACCENT } else { MUTED }))
+        .border_style(
+            Style::default()
+                .fg(if focused {
+                    palette().accent
+                } else {
+                    palette().border
+                })
+                .add_modifier(if focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )
 }
 
 fn muted(text: impl Into<String>) -> Line<'static> {
-    Line::styled(text.into(), Style::default().fg(MUTED))
+    Line::styled(text.into(), Style::default().fg(palette().muted))
+}
+
+// Flatten and truncate only the visible prefix. A long reply must not copy its
+// full body into a one-line composer title on every keystroke.
+fn excerpt(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut used = 0;
+    for grapheme in value.graphemes(true) {
+        let grapheme = if grapheme.chars().any(char::is_control) {
+            " "
+        } else {
+            grapheme
+        };
+        let size = UnicodeWidthStr::width(grapheme);
+        if used + size > width
+            || output.len().saturating_add(grapheme.len()) > width.saturating_mul(16).max(32)
+        {
+            while used >= width {
+                let (index, last) = output
+                    .grapheme_indices(true)
+                    .next_back()
+                    .expect("nonempty prefix");
+                used = used.saturating_sub(UnicodeWidthStr::width(last));
+                output.truncate(index);
+            }
+            output.push('…');
+            break;
+        }
+        output.push_str(grapheme);
+        used += size;
+    }
+    output
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -341,7 +428,12 @@ fn empty(frame: &mut Frame, area: Rect, title: &str, hint: &str) {
     let inner = centered(area, area.width.saturating_sub(4), 4);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(title.to_owned()),
+            Line::styled(
+                title.to_owned(),
+                Style::default()
+                    .fg(palette().text)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Line::from(""),
             muted(hint),
         ])
@@ -402,7 +494,7 @@ fn selected_line(
     if start < end {
         spans.push(Span::styled(
             value[start..end].to_owned(),
-            Style::default().bg(ACCENT).fg(Color::Black),
+            palette().primary(),
         ));
     }
     spans.push(Span::raw(value[end..row.end].to_owned()));
@@ -565,6 +657,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hit_targets.clear();
     app.scrollbars.clear();
     let area = frame.area();
+    frame.buffer_mut().set_style(area, palette().base());
     if area.width < 30 || area.height < 12 {
         empty(
             frame,
@@ -581,6 +674,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .split(area);
+    frame
+        .buffer_mut()
+        .set_style(layout[0], Style::default().bg(palette().surface));
+    frame
+        .buffer_mut()
+        .set_style(layout[2], Style::default().bg(palette().surface));
     let connection = if app.demo {
         "离线演示"
     } else if app.auth.is_recovering() {
@@ -610,7 +709,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 " Teleaf ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 if area.width < 60 {
@@ -618,7 +719,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 } else {
                     format!("· {connection}")
                 },
-                Style::default().fg(MUTED),
+                Style::default().fg(palette().muted),
             ),
         ])),
         Rect::new(
@@ -730,11 +831,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         notice.unwrap_or(hint)
     };
     frame.render_widget(
-        Paragraph::new(footer.to_owned()).style(Style::default().fg(
-            if notice.is_some() || app.auth.is_error {
-                ERROR
+        Paragraph::new(footer).style(Style::default().fg(
+            if app.auth.is_error || (app.notice.is_none() && app.media.last_error.is_some()) {
+                palette().error
+            } else if notice.is_some() {
+                palette().text
             } else {
-                MUTED
+                palette().muted
             },
         )),
         layout[2],
@@ -755,7 +858,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.hit_targets.push((area, Target::Backdrop));
         frame.buffer_mut().set_style(
             layout[1],
-            Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(palette().muted)
+                .add_modifier(Modifier::DIM),
         );
     }
     if let Some(id) = app.preview_message {
@@ -921,7 +1026,7 @@ API ID 和 Hash 沿用刚才的填写，无需重新领取。
     frame.render_widget(
         Paragraph::new(app.auth.message.clone())
             .wrap(Wrap { trim: true })
-            .style(Style::default().fg(ERROR)),
+            .style(Style::default().fg(palette().error)),
         rows[2],
     );
     let buttons = if compact {
@@ -1033,7 +1138,7 @@ fn auth_page(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(
             Paragraph::new(link.to_owned())
                 .wrap(Wrap { trim: false })
-                .style(Style::default().fg(ACCENT)),
+                .style(Style::default().fg(palette().accent)),
             rows[1],
         );
         app.hit_targets
@@ -1046,7 +1151,11 @@ fn auth_page(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(message.to_owned())
-            .style(Style::default().fg(if app.auth.is_error { ERROR } else { ACCENT }))
+            .style(Style::default().fg(if app.auth.is_error {
+                palette().error
+            } else {
+                palette().accent
+            }))
             .wrap(Wrap { trim: true }),
         rows[3],
     );
@@ -1226,44 +1335,59 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
         .take(visible)
         .filter_map(|id| app.store.chat(*id))
         .map(|chat| {
+            // Reserve two columns for the selection marker and one for scrolling.
+            let width = usize::from(inner.width.saturating_sub(3));
             let unread = if chat.unread > 0 {
-                format!("  {}", chat.unread)
+                if chat.unread > 999 {
+                    " 999+ ".to_owned()
+                } else {
+                    format!(" {} ", chat.unread)
+                }
             } else {
                 String::new()
             };
+            let badge_width = UnicodeWidthStr::width(unread.as_str()).min(width);
+            let title = crate::text::ellipsize(
+                &format!(
+                    "{}{}",
+                    if Some(chat.id) == app.store.active_chat {
+                        "· "
+                    } else {
+                        ""
+                    },
+                    chat.title
+                ),
+                width.saturating_sub(badge_width + usize::from(badge_width > 0)),
+            );
+            let padding =
+                width.saturating_sub(UnicodeWidthStr::width(title.as_str()) + badge_width);
+            let preview = if chat.preview.is_empty() {
+                "暂无消息".to_owned()
+            } else {
+                excerpt(&chat.preview, width)
+            };
             ListItem::new(vec![
                 Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{}{}",
-                            if Some(chat.id) == app.store.active_chat {
-                                "· "
-                            } else {
-                                ""
-                            },
-                            chat.title
-                        ),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(unread, Style::default().fg(ACCENT)),
+                    Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" ".repeat(padding)),
+                    Span::styled(unread, palette().primary()),
                 ]),
-                muted(if chat.preview.is_empty() {
-                    "暂无消息".to_owned()
-                } else {
-                    chat.preview.replace('\n', " ")
-                }),
+                muted(preview),
             ])
+            .style(if ids.get(selected) == Some(&chat.id) {
+                palette().selection()
+            } else {
+                Style::default()
+            })
         })
         .collect();
     let mut state = ListState::default().with_selected(
         (selected >= start && selected < start + visible).then_some(selected.saturating_sub(start)),
     );
     frame.render_stateful_widget(
-        List::new(items).highlight_symbol("› ").highlight_style(
-            Style::default()
-                .bg(Color::Indexed(236))
-                .add_modifier(Modifier::BOLD),
-        ),
+        List::new(items)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default()),
         inner,
         &mut state,
     );
@@ -1432,36 +1556,47 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 lines.push(
                     Line::styled(
                         message.info.stamp.expect("date header").date(),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(palette().muted),
                     )
                     .alignment(Alignment::Center),
                 );
             }
-            lines.push(Line::styled(
-                format!(
-                    "{}{}{}",
-                    if Some(message.id) == app.selected_message {
-                        "› "
-                    } else {
-                        "  "
-                    },
-                    crate::text::ellipsize(
-                        &format!("{label}{tag}"),
-                        usize::from(width.saturating_sub(controls_width))
-                            .saturating_sub(status_width)
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{}{}",
+                        if Some(message.id) == app.selected_message {
+                            "› "
+                        } else {
+                            "  "
+                        },
+                        crate::text::ellipsize(
+                            &format!("{label}{tag}"),
+                            usize::from(width.saturating_sub(controls_width))
+                                .saturating_sub(status_width)
+                        )
                     ),
+                    Style::default()
+                        .fg(if message.outgoing {
+                            palette().accent
+                        } else {
+                            palette().incoming
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
                     if status.is_empty() {
                         String::new()
                     } else {
                         format!(" · {status}")
-                    }
+                    },
+                    Style::default().fg(if message.retryable() {
+                        palette().error
+                    } else {
+                        palette().muted
+                    }),
                 ),
-                Style::default().fg(if message.outgoing {
-                    ACCENT
-                } else {
-                    Color::LightBlue
-                }),
-            ));
+            ]));
             if let Some(reply) = &message.info.reply {
                 let referenced = (Some(reply.chat_id) == app.store.active_chat)
                     .then(|| app.store.messages.iter().find(|m| m.id == reply.message_id))
@@ -1482,7 +1617,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                             usize::from(width)
                         )
                     ),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(palette().muted),
                 ));
                 let quote_row = before + divider + 1;
                 if referenced.is_some()
@@ -1562,7 +1697,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     for (id, rect, lines, inline, header, retryable) in visible {
         let style = if Some(id) == app.selected_message {
-            Style::default().bg(Color::Indexed(236))
+            palette().selection()
         } else {
             Style::default()
         };
@@ -1649,8 +1784,27 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
         InputMode::Search => "搜索",
         InputMode::React(_) => "表情回应",
     };
+    let title = if let InputMode::Reply(id) | InputMode::Edit(id) = app.input_mode {
+        app.store
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .map(|message| {
+                crate::text::ellipsize(
+                    &format!(
+                        "{title} · {}：{}",
+                        app.store.sender_label(message),
+                        excerpt(&message.text, usize::from(area.width.saturating_sub(8)))
+                    ),
+                    usize::from(area.width.saturating_sub(8)),
+                )
+            })
+            .unwrap_or_else(|| title.to_owned())
+    } else {
+        title.to_owned()
+    };
     let block = panel(
-        title.to_owned(),
+        title,
         app.composer_focus && app.input_mode != InputMode::Off,
     );
     let inner = block.inner(area);
@@ -1706,7 +1860,7 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     if value.is_empty() && app.input_mode == InputMode::Off {
         frame.render_widget(
-            Paragraph::new("点击写消息").style(Style::default().fg(MUTED)),
+            Paragraph::new("点击写消息").style(Style::default().fg(palette().muted)),
             inner,
         );
     }
@@ -1731,7 +1885,7 @@ fn inline_media_view(
             } else {
                 "↓ 加载图片 · 点击查看"
             })
-            .style(Style::default().fg(MUTED))
+            .style(Style::default().fg(palette().muted))
             .wrap(Wrap { trim: true }),
             area,
         );
@@ -1746,7 +1900,7 @@ fn inline_media_view(
         );
     } else {
         frame.render_widget(
-            Paragraph::new("图片准备中 · 点击查看").style(Style::default().fg(MUTED)),
+            Paragraph::new("图片准备中 · 点击查看").style(Style::default().fg(palette().muted)),
             area,
         );
     }
@@ -1840,7 +1994,8 @@ fn action_dialog(frame: &mut Frame, app: &mut App, area: Rect, selected: usize) 
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     let items: Vec<_> = entries
         .iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(index, item)| {
             ListItem::new(Line::from(vec![
                 Span::raw(item.label),
                 Span::styled(
@@ -1849,16 +2004,21 @@ fn action_dialog(frame: &mut Frame, app: &mut App, area: Rect, selected: usize) 
                     } else {
                         format!("  {}", item.key)
                     },
-                    Style::default().fg(MUTED),
+                    Style::default().fg(palette().muted),
                 ),
             ]))
+            .style(if index == selected {
+                palette().selection()
+            } else {
+                Style::default()
+            })
         })
         .collect();
     let mut state = ListState::default().with_selected((!entries.is_empty()).then_some(selected));
     frame.render_stateful_widget(
         List::new(items)
             .highlight_symbol("› ")
-            .highlight_style(Style::default().bg(Color::Indexed(236))),
+            .highlight_style(Style::default()),
         rows[0],
         &mut state,
     );
@@ -1881,7 +2041,7 @@ fn action_dialog(frame: &mut Frame, app: &mut App, area: Rect, selected: usize) 
         } else {
             "Enter 确认 · Esc 关闭"
         })
-        .style(Style::default().fg(MUTED)),
+        .style(Style::default().fg(palette().muted)),
         rows[1],
     );
 }
@@ -1938,19 +2098,11 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
                 &label,
                 usize::from(tab_width.saturating_sub(1)),
             ))
-            .style(
-                Style::default()
-                    .fg(if tab == app.sticker_panel.tab {
-                        Color::Black
-                    } else {
-                        ACCENT
-                    })
-                    .bg(if tab == app.sticker_panel.tab {
-                        ACCENT
-                    } else {
-                        Color::Reset
-                    }),
-            ),
+            .style(if tab == app.sticker_panel.tab {
+                palette().primary()
+            } else {
+                Style::default().fg(palette().muted)
+            }),
             rect,
         );
         app.hit_targets.push((rect, Target::StickerTab(tab)));
@@ -1975,7 +2127,7 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         crate::stickers::Tab::Search => format!("搜索：{}", app.sticker_panel.submitted),
     };
     frame.render_widget(
-        Paragraph::new(title).style(Style::default().fg(MUTED)),
+        Paragraph::new(title).style(Style::default().fg(palette().muted)),
         parts[1],
     );
     let grid = parts[2];
@@ -2040,9 +2192,9 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(if index == app.sticker_cursor {
-                ACCENT
+                palette().accent
             } else {
-                MUTED
+                palette().muted
             }));
         let image_area = block.inner(tile);
         frame.render_widget(block, tile);
@@ -2087,7 +2239,7 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     if value.is_empty() {
         frame.render_widget(
-            Paragraph::new("搜索贴纸 / 表情…").style(Style::default().fg(MUTED)),
+            Paragraph::new("搜索贴纸 / 表情…").style(Style::default().fg(palette().muted)),
             search[0],
         );
     }
@@ -2095,7 +2247,7 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let footer = Layout::horizontal([Constraint::Min(1), Constraint::Length(12)]).split(parts[4]);
     frame.render_widget(
         Paragraph::new(format!("{total} 张 · Enter 发送 · Tab 搜索"))
-            .style(Style::default().fg(MUTED)),
+            .style(Style::default().fg(palette().muted)),
         footer[0],
     );
     let favorite = app
@@ -2160,7 +2312,7 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     button(frame, app, tools[0], mode, Action::AttachmentMode);
     button(frame, app, tools[2], "[上一级]", Action::AttachmentParent);
     frame.render_widget(
-        Paragraph::new(directory).style(Style::default().fg(MUTED)),
+        Paragraph::new(directory).style(Style::default().fg(palette().muted)),
         parts[1],
     );
     editor(
@@ -2175,7 +2327,7 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     if path.is_empty() {
         frame.render_widget(
             Paragraph::new("粘贴/拖入路径，或点击下方文件（Tab 编辑路径）")
-                .style(Style::default().fg(MUTED)),
+                .style(Style::default().fg(palette().muted)),
             parts[2],
         );
     }
@@ -2216,7 +2368,7 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(
             Paragraph::new(crate::text::ellipsize(&label, usize::from(rect.width))).style(
                 if selected {
-                    Style::default().fg(ACCENT).bg(Color::Indexed(236))
+                    palette().selection().fg(palette().accent)
                 } else {
                     Style::default()
                 },
@@ -2258,7 +2410,7 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     frame.render_widget(
         Paragraph::new(format!("已选 {}/10 · 滚动/移除", selected.len()))
-            .style(Style::default().fg(ACCENT)),
+            .style(Style::default().fg(palette().accent)),
         Rect::new(columns[1].x, columns[1].y, columns[1].width, 1),
     );
     app.hit_targets.push((columns[1], Target::AttachmentQueue));
@@ -2313,7 +2465,8 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     if caption.is_empty() {
         frame.render_widget(
-            Paragraph::new("添加说明（可选，Tab 或点击输入）").style(Style::default().fg(MUTED)),
+            Paragraph::new("添加说明（可选，Tab 或点击输入）")
+                .style(Style::default().fg(palette().muted)),
             parts[4],
         );
     }
@@ -2323,9 +2476,9 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         )
         .style(
             Style::default().fg(if app.attachments.as_ref().unwrap().error.is_some() {
-                ERROR
+                palette().error
             } else {
-                MUTED
+                palette().muted
             }),
         ),
         parts[5],
@@ -2339,12 +2492,12 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
 fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = modal(frame, app, centered(area, 64, 24), "使用帮助");
     let lines = vec![
-        Line::styled("浏览会话", Style::default().fg(ACCENT)),
+        Line::styled("浏览会话", Style::default().fg(palette().accent)),
         muted("单击选择 · 右键操作 · 滚轮滚动所在面板"),
         Line::from("↑ ↓ / j k 选择    Enter 打开    Tab 切换会话与消息"),
         Line::from("g 加载更早消息    m 更多会话    PgUp/PgDn 滚动消息"),
         Line::from(""),
-        Line::styled("聊天与附件", Style::default().fg(ACCENT)),
+        Line::styled("聊天与附件", Style::default().fg(palette().accent)),
         Line::from("i 写消息    Enter 消息操作/媒体预览    Space 更多操作"),
         Line::from("r 回复    e 编辑    f 转发    x 回应    d 删除"),
         Line::from("S 快速收藏到收藏夹    D 复读到当前会话"),
@@ -2353,7 +2506,7 @@ fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("贴纸：缩略图网格 · [ ] 切换包 · / 搜索 · 点击发送"),
         Line::from("v 预览媒体    o 用系统程序打开"),
         Line::from(""),
-        Line::styled("输入与导航", Style::default().fg(ACCENT)),
+        Line::styled("输入与导航", Style::default().fg(palette().accent)),
         Line::from("支持直接粘贴    Alt+Enter 换行    Ctrl+U 清空输入"),
         Line::from("Enter 提交    Esc 取消当前操作    s 设置    q 退出"),
         Line::from("c 复制消息 · F6 鼠标开关 · Ctrl+Q 随时退出"),
@@ -2385,17 +2538,18 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let (api_id, directory) = app.auth.config_summary();
     let lines = vec![
-        Line::styled("账号连接", Style::default().fg(ACCENT)),
+        Line::styled("账号连接", Style::default().fg(palette().accent)),
         Line::from(format!("API ID   {api_id}")),
         muted("API Hash 已隐藏 · F3 修改 API 配置并重新连接"),
         muted("F2 打开 Telegram API 页面"),
         Line::from(""),
-        Line::styled("本机数据", Style::default().fg(ACCENT)),
+        Line::styled("本机数据", Style::default().fg(palette().accent)),
         Line::from(directory),
         muted("凭据和自动生成的密钥保存在 config.json，权限仅当前用户。"),
         Line::from(""),
-        Line::styled("终端与诊断", Style::default().fg(ACCENT)),
+        Line::styled("终端与诊断", Style::default().fg(palette().accent)),
         Line::from(format!("图片显示   {}", app.media.protocol_name)),
+        Line::from(format!("界面配色   {} · TG_THEME 可切换", palette().name)),
         Line::from(crate::terminal::summary()),
         Line::from(app.status.clone()),
         muted(app.tdlib_path.as_deref().unwrap_or("TDLib 尚未加载")),
@@ -2634,10 +2788,98 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn long_chat_titles_keep_badges_and_selected_prefix_styles() {
+        for (width, height) in [(110, 32), (80, 24), (45, 18), (30, 12)] {
+            let mut app = fixture();
+            app.focus_messages = false;
+            app.store.apply(&json!({"@type":"updateChatTitle","chat_id":1,"title":"开发讨论组 👩‍💻 很长的中文与 English 会话标题"}));
+            app.store
+                .apply(&json!({"@type":"updateChatReadInbox","chat_id":1,"unread_count":2345}));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let rect = app
+                .hit_targets
+                .iter()
+                .find(|(_, target)| *target == Target::Chat(1))
+                .unwrap()
+                .0;
+            let buffer = terminal.backend().buffer();
+            let row: String = (rect.x..rect.right())
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect();
+            assert!(row.contains("999+"), "badge clipped: {row}");
+            assert!(row.contains('…'), "title should truncate: {row}");
+            let prefix = &buffer[(rect.x, rect.y)];
+            let body = &buffer[(rect.x + 2, rect.y)];
+            assert_eq!(prefix.bg, body.bg);
+            assert_eq!(
+                prefix.modifier.contains(Modifier::REVERSED),
+                body.modifier.contains(Modifier::REVERSED)
+            );
+            let badge = &buffer[(rect.right() - 2, rect.y)];
+            assert_eq!(badge.bg, palette().primary().bg.unwrap());
+            assert_eq!(badge.fg, palette().primary().fg.unwrap());
+        }
+    }
+
+    #[test]
+    fn one_line_excerpts_preserve_graphemes_and_bound_long_replies() {
+        assert_eq!(excerpt("ab\r\ncd\te", 20), "ab cd e");
+        assert_eq!(excerpt("a\x1b[31mb\0", 20), "a [31mb ");
+        assert_eq!(excerpt("abcde", 5), "abcde");
+        assert_eq!(excerpt("abcdef", 5), "abcd…");
+        assert_eq!(excerpt("中文测试", 5), "中文…");
+        assert_eq!(excerpt("👩‍💻hello", 2), "…");
+        assert_eq!(excerpt("👩‍💻", 2), "👩‍💻");
+        assert!(excerpt(&"长消息\n".repeat(100_000), 22).len() < 100);
+        assert!(excerpt(&"\u{200b}".repeat(100_000), 10).len() <= 163);
+        let mut app = fixture();
+        app.input_mode = InputMode::Reply(1);
+        for (width, height) in [(110, 32), (30, 12)] {
+            let output = snapshot(&mut app, width, height);
+            assert!(output.contains("回复消息"));
+            assert!(
+                app.hit_targets
+                    .iter()
+                    .any(|(_, t)| *t == Target::Command(Action::Cancel))
+            );
+        }
+    }
+
     fn snapshot(app: &mut App, width: u16, height: u16) -> String {
+        snapshot_named(app, width, height, None)
+    }
+
+    fn snapshot_named(
+        app: &mut App,
+        width: u16,
+        height: u16,
+        path: Option<&std::path::Path>,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal.draw(|frame| draw(frame, app)).expect("draw");
         let buffer = terminal.backend().buffer();
+        // Synthetic fixture only. Export actual cell styles for visual review;
+        // this code is excluded from the application binary.
+        if std::env::var_os("TG_UI_PREVIEW").is_some()
+            && let Some(path) = path
+        {
+            let cells: Vec<_> = (0..height)
+                .flat_map(|y| {
+                    (0..width).map(move |x| {
+                        let cell = &buffer[(x, y)];
+                    json!({"x":x,"y":y,"text":cell.symbol(),"width":UnicodeWidthStr::width(cell.symbol()).max(1),"fg":format!("{:?}",cell.fg),
+                    "bg":format!("{:?}",cell.bg),"modifiers":cell.modifier.bits()})
+                    })
+                })
+                .collect();
+            std::fs::write(
+                path,
+                serde_json::to_vec(&json!({"width":width,"height":height,"cells":cells})).unwrap(),
+            )
+            .expect("write styled preview");
+        }
         let mut output = String::new();
         for y in 0..height {
             let mut x = 0;
@@ -2904,7 +3146,12 @@ pub(crate) mod tests {
                     "settings" => app.show_settings = true,
                     _ => {}
                 }
-                let text = snapshot(&mut app, width, height);
+                let text = snapshot_named(
+                    &mut app,
+                    width,
+                    height,
+                    Some(&directory.join(format!("{page}-{width}x{height}.json"))),
+                );
                 assert!(
                     !text.contains("private-api-hash")
                         && !text.contains("private-password")
