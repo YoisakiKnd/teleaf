@@ -2,6 +2,7 @@
 class Teleaf < Formula
   desc "Lightweight Telegram terminal client with inline media and mouse controls"
   homepage "https://github.com/YoisakiKnd/teleaf"
+  license "MIT"
   version "0.1.0"
   on_macos do
     depends_on macos: :sequoia

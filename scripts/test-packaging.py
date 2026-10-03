@@ -117,6 +117,7 @@ with tempfile.TemporaryDirectory() as folder:
             formula, manifest = packages.generate('example/teleaf', '0.1.0', folder, folder / 'generated')
             value = json.loads(manifest.read_text())
             self.assertEqual(value['bin'], 'teleaf.exe')
+            self.assertEqual(value['license'], 'MIT')
             self.assertEqual(value['architecture']['64bit']['hash'], checksum(folder / 'teleaf-0.1.0-windows-x86_64.zip'))
             self.assertIn('example/teleaf/releases/download/v0.1.0/', value['architecture']['64bit']['url'])
             self.assertEqual(len((folder / 'SHA256SUMS').read_text().splitlines()), 5)

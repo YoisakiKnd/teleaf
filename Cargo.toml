@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A lightweight Telegram terminal client with inline media and mouse controls"
 repository = "https://github.com/YoisakiKnd/teleaf"
+license = "MIT"
 
 [dependencies]
 ratatui = "0.30.2"

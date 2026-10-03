@@ -16,6 +16,19 @@ GitHub 定时任务可能延迟，长期无活动的公开仓库也可能被停�
 
 带 `-` 的版本标签作为 prerelease 发布，不更新默认分支上的稳定安装清单。包清单和 SHA256SUMS 始终从该次实际构建产物生成，源码中不写虚假的哈希或尚不存在的仓库 URL。
 
+## Scoop 双仓库发布约定
+
+每次稳定版本发布都必须向以下两个仓库提交同一份清单：
+
+1. `YoisakiKnd/scoop-teleaf`：同步 `bucket/teleaf.json` 并确认提交成功。
+2. `Mythos-404/eimer`：向默认分支提交 `bucket/teleaf.json` 的更新 PR；已有同一版本的开放 PR 时更新该 PR，避免重复提交。
+
+两个仓库的版本、下载地址、SHA-256 和许可证必须一致。eimer 的合并由其维护者决定；发布记录必须包含更新 PR 链接，未合并时不得宣称该版本已可从 eimer 安装。这项持续约定同时保存在 `AGENTS.md`，后续发布任务必须执行。
+
+自有 bucket 自动同步；eimer 的更新 PR 使用发布者本机已登录的 GitHub CLI 提交。仓库内的 `GITHUB_TOKEN` 没有跨仓库推送权限，因此当前并未配置无人值守的跨仓库 PR 创建。需要该功能时可另行配置专用 GitHub App 或访问令牌。
+
+项目许可证为 MIT，清单使用 `license: MIT`。第三方运行库保留自己的许可文本。新的发布包自动包含根目录 `LICENSE`；`v0.1.0` 的既有安装包保持原始哈希，MIT 文本作为额外 Release 资产提供。
+
 ## 用户安装
 
 [v0.1.0](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.0)及安装清单已发布：

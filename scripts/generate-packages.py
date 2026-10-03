@@ -25,6 +25,7 @@ def generate(repository, version, assets, destination):
         'class Teleaf < Formula',
         '  desc "Lightweight Telegram terminal client with inline media and mouse controls"',
         f'  homepage "{base}"',
+        '  license "MIT"',
         f'  version "{version}"',
     ]
     for system in ('macos', 'linux'):
@@ -49,6 +50,7 @@ def generate(repository, version, assets, destination):
         'version': version,
         'description': 'Lightweight Telegram terminal client with inline media and mouse controls',
         'homepage': base,
+        'license': 'MIT',
         'architecture': {'64bit': {
             'url': f'{base}/releases/download/v{version}/{files["windows-x86_64"]}',
             'hash': hashes['windows-x86_64'],
