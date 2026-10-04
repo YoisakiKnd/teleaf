@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Windows ConPTY input regression; no account data or phone/code submission.
-Requires: cargo build; python -m pip install pywinpty==3.0.5
+Requires: cargo build; python -m pip install pywinpty==3.0.5 pyte==0.8.2
 ConPTY exercises native console input, not Windows Terminal's GPU renderer.
 """
 import os
@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from winpty import Backend, PtyProcess
+import pyte
 
 ROOT = Path(__file__).resolve().parents[1]
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
@@ -27,6 +28,8 @@ class Terminal:
             args.append('--demo')
         self.proc = PtyProcess.spawn(args, env=env, dimensions=(40, 110), backend=Backend.ConPTY)
         self.output = ''
+        self.screen = pyte.Screen(110, 40)
+        self.stream = pyte.Stream(self.screen)
 
     def read(self, seconds=.3):
         data = ''
@@ -39,6 +42,7 @@ class Terminal:
                 except EOFError:
                     break
                 data += chunk
+                self.stream.feed(chunk)
         self.output += data
         return ANSI.sub('', data)
 
@@ -46,10 +50,12 @@ class Terminal:
         self.proc.write(keys)
 
     def wait(self, needle):
-        text = ''
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            text += self.read(.1)
+            self.read(.1)
+            # ConPTY sends cursor-addressed diffs, often only the changed 开/关
+            # glyph. Read the reconstructed screen rather than raw log text.
+            text = '\n'.join(self.screen.display)
             if needle.replace(' ', '') in text.replace(' ', ''):
                 return
         diagnostic = ANSI.sub('', self.output[-2000:])
@@ -89,6 +95,7 @@ for demo, protocol in [(False, 'halfblocks'), (True, 'auto'), (True, 'sixel')]:
                 terminal.send('windows-keyboard-input')
                 terminal.wait('windows-keyboard-input')
                 terminal.proc.pty.set_size(90, 30)
+                terminal.screen.resize(lines=30, columns=90)
                 terminal.read(.3)
             else:
                 terminal.send('123456\t')

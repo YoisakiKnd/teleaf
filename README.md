@@ -342,8 +342,8 @@ GitHub Actions 的 `windows-input` 作业运行 Windows 单元测试、Clippy �
 
 ```powershell
 cargo build --locked
-python -m pip install pywinpty==3.0.5
+python -m pip install pywinpty==3.0.5 pyte==0.8.2
 python -X utf8 scripts/test-windows-terminal.py
 ```
 
-pywinpty 只用于测试，不是 Teleaf 的运行依赖。测试使用临时数据和离线演示，覆盖登录输入遮挡、设置键盘焦点、关闭鼠标后的输入、F6、窗口调整与 Ctrl+Q 退出；不填写真实手机号或验证码。ConPTY 不等同于 Windows Terminal 的 GPU 显示验证。Sixel 协议和光标位置另有 Rust 单元测试及 Unix PTY 检查；图片输出后恢复后续文字位置，不增加周期刷新。
+pywinpty / pyte 只用于测试，不是 Teleaf 的运行依赖。测试使用临时数据和离线演示，覆盖登录输入遮挡、设置键盘焦点、关闭鼠标后的输入、F6、窗口调整与 Ctrl+Q 退出；不填写真实手机号或验证码。ConPTY 不等同于 Windows Terminal 的 GPU 显示验证。Sixel 协议和光标位置另有 Rust 单元测试及 Unix PTY 检查；图片输出后恢复后续文字位置，不增加周期刷新。
