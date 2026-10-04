@@ -55,7 +55,13 @@ class Terminal:
             self.read(.1)
             # ConPTY sends cursor-addressed diffs, often only the changed 开/关
             # glyph. Read the reconstructed screen rather than raw log text.
-            text = '\n'.join(self.screen.display)
+            # pyte.display can raise on an orphan wide-character continuation
+            # after ConPTY overwrites half of an emoji. Read cell data directly;
+            # empty continuation cells contribute no visible text.
+            text = '\n'.join(
+                ''.join(self.screen.buffer[y][x].data for x in range(self.screen.columns))
+                for y in range(self.screen.lines)
+            )
             if needle.replace(' ', '') in text.replace(' ', ''):
                 return
         diagnostic = ANSI.sub('', self.output[-2000:])
