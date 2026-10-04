@@ -4,6 +4,21 @@
 
 ## 发布流程
 
+### 项目 API 凭据
+
+在 Telegram 为 **Teleaf** 注册一个自己的应用，由发布者提供 API ID / Hash，使用安装包的用户无需逐个创建应用。在主仓库 **Settings → Secrets and variables → Actions → New repository secret** 设置：
+
+- `TELEAF_APP_API_ID`：应用的正整数 API ID。
+- `TELEAF_APP_API_HASH`：配套的 32 位十六进制 API Hash。
+
+五个平台的 Release 工作流会将这组凭据编译进安装包。标签发布时必须配置两项 Secrets，缺少任意一项会在构建前停止，以免发行仍要求用户注册应用的安装包；手动打包验证和源码构建允许不配置。首次运行自动生成本地配置并进入登录，用户仍需本人手机号、验证码和两步验证密码。Secrets 避免在源码中明文提交，但随客户端分发的应用凭据可从二进制提取，不应当作账号密码、Bot Token 或登录会话使用。
+
+源码构建可在构建环境设置同名变量；无项目凭据时保留手动表单。只填写一个变量或格式错误会使构建失败，错误信息不包含实际凭据。运行时读取优先级为：已有 `config.json` → `TG_API_ID` / `TG_API_HASH` → 安装包项目凭据；每组必须来自同一来源，不混用 ID / Hash。已有账号升级后继续使用已保存的凭据和数据库密钥。
+
+Telegram 官网注册错误仍需在官网解决；已有应用无需再次创建。不能使用官方代码中的受限示例凭据代替 Teleaf 自己的应用。参见 [创建应用](https://core.telegram.org/api/obtaining_api_id) 和 [API 条款](https://core.telegram.org/api/terms)。
+
+### 打包与同步
+
 1. 使用 `YoisakiKnd/teleaf` 仓库，将当前源码连同 `.github/`、`packaging/` 和 `scripts/` 推送到默认分支。`target/`、本地账号数据和 `.env` 不提交。
 2. 在 Actions 页面手动运行 **Release packages**，先检查五个平台能否构建和加载 TDLib。手动运行只生成 Actions artifacts，不发布 Release 或修改包清单。
 3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.1`。标签必须与 Cargo 版本完全一致。
@@ -16,20 +31,17 @@ GitHub 定时任务可能延迟，长期无活动的公开仓库也可能被停�
 
 带 `-` 的版本标签作为 prerelease 发布，不更新默认分支上的稳定安装清单。包清单和 SHA256SUMS 始终从该次实际构建产物生成，源码中不写虚假的哈希或尚不存在的仓库 URL。
 
-## Scoop 双仓库发布约定
+## Scoop 发布约定
 
-每次稳定版本发布都必须向以下两个仓库提交同一份清单：
+2026-10-04 起按用户的新要求，稳定版本只推送主仓库 `YoisakiKnd/teleaf` 并更新 `YoisakiKnd/scoop-teleaf` 的 `bucket/teleaf.json`，不再为 `Mythos-404/eimer` 创建或更新 PR。已提交的历史 PR 保留，由维护者自行处理。这项约定同时保存在 `AGENTS.md`。
 
-1. `YoisakiKnd/scoop-teleaf`：同步 `bucket/teleaf.json` 并确认提交成功。
-2. `Mythos-404/eimer`：向默认分支提交 `bucket/teleaf.json` 的更新 PR；已有尚未合并的 Teleaf 收录或更新 PR 时优先更新该 PR，避免重复提交。
-
-两个仓库的版本、下载地址、SHA-256 和许可证必须一致。eimer 的合并由其维护者决定；发布记录必须包含更新 PR 链接，未合并时不得宣称该版本已可从 eimer 安装。这项持续约定同时保存在 `AGENTS.md`，后续发布任务必须执行。
+Scoop 清单必须与该次实际发布的 Windows ZIP 版本、下载地址、SHA-256 和 MIT 许可证一致，核验成功后再同步。
 
 `v0.1.0` 首次收录 PR：[Mythos-404/eimer#1](https://github.com/Mythos-404/eimer/pull/1)。
 
 `v0.1.1` 已发布并同步自有 bucket（提交 `8bbe829`）；eimer 更新 PR：[Mythos-404/eimer#2](https://github.com/Mythos-404/eimer/pull/2)，提交时等待维护者合并。两份清单与 Release 的 `teleaf.json` 相同，Windows ZIP 的 SHA-256 为 `6b390f50c6da83fcc76323add9ea2b3c83eac1d56c82e86a53c9a440b0cb411a`。Homebrew 配方由发布工作流同步（提交 `f4302e0`）。
 
-自有 bucket 自动同步；eimer 的更新 PR 使用发布者本机已登录的 GitHub CLI 提交。仓库内的 `GITHUB_TOKEN` 没有跨仓库推送权限，因此当前并未配置无人值守的跨仓库 PR 创建。需要该功能时可另行配置专用 GitHub App 或访问令牌。
+自有 bucket 自动同步，必要时可手动触发同步工作流；本机 GitHub CLI 可核验清单和同步结果。
 
 项目许可证为 MIT，清单使用 `license: MIT`。第三方运行库保留自己的许可文本。新的发布包自动包含根目录 `LICENSE`；`v0.1.0` 的既有安装包保持原始哈希，MIT 文本作为额外 Release 资产提供。
 

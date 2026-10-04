@@ -302,17 +302,42 @@ impl Config {
 }
 
 fn credentials(saved: &Value) -> (Option<String>, Option<String>) {
+    resolve_credentials(
+        saved,
+        (env::var("TG_API_ID").ok(), env::var("TG_API_HASH").ok()),
+        (
+            option_env!("TELEAF_APP_API_ID")
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned),
+            option_env!("TELEAF_APP_API_HASH")
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned),
+        ),
+    )
+}
+
+fn resolve_credentials(
+    saved: &Value,
+    runtime: (Option<String>, Option<String>),
+    bundled: (Option<String>, Option<String>),
+) -> (Option<String>, Option<String>) {
     let id = saved
         .get("api_id")
         .and_then(Value::as_i64)
-        .map(|id| id.to_string())
-        .or_else(|| env::var("TG_API_ID").ok());
+        .map(|id| id.to_string());
     let hash = saved
         .get("api_hash")
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| env::var("TG_API_HASH").ok());
-    (id, hash)
+        .map(str::to_owned);
+    // Keep pairs from one source: a partial override must never silently mix
+    // a user's ID with the application's hash, or switch an existing session.
+    if saved.get("api_id").is_some() || saved.get("api_hash").is_some() {
+        (id, hash)
+    } else if runtime.0.is_some() || runtime.1.is_some() {
+        runtime
+    } else {
+        bundled
+    }
 }
 
 fn read_settings(data_dir: &Path) -> Result<Value, String> {
@@ -350,6 +375,33 @@ fn create_private_dir(path: &PathBuf) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn application_credentials_skip_setup_without_mixing_overrides() {
+        use super::resolve_credentials;
+        let bundled = (Some("123".into()), Some("0".repeat(32)));
+        assert_eq!(
+            resolve_credentials(&serde_json::json!({}), (None, None), bundled.clone()),
+            bundled
+        );
+        let runtime = (Some("456".into()), Some("1".repeat(32)));
+        assert_eq!(
+            resolve_credentials(&serde_json::json!({}), runtime.clone(), bundled.clone()),
+            runtime
+        );
+        let saved = serde_json::json!({"api_id":789,"api_hash":"2".repeat(32)});
+        assert_eq!(
+            resolve_credentials(&saved, runtime.clone(), bundled.clone()),
+            (Some("789".into()), Some("2".repeat(32)))
+        );
+        assert_eq!(
+            resolve_credentials(&serde_json::json!({"api_id":789}), runtime, bundled.clone()),
+            (Some("789".into()), None)
+        );
+        assert_eq!(
+            resolve_credentials(&serde_json::json!({}), (Some("456".into()), None), bundled),
+            (Some("456".into()), None)
+        );
+    }
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 

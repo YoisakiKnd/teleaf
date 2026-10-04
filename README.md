@@ -72,14 +72,16 @@ cargo run --release
 
 自动发布、Homebrew 配方和 Scoop 清单生成方式见 [RELEASING.md](RELEASING.md)。
 
-首次启动会显示配置表单：
+包含 Teleaf 项目 API 凭据的安装包会直接进入手机号、验证码和两步验证流程，普通用户无需注册 Telegram 应用。发布者配置方式见 [RELEASING.md](RELEASING.md#项目-api-凭据)。已发布的 `v0.1.1` 尚未内置项目凭据；源码未配置项目凭据时也会显示手动表单：
 
 1. 按 `F2` 打开 [Telegram API 页面](https://my.telegram.org/apps)，登录并进入 **API development tools**。
 2. 创建应用：应用名和 Short name 自定，Platform 选 **Desktop**。
 3. 将官网提供的 **API ID** 和 **API Hash** 粘贴到 TUI，按 `Tab` 切换字段，按 `Enter` 保存。
 4. 按页面提示填写手机号、验证码，以及账号启用的两步验证密码。
 
-之后直接运行 `teleaf`（源码版 `cargo run --release`）即可。API 配置会保存在本机，数据库密钥自动生成并保留，已有登录会话由 TDLib 恢复；无需每次设置环境变量。按 `F3` 可以修改 API 配置，保存后自动重新连接。Telegram 要求应用具备自己的 API 凭据，首次领取仍需在其官网完成，参见 [官方说明](https://core.telegram.org/api/obtaining_api_id)。
+之后直接运行 `teleaf`（源码版 `cargo run --release`）即可。API 配置会保存在本机，数据库密钥自动生成并保留，已有登录会话由 TDLib 恢复；无需每次设置环境变量。按 `F3` 可以修改 API 配置，保存后自动重新连接。Telegram 要求**应用开发者**取得自己的 API 凭据；不是每个使用客户端的人都需要创建应用，参见 [官方说明](https://core.telegram.org/api/obtaining_api_id)。
+
+**官网无法注册应用：** 按 `F1` 查看注册帮助。每个号码只能关联一个 API ID，已有应用可在官网复制原 ID / Hash。官网仅返回 `ERROR` 时，没有客户端可以保证成功的绕过方案；可以联系发布者获取包含 Teleaf 项目凭据的新版安装包。二维码登录仍需要 API 凭据；Telegram 的示例 ID 有服务端限制，不适合发行给用户。
 
 配置、密钥及账号数据库默认放在系统的用户数据目录，具体路径可在 `s` / `F4` 设置页查看；用 `TG_DATA_DIR` 可以指定其他目录。`config.json` 包含 API 凭据和本地数据库密钥，Unix 上目录权限为 `0700`、文件为 `0600`；配置文件内容本身没有额外加密。请保留该文件，并不要把账号数据提交到仓库。
 
@@ -88,6 +90,8 @@ cargo run --release
 不知道旧密钥时，点击“不知道密钥，重新登录”或按 F5，再确认重新登录。API 凭据沿用已填写的内容，新密钥自动生成，新登录使用 `sessions/<随机标识>/` 下的独立目录；旧 `tdlib/`、`files/` 和以前的会话目录保留在原处，旧配置备份在新目录的 `previous-config.json`。重新验证手机号后会同步云端聊天；旧本地数据仍需要原密钥才能读取。以后启动自动使用新的登录目录。
 
 ## 界面与操作
+
+设置页支持 `Tab` / `Shift+Tab` 选择按钮、`Enter` / `Space` 操作、`↑↓` 滚动、`Esc` 返回；`F6` 随时切换鼠标。关闭鼠标后，键盘登录、输入和会话导航仍可使用。Windows 控制台关闭鼠标时保持键盘输入与窗口调整事件，并禁用会暂停程序的 Quick Edit。
 
 界面采用石墨灰背景与薄荷绿强调色：选中会话保留完整行高，未读徽标靠右，长标题和摘要显示省略号；发送、保存与继续按钮突出显示。消息发送者、正文和时间分别呈现，回复/编辑输入区显示目标消息摘要。宽屏与窄屏沿用相同的鼠标操作和键盘焦点规则。
 
@@ -239,7 +243,7 @@ TG_IMAGE_PROTOCOL=halfblocks cargo run
 | macOS / Linux 的 Ghostty、Kitty | 默认 `auto`；支持 Kitty 图片协议，整帧同步输出 | 协议输出有离线 PTY 检查；[Ghostty 能力说明](https://ghostty.org/docs/about) |
 | macOS 的 iTerm2 | 默认 `auto`，探测异常时可强制 `iterm2` | 使用 [iTerm2 图片协议](https://iterm2.com/documentation-images.html) |
 | WezTerm | 默认 `auto`，可按终端配置强制 `iterm2` 或 `sixel` | 参见 [官方转义序列说明](https://wezterm.org/escape-sequences.html) |
-| Windows 原生终端 | 保留原生鼠标初始化；新版本 Windows Terminal 可用 Sixel，不支持时字符回退 | [Windows Terminal Sixel 说明](https://devblogs.microsoft.com/commandline/windows-terminal-preview-1-22-release/)；Windows 目标编译检查已通过，实机未验证 |
+| Windows Terminal | 正式版 1.22+ 支持 Sixel；默认自动探测，失败时字符回退。保留原生键鼠输入 | [微软正式版说明](https://devblogs.microsoft.com/commandline/windows-terminal-preview-1-23-release/)；原生 ConPTY 输入纳入 CI，GPU 显示仍需实机验证 |
 | Linux Wayland / X11 | 默认 `auto`；系统复制使用 `wl-copy` / `xclip` | 上传、文件浏览不依赖这些剪贴板工具 |
 | Windows + WSL | 按 Windows Terminal 实际能力显示；盘符路径转换，系统复制使用 `clip.exe` | WSL 运行 Linux 版 TDLib，不加载 Windows DLL |
 | SSH / tmux | 能力查询被阻断时用字符模式；复制可通过 OSC 52 写入本机剪贴板 | 原生图片需要外层终端和复用器透传，异常时用回退模式 |
@@ -293,15 +297,17 @@ python3 scripts/test-packaging.py
 cargo clippy --offline --all-targets -- -D warnings
 cargo build --offline
 python3 scripts/test-mouse-pty.py
+python3 scripts/test-keyboard-without-mouse-pty.py
 python3 scripts/test-login-recovery-pty.py
 python3 scripts/test-chat-pty.py
 python3 scripts/test-quick-messages-pty.py
 python3 scripts/test-kitty-pty.py
 python3 scripts/test-attachments-pty.py
 python3 scripts/test-terminal-profiles-pty.py
+python3 scripts/test-sixel-pty.py
 ```
 
-测试涵盖配置保存、密钥迁移和权限、登录与粘贴、消息操作、中文/emoji 换行、媒体回退，以及各页面在不同窗口尺寸下的渲染。页面文本预览会写入 `target/ui-previews/`。鼠标回归测试覆盖面板滚动、历史阅读锚点、草稿恢复、Unicode 光标、弹窗隔离及确认按钮防误触，以及跨消息选择、双击替换、拖动滚动条、缩放/平移、图片解码缓存和快速缩放队列。PTY 检查用于 macOS/Linux，会启动独立临时数据目录，不读取现有登录会话；验证真实终端输入解析、鼠标开关、静置和鼠标移动无输出，以及正常退出。
+测试涵盖配置保存、密钥迁移和权限、登录与粘贴、消息操作、中文/emoji 换行、媒体回退，以及各页面在不同窗口尺寸下的渲染。页面文本预览会写入 `target/ui-previews/`。鼠标回归测试覆盖面板滚动、历史阅读锚点、草稿恢复、Unicode 光标、弹窗隔离及确认按钮防误触，以及跨消息选择、双击替换、拖动滚动条、缩放/平移、图片解码缓存和快速缩放队列。PTY 检查用于 macOS/Linux，会启动独立临时数据目录，不读取现有登录会话；验证真实终端输入解析、鼠标开关、静置和鼠标移动无输出，以及正常退出。`test-keyboard-without-mouse-pty.py` 额外检查关闭鼠标后的登录输入、遮挡显示、聊天输入以及设置页 Tab / Shift+Tab / Enter 操作。
 
 可导出离线夹具的实际字符、颜色和字宽，生成 32 个页面 × 4 个窗口尺寸的 SVG / HTML 预览；此导出代码仅编入测试，不进入客户端：
 
@@ -329,3 +335,15 @@ cargo run -- --demo
 `test-attachments-pty.py` 检查附件入口、多路径暂存、说明、F8 成组提交、取消、贴纸点击、贴纸包切换和搜索；`test-terminal-profiles-pty.py` 检查 Kitty/Sixel/iTerm2/字符协议输出、dumb 回退与关闭同步输出。均使用独立离线数据，不会给真实账号发送消息。
 
 真实账号登录、服务端功能兼容性和性能目标仍需在目标终端实测。草稿同步、通知、语音、群组管理、动态贴纸播放和通话等仍在 [计划](PLAN.md) 中。
+
+### Windows 原生回归验证
+
+GitHub Actions 的 `windows-input` 作业运行 Windows 单元测试、Clippy 和 ConPTY 输入测试。开发者可在 Windows 上执行：
+
+```powershell
+cargo build --locked
+python -m pip install pywinpty==3.0.5
+python -X utf8 scripts/test-windows-terminal.py
+```
+
+pywinpty 只用于测试，不是 Teleaf 的运行依赖。测试使用临时数据和离线演示，覆盖登录输入遮挡、设置键盘焦点、关闭鼠标后的输入、F6、窗口调整与 Ctrl+Q 退出；不填写真实手机号或验证码。ConPTY 不等同于 Windows Terminal 的 GPU 显示验证。Sixel 协议和光标位置另有 Rust 单元测试及 Unix PTY 检查；图片输出后恢复后续文字位置，不增加周期刷新。

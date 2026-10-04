@@ -2,6 +2,36 @@
 use base64::Engine;
 use std::io::{self, Write};
 
+#[cfg(windows)]
+fn without_console_mouse(mode: u32) -> u32 {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_WINDOW_INPUT,
+    };
+    // Quick Edit can suspend console input when the user clicks to select text.
+    // Preserve keyboard flags and keep resize notifications available.
+    (mode & !(ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE))
+        | ENABLE_EXTENDED_FLAGS
+        | ENABLE_WINDOW_INPUT
+}
+
+#[cfg(windows)]
+pub fn disable_console_mouse() -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+    let mut mode = 0;
+    // SAFETY: the standard input handle is borrowed, and mode is writable.
+    unsafe {
+        let input = GetStdHandle(STD_INPUT_HANDLE);
+        if GetConsoleMode(input, &mut mode) == 0
+            || SetConsoleMode(input, without_console_mouse(mode)) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 pub fn sync_output() -> bool {
     std::env::var("TG_SYNC_OUTPUT").as_deref() != Ok("0")
 }
@@ -240,6 +270,22 @@ fn query_input(_: std::time::Duration) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn disabling_mouse_preserves_raw_keyboard_and_resize_events() {
+        use windows_sys::Win32::System::Console::*;
+        let raw = ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT;
+        let mode = super::without_console_mouse(raw);
+        assert_eq!(mode & (ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE), 0);
+        assert_ne!(mode & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+        assert_ne!(mode & ENABLE_WINDOW_INPUT, 0);
+        assert_eq!(
+            mode & (ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT),
+            0
+        );
+        let cooked = ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT;
+        assert_eq!(super::without_console_mouse(cooked) & cooked, cooked);
+    }
     #[test]
     fn clipboard_payload_encodes_controls_instead_of_executing_them() {
         let mut output = vec![];

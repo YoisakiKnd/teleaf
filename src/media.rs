@@ -584,6 +584,57 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn sixel_encodes_inline_and_detail_with_bounded_canvas() {
+        let path = std::env::temp_dir().join(format!("teleaf-sixel-{}.png", std::process::id()));
+        image::RgbImage::from_fn(64, 32, |x, y| image::Rgb([x as u8 * 3, y as u8 * 5, 90]))
+            .save(&path)
+            .unwrap();
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(12, 24));
+        picker.set_protocol_type(ProtocolType::Sixel);
+        for inline in [false, true] {
+            let job = Job {
+                key: (
+                    1,
+                    8,
+                    4,
+                    View {
+                        inline,
+                        ..View::default()
+                    },
+                ),
+                path: path.to_string_lossy().into_owned(),
+                kitty_id: 1,
+            };
+            let encoded = prepare(&picker, &job, &mut Decoded::new(), 1).unwrap();
+            assert!(encoded.weight() <= ENCODED_BUDGET);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 4)).unwrap();
+            terminal
+                .draw(|frame| {
+                    if let Some(protocol) = encoded.inline() {
+                        frame.render_widget(
+                            ratatui_image::sliced::SlicedImage::new(
+                                protocol,
+                                ratatui_image::sliced::SignedPosition::from((0, 0)),
+                            ),
+                            frame.area(),
+                        );
+                    } else {
+                        frame.render_widget(
+                            ratatui_image::Image::new(encoded.regular().unwrap()),
+                            frame.area(),
+                        );
+                    }
+                })
+                .unwrap();
+            let payload = terminal.backend().buffer()[(0, 0)].symbol();
+            assert!(payload.contains("\x1bP") && payload.contains("\x1b\\"));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn extreme_aspect_ratio_is_rejected_before_allocating_resampler_scratch() {
         let path = std::env::temp_dir().join(format!("tg-wide-source-{}.png", std::process::id()));
         image::RgbImage::from_pixel(SOURCE_EDGE + 1, 1, image::Rgb([20, 30, 40]))

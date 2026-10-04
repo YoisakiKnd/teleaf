@@ -66,6 +66,14 @@ struct ReadingPosition {
 }
 
 const MOUSE_CAPTURE: &str = "\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_RELEASE: &str = "\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
+fn disable_mouse_capture(writer: &mut impl io::Write) -> io::Result<()> {
+    // Disable only mouse reporting; keep raw keyboard input and resize events.
+    #[cfg(windows)]
+    terminal::disable_console_mouse()?;
+    execute!(writer, crossterm::style::Print(MOUSE_RELEASE))
+}
 
 fn enable_mouse_capture(writer: &mut impl io::Write) -> io::Result<()> {
     #[cfg(windows)]
@@ -113,7 +121,6 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
             EndSynchronizedUpdate,
@@ -121,6 +128,9 @@ impl Drop for TerminalGuard {
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        // On Windows DisableMouseCapture restores the mode saved AFTER raw mode
+        // was enabled. Restore cooked keyboard input last.
+        let _ = disable_raw_mode();
         let _ = self.terminal.show_cursor();
     }
 }
@@ -145,6 +155,7 @@ struct App {
     attachments: Option<attachments::Picker>,
     show_help: bool,
     show_settings: bool,
+    settings_focus: Option<ui::Action>,
     action_menu: Option<usize>,
     menu_scope: menu::Scope,
     menu_generation: u64,
@@ -235,6 +246,7 @@ impl App {
             chat_visible: 1,
             reveal_chat: true,
             mouse_enabled: true,
+            settings_focus: None,
             folder_offset: 0,
             show_folders: false,
             visible_media: Vec::new(),
@@ -524,6 +536,7 @@ impl App {
         self.show_folders = false;
         self.show_help = false;
         self.show_settings = false;
+        self.settings_focus = None;
         self.action_menu = None;
         self.sticker_picker = false;
         self.attachments = None;
@@ -822,6 +835,39 @@ fn submit_composer(app: &mut App, worker: &TdWorker) -> bool {
     }
 }
 
+fn handle_settings_key(app: &mut App, worker: &TdWorker, code: KeyCode) {
+    const ACTIONS: [ui::Action; 3] = [
+        ui::Action::ApiSetup,
+        ui::Action::OpenLink,
+        ui::Action::ToggleMouse,
+    ];
+    match code {
+        KeyCode::Esc | KeyCode::Char('s') => app.close_overlays(),
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+            let previous = app
+                .settings_focus
+                .and_then(|action| ACTIONS.iter().position(|a| *a == action));
+            let backwards = matches!(code, KeyCode::BackTab | KeyCode::Left);
+            let index = previous.map_or(if backwards { 2 } else { 0 }, |index| {
+                (index + if backwards { 2 } else { 1 }) % ACTIONS.len()
+            });
+            app.settings_focus = Some(ACTIONS[index]);
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if let Some(action) = app.settings_focus {
+                interaction::perform(app, worker, action);
+            }
+        }
+        KeyCode::Down | KeyCode::PageDown => {
+            app.modal_scroll = app.modal_scroll.saturating_add(1);
+        }
+        KeyCode::Up | KeyCode::PageUp => {
+            app.modal_scroll = app.modal_scroll.saturating_sub(1);
+        }
+        _ => {}
+    }
+}
+
 fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
     if code == KeyCode::Esc {
         app.quick_message.cancel_preparation();
@@ -882,9 +928,7 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         return false;
     }
     if app.show_settings {
-        if matches!(code, KeyCode::Esc | KeyCode::Char('s') | KeyCode::F(4)) {
-            app.show_settings = false;
-        }
+        handle_settings_key(app, worker, code);
         return false;
     }
     if let Some(index) = app.action_menu {
@@ -1109,7 +1153,7 @@ fn run(demo: bool) -> io::Result<()> {
             if app.mouse_enabled {
                 enable_mouse_capture(terminal.terminal.backend_mut())?;
             } else {
-                execute!(terminal.terminal.backend_mut(), DisableMouseCapture)?;
+                disable_mouse_capture(terminal.terminal.backend_mut())?;
             }
             capture = app.mouse_enabled;
             app.mouse_press = None;
@@ -1180,7 +1224,9 @@ fn run(demo: bool) -> io::Result<()> {
                             let was_open = app.show_help;
                             app.close_overlays();
                             app.show_help = !was_open;
-                        } else if app.show_settings || app.show_help {
+                        } else if app.show_settings {
+                            handle_settings_key(&mut app, &worker, key.code);
+                        } else if app.show_help {
                             if matches!(
                                 key.code,
                                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('s')
@@ -1188,7 +1234,7 @@ fn run(demo: bool) -> io::Result<()> {
                                 app.show_settings = false;
                                 app.show_help = false;
                             } else if matches!(key.code, KeyCode::Down | KeyCode::PageDown) {
-                                app.modal_scroll = app.modal_scroll.saturating_add(1).min(40);
+                                app.modal_scroll = app.modal_scroll.saturating_add(1);
                             } else if matches!(key.code, KeyCode::Up | KeyCode::PageUp) {
                                 app.modal_scroll = app.modal_scroll.saturating_sub(1);
                             }
@@ -1462,6 +1508,40 @@ fn main() {
 
 #[cfg(test)]
 mod interaction_tests {
+    #[test]
+    fn settings_keyboard_works_when_mouse_is_disabled_before_and_after_login() {
+        use super::*;
+        for ready in [false, true] {
+            let mut app = ui::tests::fixture();
+            let (worker, _) = TdWorker::test_pair();
+            if !ready {
+                app.auth.state = "authorizationStateWaitPhoneNumber".into();
+                app.auth.begin_setup();
+            }
+            interaction::perform(&mut app, &worker, ui::Action::Settings);
+            interaction::perform(&mut app, &worker, ui::Action::ToggleMouse);
+            assert!(!app.mouse_enabled);
+            handle_settings_key(&mut app, &worker, KeyCode::Tab);
+            assert_eq!(app.settings_focus, Some(ui::Action::ApiSetup));
+            handle_settings_key(&mut app, &worker, KeyCode::BackTab);
+            assert_eq!(app.settings_focus, Some(ui::Action::ToggleMouse));
+            handle_settings_key(&mut app, &worker, KeyCode::Enter);
+            assert!(app.mouse_enabled);
+            handle_settings_key(&mut app, &worker, KeyCode::Char(' '));
+            assert!(!app.mouse_enabled);
+            handle_settings_key(&mut app, &worker, KeyCode::Esc);
+            assert!(!app.show_settings);
+            assert_eq!(app.settings_focus, None);
+            if ready {
+                handle_ready_key(&mut app, &worker, KeyCode::Char('i'));
+                handle_ready_key(&mut app, &worker, KeyCode::Char('好'));
+                assert_eq!(app.draft, "好");
+            } else {
+                app.auth.key(KeyCode::Char('1'));
+                assert_eq!(app.auth.setup.as_ref().unwrap().api_id, "1");
+            }
+        }
+    }
     use super::*;
     use tdlib::TdCommand;
 

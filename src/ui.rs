@@ -137,9 +137,10 @@ fn button(frame: &mut Frame, app: &mut App, area: Rect, label: &str, action: Act
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let pressed = app
-        .mouse_press
-        .is_some_and(|(_, target)| target == Target::Command(action));
+    let pressed = (app.show_settings && app.settings_focus == Some(action))
+        || app
+            .mouse_press
+            .is_some_and(|(_, target)| target == Target::Command(action));
     let primary = matches!(action, Action::Submit | Action::Confirm);
     let destructive =
         action == Action::Delete || (action == Action::Confirm && app.confirm_delete.is_some());
@@ -766,12 +767,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         chat_page(frame, app, layout[1]);
     }
-    let hint = if app.auth.is_new_login() {
+    let hint = if app.show_settings {
+        "Tab 选择按钮 · Enter 操作 · ↑↓ 滚动 · F6 鼠标 · Esc 返回"
+    } else if app.show_help {
+        "↑↓ 滚动 · Esc 返回"
+    } else if app.auth.is_new_login() {
         "Enter 确认重新登录 · Esc 返回 · Ctrl+C 退出"
     } else if app.auth.is_recovering() {
         "填入旧本地密钥 · Enter 恢复 · F5 重新登录 · Esc 修改 API"
     } else if app.auth.setup.is_some() {
-        "Tab 切换字段 · Enter 保存并继续 · F2 打开官网 · Ctrl+C 退出"
+        "Tab 切换字段 · Enter 保存 · F2 官网 · F1 注册帮助 · Ctrl+C 退出"
     } else if app.auth.state != "authorizationStateReady" {
         "Enter 继续 · F3 修改 API · F4 设置 · Ctrl+C 退出"
     } else if app.attachments.is_some() {
@@ -795,7 +800,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let notice = app.notice.as_deref().or(app.media.last_error.as_deref());
     let hint = if area.width < 60 {
-        if app.show_help || app.show_settings {
+        if app.show_settings {
+            "Tab 选择 · Enter 操作 · Esc 返回"
+        } else if app.show_help {
             "↑↓ 滚动 · Esc 返回"
         } else if app.attachments.is_some() {
             "Space 选择 · Tab 切换 · F8 / Ctrl+Enter 发送 · Esc 返回"
@@ -1100,14 +1107,14 @@ fn auth_page(frame: &mut Frame, app: &mut App, area: Rect) {
     .split(inner);
     let detail = if setup {
         if compact {
-            "首次填写 API 凭据
-官网领取后粘贴；点击下方切换字段"
+            "填写 API ID / Hash；Tab 切换
+官网无法注册：F1 查看帮助"
         } else {
-            "首次使用，填入你的 Telegram API 凭据。
+            "此安装包尚未提供项目 API 凭据，请填写一次。
 1  打开官网，登录后进入 API development tools
 2  创建应用，Platform 选择 Desktop
 3  粘贴 API ID 和 API Hash，只需填写一次
-配置保存在本机，下次直接登录。"
+官网无法注册：按 F1 查看帮助。"
         }
     } else {
         &app.auth.detail
@@ -1898,11 +1905,29 @@ fn inline_media_view(
             SlicedImage::new(image, SignedPosition::from((0, -(skip as i16)))),
             area,
         );
+        finish_sixel(frame, area, &app.media.protocol_name);
     } else {
         frame.render_widget(
             Paragraph::new("图片准备中 · 点击查看").style(Style::default().fg(palette().muted)),
             area,
         );
+    }
+}
+
+fn finish_sixel(frame: &mut Frame, area: Rect, protocol: &str) {
+    if protocol != "Sixel" || area.is_empty() {
+        return;
+    }
+    let next_column = area.x.saturating_add(2).min(frame.area().right());
+    if let Some(cell) = frame.buffer_mut().cell_mut((area.x, area.y))
+        && cell.symbol().contains("\x1bP")
+    {
+        // Sixel can leave the physical cursor on another row. Ratatui treats
+        // this payload as one cell; adjacent text must start at that next cell.
+        let mut payload = cell.symbol().to_owned();
+        use std::fmt::Write;
+        let _ = write!(payload, "\x1b[{};{next_column}H", area.y + 1);
+        cell.set_symbol(&payload);
     }
 }
 
@@ -1958,6 +1983,7 @@ fn media_view(frame: &mut Frame, app: &mut App, area: Rect, media: Option<MediaR
     if let Some(image) = image {
         let image_area = centered(viewport, image.size().width, image.size().height);
         frame.render_widget(Image::new(image).allow_clipping(true), image_area);
+        finish_sixel(frame, image_area, &app.media.protocol_name);
         if preview {
             app.hit_targets
                 .push((image_area, Target::Image(image_area)));
@@ -2208,10 +2234,9 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
                 sticker.preview.file_id,
                 Size::new(image_area.width, image_area.height),
             ) {
-                frame.render_widget(
-                    Image::new(image).allow_clipping(true),
-                    centered(image_area, image.size().width, image.size().height),
-                );
+                let image_area = centered(image_area, image.size().width, image.size().height);
+                frame.render_widget(Image::new(image).allow_clipping(true), image_area);
+                finish_sixel(frame, image_area, &app.media.protocol_name);
             } else {
                 frame.render_widget(
                     Paragraph::new(sticker.emoji).alignment(Alignment::Center),
@@ -2448,10 +2473,9 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         let id = crate::attachments::preview_id(&path);
         app.media.request(id, &path.to_string_lossy(), size);
         if let Some(image) = app.media.get(id, size) {
-            frame.render_widget(
-                Image::new(image).allow_clipping(true),
-                centered(preview, image.size().width, image.size().height),
-            );
+            let image_area = centered(preview, image.size().width, image.size().height);
+            frame.render_widget(Image::new(image).allow_clipping(true), image_area);
+            finish_sixel(frame, image_area, &app.media.protocol_name);
         }
     }
     editor(
@@ -2514,6 +2538,13 @@ fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("图片：滚轮或 +/- 缩放 · 拖动或方向键平移 · 0 复位"),
         Line::from("选中文字后 Ctrl+C 复制 · 输入区 Ctrl+A 全选"),
         muted("终端自带的选字修饰键因终端而异，可用 F6 暂停鼠标。"),
+        Line::from(""),
+        Line::styled("API 凭据与官网注册", Style::default().fg(palette().accent)),
+        Line::from("已有应用：登录 my.telegram.org/apps 复制原 API ID / Hash。"),
+        Line::from("每个号码只能创建一个 API ID，已有应用无需重新注册。"),
+        Line::from("官网 ERROR 是 Telegram 的注册错误，客户端无法代为修复。"),
+        Line::from("联系发布者提供含 Teleaf 项目凭据的安装包，可免手动注册。"),
+        muted("二维码登录也需要应用凭据；官方示例 ID 不适合发行。"),
     ];
     scrolling_text(frame, lines, inner, &mut app.modal_scroll);
 }
@@ -2580,6 +2611,34 @@ fn scrolling_text(frame: &mut Frame, lines: Vec<Line<'static>>, area: Rect, scro
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn sixel_restores_cursor_before_adjacent_text_and_keeps_idle_frames_unchanged() {
+        use ratatui_image::protocol::{Protocol, sixel::Sixel};
+        let image = Protocol::Sixel(Sixel {
+            data: "\x1bP0;1;0q#0;2;100;0;0#0~-\x1b\\".into(),
+            size: Size::new(1, 1),
+            is_tmux: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
+        let mut previous = None;
+        for _ in 0..2 {
+            terminal
+                .draw(|frame| {
+                    let area = Rect::new(2, 1, 1, 1);
+                    frame.render_widget(Image::new(&image), area);
+                    finish_sixel(frame, area, "Sixel");
+                    frame.render_widget(Paragraph::new("ok"), Rect::new(3, 1, 2, 1));
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(buffer[(2, 1)].symbol().ends_with("\x1b[2;4H"));
+            assert_eq!(buffer[(3, 1)].symbol(), "o");
+            if let Some(previous) = &previous {
+                assert_eq!(buffer, previous);
+            }
+            previous = Some(buffer.clone());
+        }
+    }
     use super::*;
     use crate::auth::AuthFlow;
     use crate::media::MediaManager;

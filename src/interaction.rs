@@ -71,6 +71,14 @@ fn zoomable(app: &App) -> bool {
 }
 
 pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
+    if app.show_settings
+        && matches!(
+            action,
+            Action::ApiSetup | Action::OpenLink | Action::ToggleMouse
+        )
+    {
+        app.settings_focus = Some(action);
+    }
     if action == Action::Cancel {
         app.quick_message.cancel_preparation();
     }
