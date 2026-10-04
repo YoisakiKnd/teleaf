@@ -72,7 +72,7 @@ cargo run --release
 
 自动发布、Homebrew 配方和 Scoop 清单生成方式见 [RELEASING.md](RELEASING.md)。
 
-包含 Teleaf 项目 API 凭据的安装包会直接进入手机号、验证码和两步验证流程，普通用户无需注册 Telegram 应用。发布者配置方式见 [RELEASING.md](RELEASING.md#项目-api-凭据)。已发布的 `v0.1.1` 尚未内置项目凭据；源码未配置项目凭据时也会显示手动表单：
+从 `v0.1.2` 起，安装包包含 Teleaf 项目 API 凭据，会直接进入手机号、验证码和两步验证流程，普通用户无需注册 Telegram 应用。发布者配置方式见 [RELEASING.md](RELEASING.md#项目-api-凭据)。已发布的 `v0.1.1` 尚未内置项目凭据；源码未配置项目凭据时也会显示手动表单：
 
 1. 按 `F2` 打开 [Telegram API 页面](https://my.telegram.org/apps)，登录并进入 **API development tools**。
 2. 创建应用：应用名和 Short name 自定，Platform 选 **Desktop**。
@@ -278,7 +278,7 @@ cargo run --release
 $env:TG_IMAGE_PROTOCOL = 'sixel'
 ```
 
-Linux / WSL 使用 `libtdjson.so`，macOS 使用 `libtdjson.dylib`；`TDLIB_PATH` 指向对应系统的库。当前实测主机为 macOS；Windows 做了编译检查，其他终端的原生图片输出做了协议测试，Linux/Windows 实机与真实账号上传仍需验证。PTY 测试使用 Unix API，只能在 macOS/Linux/WSL 运行，不能直接在原生 PowerShell 运行。
+Linux / WSL 使用 `libtdjson.so`，macOS 使用 `libtdjson.dylib`；`TDLIB_PATH` 指向对应系统的库。交互式实测主机为 macOS；五个平台已在原生 CI 构建和测试，Windows ConPTY 输入已验证，原生图片输出有协议测试。Linux/Windows 的交互式终端 GPU 显示及真实账号上传仍需实机验证。PTY 测试使用 Unix API，只能在 macOS/Linux/WSL 运行，不能直接在原生 PowerShell 运行。
 
 ## TDLib
 

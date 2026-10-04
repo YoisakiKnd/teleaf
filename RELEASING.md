@@ -45,9 +45,19 @@ Scoop 清单必须与该次实际发布的 Windows ZIP 版本、下载地址、S
 
 项目许可证为 MIT，清单使用 `license: MIT`。第三方运行库保留自己的许可文本。新的发布包自动包含根目录 `LICENSE`；`v0.1.0` 的既有安装包保持原始哈希，MIT 文本作为额外 Release 资产提供。
 
+## 0.1.2 发布验证
+
+2026-10-04 已发布 [v0.1.2](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.2)，标签对应 `1b3d1ec`。主仓库原生 CI [37167271185](https://github.com/YoisakiKnd/teleaf/actions/runs/37167271185) 通过：Unix 105 / Windows 106 项单元测试，Windows ConPTY 登录、关闭鼠标后的输入、窗口调整和退出，以及 Clippy 与终端回归。
+
+正式发布 [37167430406](https://github.com/YoisakiKnd/teleaf/actions/runs/37167430406) 五个平台均通过原生构建、测试、运行库加载和打包；发布前运行实际 Linux x64 安装包验证内置 API 凭据能进入手机号页面且保留已有配置。下载后的五份安装包、SHA256SUMS、GitHub 资产摘要及许可证均已核验；实际 macOS ARM 安装包也通过相同登录启动验证。测试未提交真实手机号或验证码。
+
+Homebrew 配方更新至 0.1.2（`bbf5f73`）；自有 Scoop [同步任务 37167698846](https://github.com/YoisakiKnd/scoop-teleaf/actions/runs/37167698846) 成功（`3da39a1`）。两份包清单与 Release 资产一致。Windows ZIP SHA-256：`e8e7e83787ca3481af73ef83bd0ffc284db9853cf6041938f935a3bb2e7ec63d`。按新约定，没有为 eimer 创建或更新 PR。
+
+Windows Terminal 的实际 GPU 图片显示仍需终端实机验证；ConPTY 原生输入和 Sixel 编码/协议测试不能代替该项。
+
 ## 用户安装
 
-[v0.1.1](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.1)及安装清单已发布：
+[v0.1.2](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.2)及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/teleaf https://github.com/YoisakiKnd/teleaf
