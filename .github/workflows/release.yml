@@ -84,6 +84,10 @@ jobs:
           pattern: release-*
           path: target/dist
           merge-multiple: true
+      - name: Verify bundled application login before publication
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/verify-bundled-release.py --version "${RELEASE_TAG#v}"
       - name: Generate package manifests from release assets
         env:
           RELEASE_TAG: ${{ github.ref_name }}

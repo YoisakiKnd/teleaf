@@ -52,7 +52,9 @@ class Terminal:
             text += self.read(.1)
             if needle.replace(' ', '') in text.replace(' ', ''):
                 return
-        raise AssertionError('ConPTY did not display: ' + needle)
+        diagnostic = ANSI.sub('', self.output[-2000:])
+        diagnostic = diagnostic.replace('private-test-hash', '<masked test value>')
+        raise AssertionError(f'ConPTY did not display: {needle}; alive={self.proc.isalive()}; tail={diagnostic!r}')
 
     def close(self):
         self.send('\x11')  # Ctrl+Q: must remain available with mouse disabled.
@@ -64,7 +66,7 @@ class Terminal:
 
 
 def toggle_mouse_off(terminal):
-    terminal.send('\x1b[14~')  # F4
+    terminal.send('\x1bOS')  # F4's SS3 encoding, accepted by the ConPTY input parser.
     terminal.wait('设置与连接')
     terminal.send('\t\t\t\r')
     terminal.wait('鼠标：关')
@@ -95,7 +97,7 @@ for demo, protocol in [(False, 'halfblocks'), (True, 'auto'), (True, 'sixel')]:
                 terminal.wait('•')
                 assert 'private-test-hash' not in terminal.output
                 assert not (Path(directory) / 'config.json').exists()
-            terminal.send('\x1b[14~')
+            terminal.send('\x1bOS')
             terminal.wait('设置与连接')
             if protocol == 'sixel':
                 # The headless ConPTY host may consume graphics; verify the
