@@ -9,7 +9,7 @@ use windows::UI::Notifications::{
 };
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::Com::StructuredStorage::{
-    InitPropVariantFromCLSID, PROPVARIANT, PropVariantClear,
+    InitPropVariantFromCLSID, PROPVARIANT, PVCHF_DEFAULT, PropVariantChangeType,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile,
@@ -23,7 +23,7 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::{
     FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellLink,
 };
-use windows::core::{GUID, HSTRING, Interface, PCWSTR, PWSTR};
+use windows::core::{GUID, HSTRING, Interface, PCWSTR};
 
 use super::Command;
 
@@ -65,23 +65,25 @@ fn wide(path: &Path) -> Vec<u16> {
 fn shortcut(path: &Path, executable: &Path) -> windows::core::Result<()> {
     let executable = wide(executable);
     let path = wide(path);
-    let app_id: Vec<u16> = APP_ID.encode_utf16().chain(Some(0)).collect();
     // SAFETY: COM is initialized; all strings remain valid through each copying call.
     unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         link.SetPath(PCWSTR(executable.as_ptr()))?;
         link.SetDescription(windows::core::w!("Teleaf Telegram terminal client"))?;
         let properties: IPropertyStore = link.cast()?;
-        // A borrowed VT_LPWSTR; SetValue copies it. It must not be PropVariantClear'd.
+        // PROPVARIANT has an automatic destructor in windows-rs. Convert an owned
+        // BSTR to an owned LPWSTR, so every success/error path frees system memory.
         let mut value = PROPVARIANT::default();
-        (*value.Anonymous.Anonymous).vt = VT_LPWSTR;
-        (*value.Anonymous.Anonymous).Anonymous.pwszVal = PWSTR(app_id.as_ptr().cast_mut());
+        PropVariantChangeType(
+            &mut value,
+            &PROPVARIANT::from(APP_ID),
+            PVCHF_DEFAULT,
+            VT_LPWSTR,
+        )?;
         properties.SetValue(&APP_ID_KEY, &value)?;
         // Microsoft-supported stub CLSID + protocol activation persists unpackaged toasts.
-        let mut activator = InitPropVariantFromCLSID(&STUB_CLSID)?;
-        let result = properties.SetValue(&ACTIVATOR_KEY, &activator);
-        PropVariantClear(&mut activator)?;
-        result?;
+        let activator = InitPropVariantFromCLSID(&STUB_CLSID)?;
+        properties.SetValue(&ACTIVATOR_KEY, &activator)?;
         properties.Commit()?;
         let file: IPersistFile = link.cast()?;
         file.Save(PCWSTR(path.as_ptr()), true)?;
@@ -239,7 +241,7 @@ mod tests {
             )
             .unwrap();
             let properties: IPropertyStore = link.cast().unwrap();
-            let mut value = properties.GetValue(&APP_ID_KEY).unwrap();
+            let value = properties.GetValue(&APP_ID_KEY).unwrap();
             assert_eq!(value.Anonymous.Anonymous.vt, VT_LPWSTR);
             let identity = value
                 .Anonymous
@@ -248,15 +250,13 @@ mod tests {
                 .pwszVal
                 .to_string()
                 .unwrap();
-            windows::Win32::System::Com::StructuredStorage::PropVariantClear(&mut value).unwrap();
             assert_eq!(identity, APP_ID);
-            let mut value = properties.GetValue(&ACTIVATOR_KEY).unwrap();
+            let value = properties.GetValue(&ACTIVATOR_KEY).unwrap();
             assert_eq!(
                 value.Anonymous.Anonymous.vt,
                 windows::Win32::System::Variant::VT_CLSID
             );
             assert_eq!(*value.Anonymous.Anonymous.Anonymous.puuid, STUB_CLSID);
-            PropVariantClear(&mut value).unwrap();
         }
         std::fs::remove_dir_all(folder).unwrap();
     }
