@@ -63,9 +63,15 @@ with tempfile.TemporaryDirectory(prefix='teleaf-keyboard-demo-') as folder:
         terminal.read(.3)
         terminal.send(b'keyboard-without-mouse')
         terminal.wait('keyboard-without-mouse')
+        terminal.send(b'\r')
+        terminal.read(.3)
+        terminal.send(b'q-followup-without-refocusing')
+        terminal.wait('q-followup-without-refocusing')
+        terminal.send(b'\r')
+        terminal.read(.3)
         restore_from_settings(terminal)
         terminal.close()
     finally:
         terminal.cleanup()
 
-print('PTY keyboard without mouse: PASS (settings Tab/Shift+Tab/Enter, login typing/masking, chat typing, Esc, clean exit)')
+print('PTY keyboard without mouse: PASS (settings Tab/Shift+Tab/Enter, login typing/masking, consecutive sends retain composer, Esc, clean exit)')

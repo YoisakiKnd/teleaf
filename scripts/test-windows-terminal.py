@@ -100,6 +100,12 @@ for demo, protocol in [(False, 'halfblocks'), (True, 'auto'), (True, 'sixel')]:
                 terminal.read(.2)
                 terminal.send('windows-keyboard-input')
                 terminal.wait('windows-keyboard-input')
+                terminal.send('\r')
+                terminal.read(.3)
+                terminal.send('q-followup-without-refocusing')
+                terminal.wait('q-followup-without-refocusing')
+                terminal.send('\r')
+                terminal.read(.3)
                 terminal.proc.pty.set_size(90, 30)
                 terminal.screen.resize(lines=30, columns=90)
                 terminal.read(.3)
@@ -116,7 +122,7 @@ for demo, protocol in [(False, 'halfblocks'), (True, 'auto'), (True, 'sixel')]:
                 # The headless ConPTY host may consume graphics; verify the
                 # configured encoder and native keyboard path, not GPU output.
                 assert 'Sixel' in terminal.read(.2) + ANSI.sub('', terminal.output)
-            terminal.send('\x1b[Z\r')  # Shift+Tab, Enter enables mouse again.
+            terminal.send('\x1b[Z\x1b[Z\r')  # Skip Notifications, then enable Mouse.
             terminal.wait('鼠标：开')
             terminal.send('\x1b[17~')  # F6 disables it again.
             terminal.wait('鼠标：关')

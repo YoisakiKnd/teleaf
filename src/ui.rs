@@ -68,6 +68,7 @@ pub(crate) enum Action {
     Settings,
     Help,
     ToggleMouse,
+    ToggleNotifications,
     NextField,
     NewLogin,
     Folders,
@@ -2604,7 +2605,11 @@ fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = modal(frame, app, centered(area, 70, 21), "设置与连接");
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(if cfg!(windows) { 3 } else { 2 }),
+    ])
+    .split(inner);
     let tools = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(Rect::new(rows[1].x, rows[1].y, rows[1].width, 1));
     button(frame, app, tools[0], "[修改 API]", Action::ApiSetup);
@@ -2620,6 +2625,19 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         },
         Action::ToggleMouse,
     );
+    if cfg!(windows) {
+        button(
+            frame,
+            app,
+            Rect::new(rows[1].x, rows[1].y + 2, rows[1].width, 1),
+            if app.notifications.enabled {
+                "[Windows 通知：开]"
+            } else {
+                "[Windows 通知：关]"
+            },
+            Action::ToggleNotifications,
+        );
+    }
     let (api_id, directory) = app.auth.config_summary();
     let lines = vec![
         Line::styled("账号连接", Style::default().fg(palette().accent)),

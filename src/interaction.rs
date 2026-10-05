@@ -74,7 +74,7 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
     if app.show_settings
         && matches!(
             action,
-            Action::ApiSetup | Action::OpenLink | Action::ToggleMouse
+            Action::ApiSetup | Action::OpenLink | Action::ToggleMouse | Action::ToggleNotifications
         )
     {
         app.settings_focus = Some(action);
@@ -117,6 +117,10 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                                 app.clipboard.submitted(picker.clipboard_images);
                                 if consume {
                                     finish_input(app);
+                                    if app.input_mode == InputMode::Off {
+                                        app.input_mode = InputMode::Send;
+                                        app.composer_focus = true;
+                                    }
                                 }
                                 app.notice = Some("附件已提交，上传结果见聊天记录".into());
                             }
@@ -249,6 +253,14 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
         Action::NewLogin => app.auth.choose_new_login(),
         Action::ToggleMouse => {
             app.mouse_enabled = !app.mouse_enabled;
+        }
+        Action::ToggleNotifications => {
+            app.notifications.toggle();
+            if app.auth.state == "authorizationStateReady" && !app.demo {
+                for request in app.notifications.requests() {
+                    send_request(app, worker, request);
+                }
+            }
         }
         Action::OpenLink => {
             let url = if app.auth.setup.is_some() || app.show_settings {

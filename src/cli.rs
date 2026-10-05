@@ -5,6 +5,8 @@ pub enum Command {
     Help,
     Version,
     Check,
+    DismissNotification,
+    TestNotification,
 }
 
 pub const HELP: &str = "Teleaf — Telegram 终端客户端
@@ -12,6 +14,7 @@ pub const HELP: &str = "Teleaf — Telegram 终端客户端
 用法：teleaf [选项]
   --demo       离线演示，不读取账号配置
   --check      检查随附 TDLib 能否加载，不登录或打开数据库
+  --test-notification  测试 Windows 原生通知，无需登录
   --version    显示版本
   --help       显示帮助
 
@@ -27,6 +30,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
             "--help" | "-h" => Ok(Command::Help),
             "--version" | "-V" => Ok(Command::Version),
             "--check" => Ok(Command::Check),
+            // A fixed Windows toast protocol handler; never opens a second TDLib session.
+            "--dismiss-notification" => Ok(Command::DismissNotification),
+            "--test-notification" => Ok(Command::TestNotification),
             _ => Err(format!("未知参数：{arg}；运行 teleaf --help 查看用法")),
         },
         _ => Err("每次只支持一个选项；运行 teleaf --help 查看用法".into()),
@@ -44,6 +50,8 @@ mod tests {
             (vec!["--check"], Command::Check),
             (vec!["--version"], Command::Version),
             (vec!["--help"], Command::Help),
+            (vec!["--dismiss-notification"], Command::DismissNotification),
+            (vec!["--test-notification"], Command::TestNotification),
         ] {
             assert_eq!(parse(args.into_iter().map(str::to_owned)), Ok(expected));
         }

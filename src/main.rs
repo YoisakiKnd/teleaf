@@ -9,6 +9,7 @@ mod demo;
 mod interaction;
 mod media;
 mod menu;
+mod notifications;
 mod quick_message;
 mod resample;
 mod selection;
@@ -155,6 +156,7 @@ struct App {
     sticker_panel: stickers::Panel,
     attachments: Option<attachments::Picker>,
     clipboard: clipboard::State,
+    notifications: notifications::State,
     show_help: bool,
     show_settings: bool,
     settings_focus: Option<ui::Action>,
@@ -229,6 +231,7 @@ impl App {
             sticker_panel: stickers::Panel::default(),
             attachments: None,
             clipboard: clipboard::State::default(),
+            notifications: notifications::State::default(),
             show_help: false,
             show_settings: false,
             action_menu: None,
@@ -308,6 +311,11 @@ impl App {
                     .and_then(|kind| kind.as_str())
                     .unwrap_or("未知事件")
                     .to_owned();
+                self.notifications.update(
+                    &value,
+                    &self.store,
+                    self.auth.state == "authorizationStateReady" && !self.demo,
+                );
                 if self.last_update == "updateConnectionState" {
                     self.connection_label =
                         match value.pointer("/state/@type").and_then(Value::as_str) {
@@ -786,7 +794,13 @@ fn drain_events(receiver: &Receiver<TdEvent>, app: &mut App, worker: &TdWorker) 
     for _ in 0..256 {
         match receiver.try_recv() {
             Ok(event) => {
+                let was_ready = app.auth.state == "authorizationStateReady";
                 let (request, redraw) = app.apply(event);
+                if !was_ready && app.auth.state == "authorizationStateReady" && !app.demo {
+                    for request in app.notifications.requests() {
+                        changed |= !send_request(app, worker, request);
+                    }
+                }
                 if let Some(request) = request {
                     changed |= !send_request(app, worker, request);
                 }
@@ -974,6 +988,7 @@ fn submit_composer(app: &mut App, worker: &TdWorker) -> bool {
     if let Some(request) = app.submit_input()
         && send_request(app, worker, request)
     {
+        let keep_composer = matches!(app.input_mode, InputMode::Send | InputMode::Reply(_));
         if app.input_mode == InputMode::Search {
             app.search_query = app.draft.clone();
             app.show_search = true;
@@ -984,6 +999,11 @@ fn submit_composer(app: &mut App, worker: &TdWorker) -> bool {
         app.timeline_anchor = None;
         app.pending_messages = 0;
         interaction::finish_input(app);
+        if keep_composer && app.input_mode == InputMode::Off {
+            app.input_mode = InputMode::Send;
+            app.composer_focus = true;
+            app.focus_messages = true;
+        }
         true
     } else {
         false
@@ -991,22 +1011,23 @@ fn submit_composer(app: &mut App, worker: &TdWorker) -> bool {
 }
 
 fn handle_settings_key(app: &mut App, worker: &TdWorker, code: KeyCode) {
-    const ACTIONS: [ui::Action; 3] = [
+    let actions = &[
         ui::Action::ApiSetup,
         ui::Action::OpenLink,
         ui::Action::ToggleMouse,
-    ];
+        ui::Action::ToggleNotifications,
+    ][..if cfg!(windows) { 4 } else { 3 }];
     match code {
         KeyCode::Esc | KeyCode::Char('s') => app.close_overlays(),
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
             let previous = app
                 .settings_focus
-                .and_then(|action| ACTIONS.iter().position(|a| *a == action));
+                .and_then(|action| actions.iter().position(|a| *a == action));
             let backwards = matches!(code, KeyCode::BackTab | KeyCode::Left);
-            let index = previous.map_or(if backwards { 2 } else { 0 }, |index| {
-                (index + if backwards { 2 } else { 1 }) % ACTIONS.len()
+            let index = previous.map_or(if backwards { actions.len() - 1 } else { 0 }, |index| {
+                (index + if backwards { actions.len() - 1 } else { 1 }) % actions.len()
             });
-            app.settings_focus = Some(ACTIONS[index]);
+            app.settings_focus = Some(actions[index]);
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             if let Some(action) = app.settings_focus {
@@ -1302,6 +1323,15 @@ fn run(demo: bool) -> io::Result<()> {
             accept_clipboard(&mut app, chat, mode, result);
             dirty = true;
         }
+        if let Some(error) = app.notifications.poll_error() {
+            app.notice = Some(error);
+            if app.auth.state == "authorizationStateReady" && !app.demo {
+                for request in app.notifications.requests() {
+                    send_request(&mut app, &worker, request);
+                }
+            }
+            dirty = true;
+        }
         if app.auth.take_restart() {
             worker.shutdown();
             app = App::new();
@@ -1566,6 +1596,19 @@ fn open_url(url: &str) -> Result<(), String> {
 
 fn main() {
     let demo = match cli::parse(std::env::args().skip(1)) {
+        Ok(cli::Command::DismissNotification) => return,
+        Ok(cli::Command::TestNotification) => {
+            match notifications::test_notification() {
+                Ok(()) => {
+                    println!("已请求显示 Teleaf 测试通知；请检查 Windows 通知中心和勿扰设置。")
+                }
+                Err(error) => {
+                    eprintln!("Teleaf: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         Ok(cli::Command::Help) => {
             println!("{}", cli::HELP);
             return;
@@ -1602,6 +1645,42 @@ fn main() {
 
 #[cfg(test)]
 mod interaction_tests {
+    #[test]
+    fn sending_and_replying_keep_composer_focused_for_the_next_message() {
+        for reply in [false, true] {
+            let mut app = super::ui::tests::fixture();
+            let (worker, requests) = super::TdWorker::test_pair();
+            app.input_mode = if reply {
+                super::InputMode::Reply(2)
+            } else {
+                super::InputMode::Send
+            };
+            app.composer_focus = true;
+            app.draft = "第一条".into();
+            super::handle_ready_key(&mut app, &worker, super::KeyCode::Enter);
+            assert!(app.draft.is_empty());
+            assert!(app.input_mode == super::InputMode::Send);
+            assert!(app.composer_focus);
+            assert!(app.focus_messages);
+            assert!(requests.try_recv().is_ok());
+            assert!(!super::handle_ready_key(
+                &mut app,
+                &worker,
+                super::KeyCode::Char('q')
+            ));
+            assert_eq!(app.draft, "q");
+            super::interaction::perform(&mut app, &worker, super::ui::Action::Submit);
+            let super::tdlib::TdCommand::Request(request) = requests.try_recv().unwrap() else {
+                panic!()
+            };
+            assert_eq!(request["input_message_content"]["text"]["text"], "q");
+            assert!(request["reply_to"].is_null());
+            assert!(app.composer_focus);
+            super::handle_ready_key(&mut app, &worker, super::KeyCode::Esc);
+            assert!(app.input_mode == super::InputMode::Off);
+        }
+    }
+
     #[test]
     fn switching_chats_cancels_clipboard_even_when_returning_to_the_same_chat() {
         let mut app = super::ui::tests::fixture();
@@ -1661,8 +1740,16 @@ mod interaction_tests {
             interaction::perform(&mut app, &worker, ui::Action::ToggleMouse);
             assert!(!app.mouse_enabled);
             handle_settings_key(&mut app, &worker, KeyCode::Tab);
+            if cfg!(windows) {
+                assert_eq!(app.settings_focus, Some(ui::Action::ToggleNotifications));
+                handle_settings_key(&mut app, &worker, KeyCode::Tab);
+            }
             assert_eq!(app.settings_focus, Some(ui::Action::ApiSetup));
             handle_settings_key(&mut app, &worker, KeyCode::BackTab);
+            if cfg!(windows) {
+                assert_eq!(app.settings_focus, Some(ui::Action::ToggleNotifications));
+                handle_settings_key(&mut app, &worker, KeyCode::BackTab);
+            }
             assert_eq!(app.settings_focus, Some(ui::Action::ToggleMouse));
             handle_settings_key(&mut app, &worker, KeyCode::Enter);
             assert!(app.mouse_enabled);
@@ -1779,6 +1866,7 @@ mod interaction_tests {
         };
         assert_eq!(request["reply_to"]["message_id"], 2);
         assert_eq!(request["input_message_content"]["text"]["text"], "回复内容");
+        handle_ready_key(&mut app, &worker, KeyCode::Esc);
         handle_ready_key(&mut app, &worker, KeyCode::Char('d'));
         handle_ready_key(&mut app, &worker, KeyCode::Esc);
         assert!(requests.try_recv().is_err());

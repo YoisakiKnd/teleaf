@@ -109,6 +109,8 @@ cargo run --release
 
 宽终端显示会话列表、消息和输入区；窄终端使用单栏，通过 `Tab` 在会话与消息间切换。会话列表显示最近消息和未读数，长消息自动换行。滚轮按行滚动鼠标所在面板，消息选中状态与滚动位置独立；`PgUp` / `PgDn` 也可以滚动消息。最小窗口为 30 列 × 12 行。
 
+普通发送和回复后继续停留在输入框，可以连续发送；回复目标在发送后清除，`Esc` 返回消息浏览。编辑、搜索和表情回应完成后恢复之前的草稿。
+
 | 操作 | 按键 |
 | --- | --- |
 | 选择会话或消息 | `↑/↓` 或 `j/k`，也可单击；滚轮只滚动内容 |
@@ -288,6 +290,18 @@ $env:TG_IMAGE_PROTOCOL = 'sixel'
 
 Linux / WSL 使用 `libtdjson.so`，macOS 使用 `libtdjson.dylib`；`TDLIB_PATH` 指向对应系统的库。交互式实测主机为 macOS；五个平台已在原生 CI 构建和测试，Windows ConPTY 输入已验证，原生图片输出有协议测试。Linux/Windows 的交互式终端 GPU 显示及真实账号上传仍需实机验证。PTY 测试使用 Unix API，只能在 macOS/Linux/WSL 运行，不能直接在原生 PowerShell 运行。
 
+## Windows 消息通知
+
+Windows 10/11 默认启用原生 WinRT 提醒，应用运行时接收消息；设置页可用鼠标或 `Tab` / `Enter` 切换 **Windows 通知**。开关只影响本次运行；长期关闭可先在 PowerShell 设置 `$env:TG_NOTIFICATIONS="0"` 再启动。
+
+提醒使用 [TDLib Notification API](https://core.telegram.org/tdlib/notification-api)，支持普通消息与提及，遵循 Telegram 通知/静音设置；忽略启动前的历史通知、自己发送的消息和重复事件，同一通知组的新消息替换已有提醒。消息读完或通知撤回后移除对应提醒。只使用文字和媒体类型摘要，不下载通知图片。
+
+第一次通知会为当前用户创建 **Teleaf Notifications** 开始菜单快捷方式及 `teleaf-notification` 通知关闭协议，无需管理员权限。当前通知是只读提醒，点击关闭，不跳转会话；关闭处理进程立即退出，不加载 TDLib 或打开账号数据库。Windows 系统通知设置中可关闭声音、预览或整个应用的提醒；勿扰模式也会影响弹窗。
+
+通知线程按需启动、队列最多 16 项、空闲 30 秒后退出；去重及已显示记录有数量上限，不增加聊天轮询。macOS/Linux 本轮没有原生通知后端。
+
+先运行 `teleaf --test-notification` 检查系统提醒，无需登录；测试通知为静音。再保持 Teleaf 登录，用另一个账号向未静音会话发消息，检查弹窗与通知中心；读完消息后检查提醒撤回，再检查静音、设置关闭与连续群消息。CI 覆盖通知过滤和 Windows XML/快捷方式标识，实际弹窗、声音和勿扰模式需 Windows 桌面验证。
+
 ## TDLib
 
 安装脚本借鉴 [`tgt`](https://github.com/FedericoBruzzone/tgt) 的预编译库分发方式，使用 [`tdlib-rs` v1.4.0](https://github.com/FedericoBruzzone/tdlib-rs/releases/tag/v1.4.0) 的 TDLib 1.8.61，支持 macOS arm64/x86_64，并检查固定 SHA-256。库下载到 `target/tdlib/`；`cargo clean` 后需重新安装。
@@ -344,7 +358,7 @@ cargo run -- --demo
 
 `test-clipboard-pty.py` 检查 F7、附件粘贴入口、SSH 回退、取消和静置零输出；不读取系统剪贴板。Rust 测试检查剪贴板 PNG 暂存、取消/移除清理、确认后源文件保留、回复/草稿及过期结果；macOS 另外使用私有剪贴板验证 PNG、TIFF、文件列表和文字，不修改用户剪贴板。Windows 和 Wayland/X11 的真实桌面剪贴板仍需对应平台实测。
 
-真实账号登录、服务端功能兼容性和性能目标仍需在目标终端实测。草稿同步、通知、语音、群组管理、动态贴纸播放和通话等仍在 [计划](PLAN.md) 中。
+真实账号登录、服务端功能兼容性和性能目标仍需在目标终端实测。草稿同步、跨平台通知、语音、群组管理、动态贴纸播放和通话等仍在 [计划](PLAN.md) 中。
 
 ### Windows 原生回归验证
 
