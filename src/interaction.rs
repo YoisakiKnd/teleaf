@@ -113,7 +113,8 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                         Ok(request) => {
                             if send_request(app, worker, request) {
                                 let consume = app.attachments.as_ref().unwrap().consume_path_draft;
-                                app.attachments = None;
+                                let picker = app.attachments.take().unwrap();
+                                app.clipboard.submitted(picker.clipboard_images);
                                 if consume {
                                     finish_input(app);
                                 }
@@ -166,6 +167,9 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                 picker.photos = !picker.photos;
                 picker.error = None;
             }
+        }
+        Action::PasteClipboard => {
+            crate::start_clipboard_paste(app);
         }
         Action::AttachmentParent => {
             if let Some(picker) = &mut app.attachments
@@ -952,7 +956,7 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                     if app.show_help || app.show_settings =>
                 {
                     let before = app.modal_scroll;
-                    app.modal_scroll = before.saturating_add_signed(delta as i16).min(40);
+                    app.modal_scroll = before.saturating_add_signed(delta as i16);
                     before != app.modal_scroll
                 }
                 _ => false,
@@ -1098,7 +1102,7 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
             if let Some(picker) = &mut app.attachments
                 && index < picker.selected.len()
             {
-                picker.selected.remove(index);
+                picker.remove(index);
             }
             true
         }
@@ -1201,6 +1205,21 @@ mod tests {
             .collect();
         app.selected_message = Some(60);
         app
+    }
+
+    #[test]
+    fn help_wheel_can_scroll_beyond_forty_rows() {
+        let mut app = ui::tests::fixture();
+        let (worker, _) = TdWorker::test_pair();
+        app.show_help = true;
+        draw(&mut app, 32, 16);
+        let rect = target(&app, Target::Panel(Pane::Modal));
+        app.modal_scroll = 45;
+        assert!(event(&mut app, &worker, MouseEventKind::ScrollDown, rect));
+        assert!(app.modal_scroll > 45);
+        let before = app.modal_scroll;
+        assert!(event(&mut app, &worker, MouseEventKind::ScrollUp, rect));
+        assert!(app.modal_scroll < before);
     }
 
     #[test]

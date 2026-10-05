@@ -4,7 +4,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+    Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 use ratatui_image::Image;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
@@ -75,6 +75,7 @@ pub(crate) enum Action {
     Back,
     AttachmentMode,
     AttachmentParent,
+    PasteClipboard,
     StickerPrevious,
     StickerNext,
     StickerSearch,
@@ -1394,6 +1395,8 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
     frame.render_stateful_widget(
         List::new(items)
             .highlight_symbol("› ")
+            // Keep the gutter when the selected chat is outside the viewport.
+            .highlight_spacing(HighlightSpacing::Always)
             .highlight_style(Style::default()),
         inner,
         &mut state,
@@ -1423,6 +1426,17 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
         start,
         ids.len().saturating_sub(visible),
     );
+}
+
+fn message_body(message: &crate::store::Message) -> &str {
+    match message.media.as_ref().map(|media| media.kind) {
+        Some(MediaKind::Photo) => message
+            .text
+            .strip_prefix("[图片] ")
+            .unwrap_or(&message.text),
+        Some(MediaKind::Sticker) if message.text.starts_with("[贴纸]") => "",
+        _ => &message.text,
+    }
 }
 
 fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1468,8 +1482,12 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             previous_date = Some(stamp);
         }
         let height = *app.timeline_heights.entry(message.id).or_insert_with(|| {
-            crate::text::row_count(&message.text, usize::from(width))
-                + 2
+            let body = message_body(message);
+            (if body.is_empty() {
+                0
+            } else {
+                crate::text::row_count(body, usize::from(width))
+            }) + 2
                 + usize::from(message.info.reply.is_some())
                 + if message.media.as_ref().is_some_and(|media| {
                     matches!(media.kind, MediaKind::Photo | MediaKind::Sticker)
@@ -1639,7 +1657,19 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             let prefix = divider + 1 + usize::from(message.info.reply.is_some());
-            let body_rows = crate::text::rows(&message.text, usize::from(width));
+            let body = message_body(message);
+            let body_offset = message.text.len() - body.len();
+            let body_rows = if body.is_empty() {
+                vec![]
+            } else {
+                crate::text::rows(body, usize::from(width))
+                    .into_iter()
+                    .map(|row| crate::text::Row {
+                        start: row.start + body_offset,
+                        end: row.end + body_offset,
+                    })
+                    .collect()
+            };
             let source = Source::Message(message.id);
             let selected_range = selection::range(app, source);
             lines.extend(
@@ -1886,12 +1916,22 @@ fn inline_media_view(
         return;
     }
     let Some(path) = &media.path else {
+        let label = if media.kind == MediaKind::Sticker {
+            "[贴纸]"
+        } else {
+            "[图片]"
+        };
         frame.render_widget(
-            Paragraph::new(if app.requested_files.contains(&media.file_id) {
-                "↓ 正在下载 · 点击查看"
-            } else {
-                "↓ 加载图片 · 点击查看"
-            })
+            Paragraph::new(format!(
+                "{label} {}",
+                if app.failed_files.contains(&media.file_id) {
+                    "下载失败 · 点击重试"
+                } else if app.requested_files.contains(&media.file_id) {
+                    "↓ 正在下载 · 点击查看"
+                } else {
+                    "↓ 加载图片 · 点击查看"
+                }
+            ))
             .style(Style::default().fg(palette().muted))
             .wrap(Wrap { trim: true }),
             area,
@@ -1907,8 +1947,21 @@ fn inline_media_view(
         );
         finish_sixel(frame, area, &app.media.protocol_name);
     } else {
+        let label = if media.kind == MediaKind::Sticker {
+            "[贴纸]"
+        } else {
+            "[图片]"
+        };
         frame.render_widget(
-            Paragraph::new("图片准备中 · 点击查看").style(Style::default().fg(palette().muted)),
+            Paragraph::new(format!(
+                "{label} {}",
+                if app.media.inline_failed(media.file_id, size) {
+                    "无法预览 · 按 o 系统打开"
+                } else {
+                    "准备中 · 点击查看"
+                }
+            ))
+            .style(Style::default().fg(palette().muted)),
             area,
         );
     }
@@ -2317,9 +2370,9 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     .split(parts[0]);
     let picker = app.attachments.as_mut().unwrap();
     let mode = if picker.photos {
-        "[图片模式]"
+        "[图片 F5]"
     } else {
-        "[原文件]"
+        "[原文件 F5]"
     };
     let directory = crate::text::ellipsize(
         &picker.directory.to_string_lossy(),
@@ -2335,6 +2388,7 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         .offset
         .min(picker.entries.len().saturating_sub(picker.visible));
     button(frame, app, tools[0], mode, Action::AttachmentMode);
+    button(frame, app, tools[1], "[粘贴 F7]", Action::PasteClipboard);
     button(frame, app, tools[2], "[上一级]", Action::AttachmentParent);
     frame.render_widget(
         Paragraph::new(directory).style(Style::default().fg(palette().muted)),
@@ -2495,16 +2549,14 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     }
     frame.render_widget(
-        Paragraph::new(
-            error.unwrap_or("Enter 打开/选择 · Space 多选 · F8 / Ctrl+Enter 发送".into()),
-        )
-        .style(
-            Style::default().fg(if app.attachments.as_ref().unwrap().error.is_some() {
-                palette().error
-            } else {
-                palette().muted
-            }),
-        ),
+        Paragraph::new(error.unwrap_or("Enter 选择 · Space 多选 · F5 切换模式 · F8 发送".into()))
+            .style(
+                Style::default().fg(if app.attachments.as_ref().unwrap().error.is_some() {
+                    palette().error
+                } else {
+                    palette().muted
+                }),
+            ),
         parts[5],
     );
     let footer = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2526,6 +2578,7 @@ fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("r 回复    e 编辑    f 转发    x 回应    d 删除"),
         Line::from("S 快速收藏到收藏夹    D 复读到当前会话"),
         Line::from("p 图片 / a 文件 / Ctrl+O 附件 · t 贴纸 · / 搜索"),
+        Line::from("F7 / Ctrl+V 读取剪贴板图片、文件或文字；F8 确认发送"),
         Line::from("附件：点击多选 / 拖入路径 · Tab 说明 · F8 / Ctrl+Enter 发送"),
         Line::from("贴纸：缩略图网格 · [ ] 切换包 · / 搜索 · 点击发送"),
         Line::from("v 预览媒体    o 用系统程序打开"),
@@ -2845,6 +2898,146 @@ pub(crate) mod tests {
                 .iter()
                 .any(|(r, t)| r.y == 0 && *t == Target::Command(Action::Back))
         );
+    }
+
+    #[test]
+    fn inline_media_hides_duplicate_labels_preserves_caption_offsets_and_stable_height() {
+        let mut app = fixture();
+        let image = crate::clipboard::test_image();
+        app.store.messages[0].text = "[图片] 真实说明 👩‍💻".into();
+        app.store.messages[0].media = Some(MediaRef {
+            file_id: 71,
+            path: Some(image.path.to_string_lossy().into()),
+            kind: MediaKind::Photo,
+            detail: None,
+        });
+        app.store.messages[1].text = "[贴纸] 🙂".into();
+        app.store.messages[1].media = Some(MediaRef {
+            file_id: 72,
+            path: Some(image.path.to_string_lossy().into()),
+            kind: MediaKind::Sticker,
+            detail: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(50, 32)).unwrap();
+        terminal
+            .draw(|frame| message_list(frame, &mut app, frame.area()))
+            .unwrap();
+        let output = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .replace(' ', "")
+        };
+        assert!(
+            output(&terminal).contains("[图片]"),
+            "{}",
+            output(&terminal)
+        );
+        assert!(output(&terminal).contains("[贴纸]"));
+        let rows = app.timeline_rows.clone();
+        let size = Size::new(47, 8);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.media.get_inline(71, size).is_none() || app.media.get_inline(72, size).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "inline image preparation timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            app.media.poll();
+        }
+        app.hit_targets.clear();
+        terminal
+            .draw(|frame| message_list(frame, &mut app, frame.area()))
+            .unwrap();
+        let ready = output(&terminal);
+        assert!(!ready.contains("[图片]") && !ready.contains("[贴纸]"));
+        assert!(ready.contains("真实说明"));
+        assert_eq!(
+            app.timeline_rows, rows,
+            "ready images must not shift the timeline"
+        );
+        let start = "[图片] ".len();
+        assert!(app.hit_targets.iter().any(|(_, target)| *target
+            == Target::Text(Point {
+                source: Source::Message(1),
+                byte: start
+            })));
+        app.selection = Some(selection::Selection {
+            anchor: Point {
+                source: Source::Message(1),
+                byte: start,
+            },
+            head: Point {
+                source: Source::Message(1),
+                byte: app.store.messages[0].text.len(),
+            },
+        });
+        assert_eq!(
+            selection::selected_text(&app).unwrap().as_deref(),
+            Some("真实说明 👩‍💻")
+        );
+        let message = crate::store::Message {
+            text: "[图片] 用户自己输入的文字".into(),
+            ..Default::default()
+        };
+        assert_eq!(message_body(&message), message.text);
+    }
+
+    #[test]
+    fn chat_list_keeps_marker_columns_when_selection_scrolls_out_of_view() {
+        for (width, height, focused) in [(26, 12, true), (36, 13, false), (45, 18, true)] {
+            let mut app = fixture();
+            for id in 4..=30 {
+                app.store.apply(&json!({"@type":"updateNewChat","chat": {
+                    "id":id,"title":format!("会话 {id}"),
+                    "positions":[{"list":{"@type":"chatListMain"},"order":100-id}],
+                    "last_message":{"content":{"@type":"messageText","text":{"text":"预览消息"}}}
+                }}));
+            }
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for offset in [0, 1, 7, 30, 0] {
+                app.chat_offset = offset;
+                terminal
+                    .draw(|frame| {
+                        app.hit_targets.clear();
+                        app.scrollbars.clear();
+                        chat_list(frame, &mut app, frame.area(), focused, true);
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                for (rect, target) in &app.hit_targets {
+                    let Target::Chat(id) = target else { continue };
+                    let selected = Some(*id) == app.selected_chat;
+                    assert_eq!(
+                        buffer[(rect.x, rect.y)].symbol(),
+                        if selected { "›" } else { " " },
+                        "marker at offset {offset}, chat {id}"
+                    );
+                    assert_eq!(buffer[(rect.x + 1, rect.y)].symbol(), " ");
+                    assert_eq!(buffer[(rect.x, rect.y + 1)].symbol(), " ");
+                    assert_eq!(buffer[(rect.x + 1, rect.y + 1)].symbol(), " ");
+                    assert_eq!(
+                        buffer[(rect.x + 2, rect.y)].symbol(),
+                        if Some(*id) == app.store.active_chat {
+                            "·"
+                        } else if *id <= 3 {
+                            if *id == 2 { "小" } else { "T" }
+                        } else {
+                            "会"
+                        }
+                    );
+                    if *id >= 4 {
+                        assert_eq!(buffer[(rect.x + 2, rect.y + 1)].symbol(), "预");
+                    }
+                }
+                assert_eq!(app.selected_chat, Some(1));
+                assert_eq!(app.store.active_chat, Some(1));
+            }
+        }
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub struct Picker {
     pub offset: usize,
     pub visible: usize,
     pub selected: Vec<PathBuf>,
+    pub clipboard_images: Vec<crate::clipboard::TemporaryImage>,
     pub queue_offset: usize,
     pub queue_visible: usize,
     pub consume_path_draft: bool,
@@ -46,6 +47,7 @@ impl Picker {
             offset: 0,
             visible: 1,
             selected: vec![],
+            clipboard_images: vec![],
             queue_offset: 0,
             queue_visible: 1,
             consume_path_draft: false,
@@ -109,7 +111,7 @@ impl Picker {
             if entry.directory {
                 self.navigate(entry.path);
             } else if let Some(index) = self.selected.iter().position(|p| *p == entry.path) {
-                self.selected.remove(index);
+                self.remove(index);
             } else if let Err(error) = self.add(vec![entry.path]) {
                 self.error = Some(error);
             }
@@ -137,6 +139,13 @@ impl Picker {
         self.error = None;
         Ok(())
     }
+    pub fn remove(&mut self, index: usize) {
+        if index < self.selected.len() {
+            let removed = self.selected.remove(index);
+            self.clipboard_images
+                .retain(|image| fs::canonicalize(&image.path).is_ok_and(|path| path != removed));
+        }
+    }
     pub fn paste_paths(&mut self, value: &str) {
         match parse_paths(value, &self.directory) {
             Ok(paths) => {
@@ -156,6 +165,10 @@ impl Picker {
     }
     pub fn key(&mut self, key: KeyCode) {
         match key {
+            KeyCode::F(5) => {
+                self.photos = !self.photos;
+                self.error = None;
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match (self.focus, key) {
                     (Focus::Browser, KeyCode::BackTab) | (Focus::Path, KeyCode::Tab) => {
@@ -196,7 +209,7 @@ impl Picker {
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(self.cursor),
             KeyCode::Delete => {
-                self.selected.pop();
+                self.remove(self.selected.len().saturating_sub(1));
             }
             KeyCode::Char(c) => {
                 self.focus = Focus::Path;
@@ -434,6 +447,37 @@ pub fn preview_id(path: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keyboard_mode_toggle_works_in_every_attachment_field() {
+        let mut picker = Picker::new(true, Some(42));
+        picker.caption = "说明".into();
+        picker.path = "路径".into();
+        for focus in [Focus::Browser, Focus::Path, Focus::Caption] {
+            picker.focus = focus;
+            picker.error = Some("validation error".into());
+            picker.key(KeyCode::F(5));
+            assert!(!picker.photos);
+            assert!(picker.error.is_none());
+            picker.key(KeyCode::F(5));
+            assert!(picker.photos);
+            assert!(picker.focus == focus);
+        }
+        assert_eq!(picker.caption, "说明");
+        assert_eq!(picker.path, "路径");
+        assert_eq!(picker.reply_to, Some(42));
+    }
+    #[test]
+    fn removing_clipboard_attachment_deletes_its_temporary_source() {
+        let image = crate::clipboard::test_image();
+        let path = image.path.clone();
+        let mut picker = Picker::new(true, None);
+        picker.add(vec![path.clone()]).unwrap();
+        picker.clipboard_images.push(image);
+        picker.remove(0);
+        assert!(picker.selected.is_empty());
+        assert!(picker.clipboard_images.is_empty());
+        assert!(!path.exists());
+    }
     fn fixture(name: &str) -> PathBuf {
         let folder = std::env::temp_dir().join(format!("tg-attach-{name}-{}", std::process::id()));
         fs::create_dir_all(&folder).unwrap();

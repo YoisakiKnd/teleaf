@@ -36,11 +36,11 @@ with tempfile.TemporaryDirectory(prefix='tg-chat-smoke-') as folder:
         terminal.read(.3)
         terminal.click(50,31)  # Select latest message before its contextual buttons appear
         terminal.read(.2)
-        terminal.click(99,30)  # Reply button on the latest message
+        terminal.click(99,29)  # Reply button on the latest message
         terminal.wait('回复消息')
         terminal.send(b'\x1b')
         terminal.read(.3)
-        terminal.click(105,30)  # Message menu button
+        terminal.click(105,29)  # Message menu button
         terminal.wait('消息操作')
         terminal.send(b'\x1b')
         terminal.read(.3)

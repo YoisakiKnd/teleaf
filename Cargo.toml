@@ -19,6 +19,9 @@ unicode-segmentation = "1.13.3"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

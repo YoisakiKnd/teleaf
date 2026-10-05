@@ -610,12 +610,19 @@ impl Store {
             }
             "updateMessageContent" => {
                 let id = integer(update.get("message_id"));
-                if update.get("chat_id").and_then(Value::as_i64) == self.active_chat
-                    && let Some(message) = self.messages.iter_mut().find(|m| m.id == id)
-                {
-                    message.text = content_text(update.get("new_content"));
-                    message.info.text_message = kind(&update["new_content"]) == "messageText";
-                    message.media = update.get("new_content").and_then(media_ref);
+                if update.get("chat_id").and_then(Value::as_i64) == self.active_chat {
+                    for message in self
+                        .messages
+                        .iter_mut()
+                        .chain(&mut self.search_results)
+                        .filter(|message| message.id == id)
+                    {
+                        message.text = content_text(update.get("new_content"));
+                        message.info.text_message = kind(&update["new_content"]) == "messageText";
+                        message.media = update.get("new_content").and_then(media_ref);
+                    }
+                    trim_messages(&mut self.messages, 6 * 1024 * 1024, false);
+                    trim_messages(&mut self.search_results, 2 * 1024 * 1024, true);
                 }
             }
             "updateDeleteMessages" => {
@@ -623,6 +630,8 @@ impl Store {
                     && let Some(ids) = update.get("message_ids").and_then(Value::as_array)
                 {
                     self.messages
+                        .retain(|message| !ids.iter().any(|id| integer(Some(id)) == message.id));
+                    self.search_results
                         .retain(|message| !ids.iter().any(|id| integer(Some(id)) == message.id));
                 }
             }
@@ -1067,6 +1076,70 @@ fn content_text(content: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn content_changes_and_deletions_update_history_and_search() {
+        let mut store = Store::default();
+        store.open(7);
+        let message = json!({"id": 30, "chat_id": 7, "content": {
+            "@type": "messageText", "text": {"text": "old"}
+        }});
+        store.apply(&json!({"@type":"messages", "@extra":"history:7", "messages":[message]}));
+        store.apply(
+            &json!({"@type":"foundChatMessages", "@extra":"search:7", "messages":[message]}),
+        );
+        let mut edit = json!({"@type":"updateMessageContent", "chat_id":8, "message_id":30,
+            "new_content":{"@type":"messagePhoto", "caption":{"text":"new"},
+                "photo":{"sizes":[{"width":320,"photo":{"id":42}}]}}});
+        store.apply(&edit);
+        assert_eq!(store.search_results[0].text, "old");
+        edit["chat_id"] = json!(7);
+        store.apply(&edit);
+        for message in store.messages.iter().chain(&store.search_results) {
+            assert_eq!(message.text, "[图片] new");
+            assert!(!message.info.text_message);
+            assert_eq!(message.media.as_ref().unwrap().file_id, 42);
+        }
+        store.apply(&json!({"@type":"updateDeleteMessages", "chat_id":8, "message_ids":[30]}));
+        assert_eq!(store.search_results.len(), 1);
+        store.apply(&json!({"@type":"updateDeleteMessages", "chat_id":7, "message_ids":[30]}));
+        assert!(store.messages.is_empty());
+        assert!(store.search_results.is_empty());
+    }
+
+    #[test]
+    fn editing_large_messages_keeps_history_and_search_within_byte_budgets() {
+        let mut store = Store::default();
+        store.open(7);
+        store.messages = (1..=100)
+            .map(|id| Message {
+                id,
+                text: "x".repeat(60_000),
+                ..Message::default()
+            })
+            .collect();
+        store.search_results = store.messages.iter().take(34).cloned().collect();
+        store.apply(
+            &json!({"@type":"updateMessageContent", "chat_id":7, "message_id":1,
+            "new_content":{"@type":"messageText", "text":{"text":"y".repeat(600_000)}}}),
+        );
+        assert!(
+            store
+                .messages
+                .iter()
+                .map(Message::retained_bytes)
+                .sum::<usize>()
+                <= 6 * 1024 * 1024
+        );
+        assert!(
+            store
+                .search_results
+                .iter()
+                .map(Message::retained_bytes)
+                .sum::<usize>()
+                <= 2 * 1024 * 1024
+        );
+    }
 
     #[test]
     fn sending_transitions_and_read_receipts_preserve_text_and_ignore_other_chats() {

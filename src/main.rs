@@ -3,6 +3,7 @@ mod attachments;
 mod auth;
 mod calendar;
 mod cli;
+mod clipboard;
 mod config;
 mod demo;
 mod interaction;
@@ -153,6 +154,7 @@ struct App {
     sticker_cursor: usize,
     sticker_panel: stickers::Panel,
     attachments: Option<attachments::Picker>,
+    clipboard: clipboard::State,
     show_help: bool,
     show_settings: bool,
     settings_focus: Option<ui::Action>,
@@ -226,6 +228,7 @@ impl App {
             sticker_cursor: 0,
             sticker_panel: stickers::Panel::default(),
             attachments: None,
+            clipboard: clipboard::State::default(),
             show_help: false,
             show_settings: false,
             action_menu: None,
@@ -432,7 +435,12 @@ impl App {
                 {
                     self.selected_chat = self.store.chat_ids().next();
                 }
-                if self.selected_message.is_none() {
+                if self.selected_message.is_none()
+                    || !self
+                        .active_messages()
+                        .iter()
+                        .any(|message| Some(message.id) == self.selected_message)
+                {
                     self.selected_message = self.active_messages().last().map(|message| message.id);
                 }
                 let auth_request = self.auth.on_update(&value);
@@ -523,6 +531,7 @@ impl App {
     }
 
     fn close_overlays(&mut self) {
+        self.clipboard.cancel();
         self.quick_message.cancel_preparation();
         if self.sticker_picker {
             stickers::close(self);
@@ -562,6 +571,7 @@ impl App {
         self.drag = None;
         self.last_click = None;
         self.save_draft();
+        self.clipboard.cancel();
         self.store.open(id);
         self.quick_message.cancel_preparation();
         self.message_check = None;
@@ -803,6 +813,151 @@ fn send_request(app: &mut App, worker: &TdWorker, request: Value) -> bool {
     }
 }
 
+fn start_clipboard_paste(app: &mut App) {
+    if app.auth.setup.is_some() || app.auth.state != "authorizationStateReady" {
+        return;
+    }
+    if app.store.active_chat.is_none() {
+        app.notice = Some("请先打开一个会话".into());
+        return;
+    }
+    if (app.has_overlay() && app.attachments.is_none())
+        || !matches!(
+            app.input_mode,
+            InputMode::Off | InputMode::Send | InputMode::Reply(_)
+        )
+    {
+        app.notice = Some("请在聊天输入区或附件窗口粘贴".into());
+        return;
+    }
+    if app
+        .clipboard
+        .start(app.store.active_chat.unwrap(), app.input_mode)
+    {
+        app.notice = Some("正在读取剪贴板…（Esc 取消）".into());
+    }
+}
+
+fn accept_clipboard(
+    app: &mut App,
+    chat: i64,
+    mode: InputMode,
+    result: Result<clipboard::Content, String>,
+) {
+    if app.auth.setup.is_some()
+        || app.auth.state != "authorizationStateReady"
+        || app.store.active_chat != Some(chat)
+        || app.input_mode != mode
+        || (app.has_overlay() && app.attachments.is_none())
+    {
+        return;
+    }
+    let result = result.and_then(|content| {
+        let (paths, image) = match content {
+            clipboard::Content::Text(text) => {
+                paste_text(app, &text);
+                app.notice = Some("已粘贴剪贴板文字".into());
+                return Ok(());
+            }
+            clipboard::Content::Files(paths) => (paths, None),
+            clipboard::Content::Image(image) => (vec![image.path.clone()], Some(image)),
+        };
+        if let Some(image) = &image
+            && !app.clipboard.can_stage(
+                app.attachments
+                    .as_ref()
+                    .map_or(&[], |p| p.clipboard_images.as_slice()),
+                image,
+            )
+        {
+            return Err("本次运行的剪贴板暂存已达 256 MiB；请改用已保存的文件".into());
+        }
+        if app.attachments.is_none() {
+            interaction::open_attachments(app, attachments::photo_paths(&paths));
+        }
+        let picker = app.attachments.as_mut().unwrap();
+        picker.add(paths)?;
+        if let Some(image) = image {
+            picker.clipboard_images.push(image);
+        }
+        app.notice = Some("已加入附件；确认后按 F8 发送".into());
+        Ok(())
+    });
+    if let Err(error) = result {
+        if let Some(picker) = &mut app.attachments {
+            picker.error = Some(error.clone());
+        }
+        app.notice = Some(error);
+    }
+}
+
+fn paste_text(app: &mut App, text: &str) {
+    if app.show_settings || app.show_help {
+        return;
+    }
+    if app.auth.setup.is_some() || app.auth.state != "authorizationStateReady" {
+        app.auth.paste(text);
+    } else if app.attachments.is_some() {
+        if let Some(picker) = &mut app.attachments {
+            if picker.focus == attachments::Focus::Caption {
+                let clean: String = text
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == '\n')
+                    .take(4096)
+                    .collect();
+                text::insert(
+                    &mut picker.caption,
+                    &mut picker.caption_cursor,
+                    &clean,
+                    4096,
+                );
+            } else {
+                picker.paste_paths(text);
+            }
+        }
+    } else if app.sticker_picker && app.sticker_panel.search_focus {
+        let clean: String = text.chars().filter(|c| !c.is_control()).take(256).collect();
+        text::insert(
+            &mut app.sticker_panel.query,
+            &mut app.sticker_panel.query_cursor,
+            &clean,
+            256,
+        );
+    } else if !app.has_overlay()
+        && matches!(
+            app.input_mode,
+            InputMode::Off | InputMode::Send | InputMode::Reply(_)
+        )
+        && app.store.active_chat.is_some()
+        && let Some(paths) = attachments::pasted_files(text)
+    {
+        interaction::open_attachments(app, attachments::photo_paths(&paths));
+        if let Some(picker) = &mut app.attachments {
+            picker.paste_paths(text);
+        }
+    } else if app.store.active_chat.is_some() && !app.has_overlay() {
+        if app.input_mode == InputMode::Off {
+            app.input_mode = InputMode::Send;
+            app.composer_focus = true;
+        }
+        app.composer_focus = true;
+        selection::remove_from_draft(app);
+        let text: String = text
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .take(65536usize.saturating_sub(app.draft.chars().count()))
+            .collect();
+        if matches!(
+            app.input_mode,
+            InputMode::Send | InputMode::Reply(_) | InputMode::Edit(_)
+        ) {
+            text::insert(&mut app.draft, &mut app.draft_cursor, &text, 262144);
+        } else {
+            text::insert(&mut app.draft, &mut app.draft_cursor, text.trim(), 262144);
+        }
+    }
+}
+
 fn submit_composer(app: &mut App, worker: &TdWorker) -> bool {
     app.selection = None;
     if matches!(app.input_mode, InputMode::Send | InputMode::Reply(_))
@@ -871,6 +1026,7 @@ fn handle_settings_key(app: &mut App, worker: &TdWorker, code: KeyCode) {
 fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
     if code == KeyCode::Esc {
         app.quick_message.cancel_preparation();
+        app.clipboard.cancel();
     }
     if code == KeyCode::Esc
         && let Some(check) = &mut app.message_check
@@ -1142,6 +1298,10 @@ fn run(demo: bool) -> io::Result<()> {
         }
         stickers::download_visible(&mut app, &worker);
         dirty |= app.media.poll();
+        if let Some((chat, mode, result)) = app.clipboard.poll() {
+            accept_clipboard(&mut app, chat, mode, result);
+            dirty = true;
+        }
         if app.auth.take_restart() {
             worker.shutdown();
             app = App::new();
@@ -1176,6 +1336,9 @@ fn run(demo: bool) -> io::Result<()> {
             for _ in 0..64 {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if key.code == KeyCode::Esc {
+                            app.clipboard.cancel();
+                        }
                         if key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
@@ -1283,6 +1446,11 @@ fn run(demo: bool) -> io::Result<()> {
                                     byte: app.draft.len(),
                                 },
                             });
+                        } else if key.code == KeyCode::F(7)
+                            || (key.code == KeyCode::Char('v')
+                                && key.modifiers.contains(KeyModifiers::CONTROL))
+                        {
+                            start_clipboard_paste(&mut app);
                         } else if key.code == KeyCode::Char('o')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                             && app.auth.setup.is_none()
@@ -1344,82 +1512,8 @@ fn run(demo: bool) -> io::Result<()> {
                         }
                         dirty = true;
                     }
-                    Event::Paste(text) if !app.show_settings && !app.show_help => {
-                        if app.auth.setup.is_some() || app.auth.state != "authorizationStateReady" {
-                            app.auth.paste(&text);
-                        } else if app.attachments.is_some() {
-                            if let Some(picker) = &mut app.attachments {
-                                if picker.focus == attachments::Focus::Caption {
-                                    let clean: String = text
-                                        .chars()
-                                        .filter(|c| !c.is_control() || *c == '\n')
-                                        .collect();
-                                    text::insert(
-                                        &mut picker.caption,
-                                        &mut picker.caption_cursor,
-                                        &clean,
-                                        4096,
-                                    );
-                                } else {
-                                    picker.paste_paths(&text);
-                                }
-                            }
-                        } else if app.sticker_picker && app.sticker_panel.search_focus {
-                            let clean: String = text.chars().filter(|c| !c.is_control()).collect();
-                            text::insert(
-                                &mut app.sticker_panel.query,
-                                &mut app.sticker_panel.query_cursor,
-                                &clean,
-                                256,
-                            );
-                        } else if !app.has_overlay()
-                            && matches!(
-                                app.input_mode,
-                                InputMode::Off | InputMode::Send | InputMode::Reply(_)
-                            )
-                            && app.store.active_chat.is_some()
-                            && attachments::pasted_files(&text).is_some()
-                        {
-                            let paths = attachments::pasted_files(&text).unwrap();
-                            interaction::open_attachments(
-                                &mut app,
-                                attachments::photo_paths(&paths),
-                            );
-                            if let Some(picker) = &mut app.attachments {
-                                picker.paste_paths(&text);
-                            }
-                        } else if app.store.active_chat.is_some()
-                            && app.action_menu.is_none()
-                            && !app.sticker_picker
-                            && app.preview_message.is_none()
-                            && app.forward_message.is_none()
-                            && app.confirm_delete.is_none()
-                        {
-                            if app.input_mode == InputMode::Off {
-                                app.input_mode = InputMode::Send;
-                                app.composer_focus = true;
-                            }
-                            app.composer_focus = true;
-                            selection::remove_from_draft(&mut app);
-                            let text: String = text
-                                .chars()
-                                .filter(|c| !c.is_control() || *c == '\n')
-                                .take(65536usize.saturating_sub(app.draft.chars().count()))
-                                .collect();
-                            if matches!(
-                                app.input_mode,
-                                InputMode::Send | InputMode::Reply(_) | InputMode::Edit(_)
-                            ) {
-                                text::insert(&mut app.draft, &mut app.draft_cursor, &text, 262144);
-                            } else {
-                                text::insert(
-                                    &mut app.draft,
-                                    &mut app.draft_cursor,
-                                    text.trim(),
-                                    262144,
-                                );
-                            }
-                        }
+                    Event::Paste(text) => {
+                        paste_text(&mut app, &text);
                         dirty = true;
                     }
                     Event::Resize(_, _) => {
@@ -1509,6 +1603,51 @@ fn main() {
 #[cfg(test)]
 mod interaction_tests {
     #[test]
+    fn switching_chats_cancels_clipboard_even_when_returning_to_the_same_chat() {
+        let mut app = super::ui::tests::fixture();
+        let image = super::clipboard::test_image();
+        let path = image.path.clone();
+        app.clipboard = super::clipboard::State::queued(
+            1,
+            super::InputMode::Off,
+            super::clipboard::Content::Image(image),
+        );
+        app.selected_chat = Some(2);
+        app.open_selected();
+        app.selected_chat = Some(1);
+        app.open_selected();
+        assert!(app.clipboard.poll().is_none());
+        assert!(app.attachments.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn deleting_selected_search_result_selects_a_remaining_message() {
+        let mut app = super::ui::tests::fixture();
+        app.show_search = true;
+        app.store.search_results = app.store.messages.clone();
+        app.selected_message = Some(2);
+        app.apply(super::TdEvent::Update(serde_json::json!({
+            "@type":"updateDeleteMessages", "chat_id":1, "message_ids":[2]
+        })));
+        assert_eq!(app.selected_message, Some(1));
+        assert_eq!(app.active_messages().len(), 1);
+    }
+
+    #[test]
+    fn folder_modal_paste_does_not_change_hidden_composer() {
+        let mut app = super::ui::tests::fixture();
+        app.show_folders = true;
+        app.draft = "保留草稿".into();
+        app.draft_cursor = 3;
+        super::paste_text(&mut app, "不应插入");
+        assert_eq!(app.draft, "保留草稿");
+        assert_eq!(app.draft_cursor, 3);
+        assert!(app.input_mode == super::InputMode::Off);
+        assert!(app.attachments.is_none());
+    }
+
+    #[test]
     fn settings_keyboard_works_when_mouse_is_disabled_before_and_after_login() {
         use super::*;
         for ready in [false, true] {
@@ -1544,6 +1683,86 @@ mod interaction_tests {
     }
     use super::*;
     use tdlib::TdCommand;
+
+    #[test]
+    fn clipboard_image_requires_confirmation_preserves_reply_and_cleans_up() {
+        let mut app = ui::tests::fixture();
+        let (worker, requests) = TdWorker::test_pair();
+        app.input_mode = InputMode::Reply(2);
+        app.draft = "保留草稿".into();
+        let image = clipboard::test_image();
+        let path = image.path.clone();
+        accept_clipboard(
+            &mut app,
+            1,
+            InputMode::Reply(2),
+            Ok(clipboard::Content::Image(image)),
+        );
+        assert!(requests.try_recv().is_err(), "paste must not send");
+        assert!(path.exists());
+        assert_eq!(app.attachments.as_ref().unwrap().reply_to, Some(2));
+        assert_eq!(app.draft, "保留草稿");
+        interaction::perform(&mut app, &worker, ui::Action::Cancel);
+        assert!(!path.exists(), "cancel removes staged pixels");
+        let image = clipboard::test_image();
+        let path = image.path.clone();
+        accept_clipboard(
+            &mut app,
+            1,
+            InputMode::Reply(2),
+            Ok(clipboard::Content::Image(image)),
+        );
+        interaction::perform(&mut app, &worker, ui::Action::Confirm);
+        let TdCommand::Request(request) = requests.try_recv().unwrap() else {
+            panic!("send request")
+        };
+        assert_eq!(request["reply_to"]["message_id"], 2);
+        assert_eq!(
+            request["input_message_content"]["@type"],
+            "inputMessagePhoto"
+        );
+        assert!(app.attachments.is_none());
+        assert_eq!(app.draft, "保留草稿");
+        assert!(path.exists(), "TDLib can read source after submission");
+        drop(app);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stale_clipboard_results_are_discarded_and_plain_text_uses_regular_paste() {
+        let mut app = ui::tests::fixture();
+        let image = clipboard::test_image();
+        let path = image.path.clone();
+        accept_clipboard(
+            &mut app,
+            2,
+            InputMode::Off,
+            Ok(clipboard::Content::Image(image)),
+        );
+        assert!(app.attachments.is_none());
+        assert!(!path.exists());
+        accept_clipboard(
+            &mut app,
+            1,
+            InputMode::Off,
+            Ok(clipboard::Content::Text("文字\n👩‍💻".into())),
+        );
+        assert_eq!(app.draft, "文字\n👩‍💻");
+        assert!(app.input_mode == InputMode::Send);
+        let image = clipboard::test_image();
+        let path = image.path.clone();
+        accept_clipboard(
+            &mut app,
+            1,
+            InputMode::Off,
+            Ok(clipboard::Content::Image(image)),
+        );
+        assert!(app.attachments.is_none());
+        assert!(
+            !path.exists(),
+            "reply/input changes invalidate pending paste"
+        );
+    }
 
     #[test]
     fn menu_reply_and_delete_confirmation_preserve_requests() {

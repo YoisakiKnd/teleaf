@@ -293,6 +293,18 @@ impl MediaManager {
             .and_then(Encoded::inline)
     }
 
+    pub fn inline_failed(&self, file_id: i32, size: Size) -> bool {
+        self.failed.contains(&(
+            file_id,
+            size.width,
+            size.height,
+            View {
+                inline: true,
+                ..View::default()
+            },
+        ))
+    }
+
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         while let Ok(finished) = self.finished.try_recv() {
