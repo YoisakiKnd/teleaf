@@ -21,9 +21,9 @@ Telegram 官网注册错误仍需在官网解决；已有应用无需再次创�
 
 1. 使用 `YoisakiKnd/teleaf` 仓库，将当前源码连同 `.github/`、`packaging/` 和 `scripts/` 推送到默认分支。`target/`、本地账号数据和 `.env` 不提交。
 2. 在 Actions 页面手动运行 **Release packages**，先检查五个平台能否构建和加载 TDLib。手动运行只生成 Actions artifacts，不发布 Release 或修改包清单。
-3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.1`。标签必须与 Cargo 版本完全一致。
+3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.3`。标签必须与 Cargo 版本完全一致。
 4. 标签触发构建、运行库打包和加载检查；全部成功后创建 GitHub Release，发布各平台压缩包、SHA-256、Homebrew 配方和 Scoop 清单。
-5. 发布任务将生成的 `Formula/teleaf.rb` 提交到主仓库默认分支；主仓库仍充当显式 URL 的 Homebrew tap。独立的 [scoop-teleaf](https://github.com/YoisakiKnd/scoop-teleaf) 仓库每小时读取主仓库的最新稳定 Release，核对 Windows 安装包 URL、`SHA256SUMS` 和 GitHub 资产哈希，再将 Release 附带的 `teleaf.json` 提交为 `bucket/teleaf.json`。Scoop 用户无需克隆主项目源码。
+5. 发布任务将生成的 `Formula/teleaf.rb` 提交到主仓库默认分支；主仓库仍充当显式 URL 的 Homebrew tap。独立的 [scoop-bucket](https://github.com/YoisakiKnd/scoop-bucket) 仓库每小时读取主仓库的最新稳定 Release，核对 Windows 安装包 URL、`SHA256SUMS` 和 GitHub 资产哈希，再将 Release 附带的 `teleaf.json` 提交为 `bucket/teleaf.json`。Scoop 用户无需克隆主项目源码。
 
 两个仓库分别使用自己的 `GITHUB_TOKEN` 写入本仓库，无需个人访问令牌或跨仓库推送权限。默认分支需要允许 Actions 提交清单；如果分支保护拒绝自动推送，Release 仍已生成，可以将附带的 `teleaf.rb` 提交到主仓库的 `Formula/`，将 `teleaf.json` 提交到 Scoop 仓库的 `bucket/`。
 
@@ -55,9 +55,21 @@ Homebrew 配方更新至 0.1.2（`bbf5f73`）；自有 Scoop [同步任务 37167
 
 Windows Terminal 的实际 GPU 图片显示仍需终端实机验证；ConPTY 原生输入和 Sixel 编码/协议测试不能代替该项。
 
+## 0.1.3 发布验证
+
+2026-10-06（北京时间）已发布 [v0.1.3](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.3)，标签对应 `3ade5bedda203e221f0cf39b93ab069d9751ada4`。包含发送后保留输入焦点、Windows 原生通知、按需读取剪贴板图片/文件、侧栏箭头、媒体文字回退和搜索/弹窗操作修复，详见 `CHANGELOG.md`。
+
+[主仓库 CI 37349909101](https://github.com/YoisakiKnd/teleaf/actions/runs/37349909101) 与 [标签 CI 37349913624](https://github.com/YoisakiKnd/teleaf/actions/runs/37349913624) 均通过，包含 Linux 终端回归、剪贴板入口和 Windows ConPTY 输入。[正式发布 37349913664](https://github.com/YoisakiKnd/teleaf/actions/runs/37349913664) 五个平台全部通过：Linux 各 124 项、macOS 各 125 项、Windows 126 项单元测试，以及 Clippy、打包检查和 TDLib 运行库加载。macOS 测试使用私有剪贴板验证图片、文件和文字；Windows 覆盖原生通知 XML 与快捷方式标识。
+
+发布前用实际 Linux x64 安装包验证项目凭据能直接进入手机号页面并保留已有配置。下载正式资产后核验五个平台安装包、SHA256SUMS、GitHub 资产摘要、可执行文件、TDLib 和许可证；实际 macOS ARM 安装包也通过相同登录启动验证。测试没有提交真实手机号或验证码。
+
+Homebrew 配方由发布任务同步（`58db450`）；自有 Scoop [同步任务 37350532043](https://github.com/YoisakiKnd/scoop-bucket/actions/runs/37350532043) 成功（清单提交 `08d80fd`）。两份包清单与 Release 附带清单逐字节一致，版本、下载地址、哈希及 MIT 元数据均已核验。Windows ZIP SHA-256：`d93a8735a991bb1f34430da743b2b24aaf595082ff554b9e1a8abeb0d23b36d4`。没有为 eimer 创建或更新 PR。
+
+Scoop 仓库已更名为 `YoisakiKnd/scoop-bucket`，旧 `scoop-teleaf` 地址重定向到同一仓库；新安装命令使用新地址。Windows 实际通知弹窗、声音、勿扰模式和终端 GPU 图片显示仍需桌面实机验证，CI 与 ConPTY 不能代替这些检查。可先运行 `teleaf --test-notification` 做无需登录的静音通知测试。
+
 ## 用户安装
 
-[v0.1.2](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.2)及安装清单已发布：
+[v0.1.3](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.3)及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/teleaf https://github.com/YoisakiKnd/teleaf
@@ -66,7 +78,7 @@ teleaf --check
 ```
 
 ```powershell
-scoop bucket add teleaf https://github.com/YoisakiKnd/scoop-teleaf
+scoop bucket add teleaf https://github.com/YoisakiKnd/scoop-bucket
 scoop install teleaf/teleaf
 teleaf --check
 ```
@@ -98,7 +110,7 @@ TDLib 上游发布包固定为 tdlib-rs `v1.4.0` 中的 TDLib `1.8.61`，平台�
 
 ```sh
 cargo build --release --locked
-python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.1
+python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.3
 python3 scripts/test-packaging.py
 ```
 
@@ -109,7 +121,7 @@ Windows 的 binary 参数为 `target/release/teleaf.exe`，打包机需要 Visua
 五个平台的产物齐全后，可以独立生成包清单：
 
 ```sh
-python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.1 --assets target/dist --output target/packages
+python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.3 --assets target/dist --output target/packages
 ```
 
 输出真实配方、Scoop 清单和 SHA256SUMS。该命令拒绝缺失的平台产物和不合法的仓库/版本输入；生成器只写本地文件，不创建远程仓库或发布内容。

@@ -1,7 +1,8 @@
 # Teleaf release requirements
 
 For every stable Teleaf release, push the fixes to `YoisakiKnd/teleaf` and
-update the verified manifest in `YoisakiKnd/scoop-teleaf`, `bucket/teleaf.json`.
+update the verified manifest in `YoisakiKnd/scoop-bucket`, `bucket/teleaf.json`.
+The bucket was renamed from `YoisakiKnd/scoop-teleaf`; the old URL redirects.
 
 On 2026-10-04 the user explicitly replaced the previous two-bucket policy:
 do not create or update release PRs in `Mythos-404/eimer` unless separately

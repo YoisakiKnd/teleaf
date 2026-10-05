@@ -27,18 +27,18 @@ teleaf
 **Windows x64（Scoop）：**
 
 ```powershell
-scoop bucket add teleaf https://github.com/YoisakiKnd/scoop-teleaf
+scoop bucket add teleaf https://github.com/YoisakiKnd/scoop-bucket
 scoop install teleaf/teleaf
 teleaf
 ```
 
-Scoop 使用独立的轻量仓库 [scoop-teleaf](https://github.com/YoisakiKnd/scoop-teleaf)，添加 bucket 时只克隆安装清单、说明和更新脚本；安装包仍从主仓库的 Release 下载。它每小时检查稳定版并同步清单，GitHub 定时任务可能延迟，也可以手动运行同步。
+Scoop 使用独立的轻量仓库 [scoop-bucket](https://github.com/YoisakiKnd/scoop-bucket)，添加 bucket 时只克隆安装清单、说明和更新脚本；安装包仍从主仓库的 Release 下载。它每小时检查稳定版并同步清单，GitHub 定时任务可能延迟，也可以手动运行同步。
 
 如果已添加旧的主源码仓库作为 `teleaf` bucket，请执行以下命令切换，无需卸载程序或重新登录：
 
 ```powershell
 scoop bucket rm teleaf
-scoop bucket add teleaf https://github.com/YoisakiKnd/scoop-teleaf
+scoop bucket add teleaf https://github.com/YoisakiKnd/scoop-bucket
 scoop update teleaf
 ```
 
