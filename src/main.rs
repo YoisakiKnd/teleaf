@@ -1016,7 +1016,7 @@ fn handle_settings_key(app: &mut App, worker: &TdWorker, code: KeyCode) {
         ui::Action::OpenLink,
         ui::Action::ToggleMouse,
         ui::Action::ToggleNotifications,
-    ][..if cfg!(windows) { 4 } else { 3 }];
+    ][..if notifications::supported() { 4 } else { 3 }];
     match code {
         KeyCode::Esc | KeyCode::Char('s') => app.close_overlays(),
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
@@ -1600,7 +1600,7 @@ fn main() {
         Ok(cli::Command::TestNotification) => {
             match notifications::test_notification() {
                 Ok(()) => {
-                    println!("已请求显示 Teleaf 测试通知；请检查 Windows 通知中心和勿扰设置。")
+                    println!("已请求显示 Teleaf 测试通知；请检查系统通知中心和勿扰设置。")
                 }
                 Err(error) => {
                     eprintln!("Teleaf: {error}");
@@ -1740,13 +1740,13 @@ mod interaction_tests {
             interaction::perform(&mut app, &worker, ui::Action::ToggleMouse);
             assert!(!app.mouse_enabled);
             handle_settings_key(&mut app, &worker, KeyCode::Tab);
-            if cfg!(windows) {
+            if notifications::supported() {
                 assert_eq!(app.settings_focus, Some(ui::Action::ToggleNotifications));
                 handle_settings_key(&mut app, &worker, KeyCode::Tab);
             }
             assert_eq!(app.settings_focus, Some(ui::Action::ApiSetup));
             handle_settings_key(&mut app, &worker, KeyCode::BackTab);
-            if cfg!(windows) {
+            if notifications::supported() {
                 assert_eq!(app.settings_focus, Some(ui::Action::ToggleNotifications));
                 handle_settings_key(&mut app, &worker, KeyCode::BackTab);
             }

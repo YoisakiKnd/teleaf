@@ -93,12 +93,13 @@ teleaf                       # Windows 为 teleaf.exe
  tdlib/
    libtdjson.dylib / libtdjson.so / tdjson.dll
    OpenSSL、zlib、libc++ 等所需运行库
+ Teleaf Notifications.app/     # 仅 macOS，按需启动的原生通知助手
  LICENSES/
  LICENSE
  README.md
 ```
 
-- macOS 15+：ARM64、x64。运行库依赖改为 `@loader_path`，使用临时代码签名；尚未提供 Developer ID 签名和 Apple 公证。
+- macOS 15+：ARM64、x64。运行库依赖改为 `@loader_path`，附带 Swift 编译的原生通知助手，使用临时代码签名；尚未提供 Developer ID 签名和 Apple 公证。
 - Linux：Ubuntu 24.04 的 glibc 基线，x64、ARM64；随附非系统依赖并写入 `$ORIGIN`，glibc 和系统加载器由系统提供。不是 musl/Alpine 通用包。
 - Windows 10/11：x64。随附 TDLib 的 DLL 依赖和 MSVC 可再分发运行库；从 DLL 所在目录加载依赖，不要求用户设置 PATH。
 

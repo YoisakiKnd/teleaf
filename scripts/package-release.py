@@ -104,6 +104,11 @@ def package(binary, name, version, output, archive=None):
         shutil.copyfile(binary, executable)
         executable.chmod(0o755)
         if name.startswith('macos-'):
+            helper = binary.resolve().parent / 'Teleaf Notifications.app'
+            if not (helper / 'Contents/MacOS/teleaf-notifications').is_file():
+                raise RuntimeError('缺少原生 macOS 通知助手，请在 macOS 上重新 cargo build')
+            shutil.copytree(helper, staging / helper.name)
+            subprocess.run([str(staging / helper.name / 'Contents/MacOS/teleaf-notifications'), '--self-test'], check=True)
             macos_dependencies(runtime)
             subprocess.run(['codesign', '--force', '--sign', '-', str(executable)], check=True)
         elif name.startswith('linux-'):

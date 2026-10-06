@@ -15,7 +15,6 @@ enum Command {
         silent: bool,
     },
     Remove(i64),
-    #[cfg(windows)]
     Clear,
 }
 
@@ -24,26 +23,24 @@ pub struct State {
     started: i64,
     seen: VecDeque<(i64, i64)>,
     displayed: VecDeque<(i64, i64)>,
-    #[cfg(windows)]
     worker: Option<std::sync::mpsc::SyncSender<Command>>,
-    #[cfg(windows)]
     errors: Option<std::sync::mpsc::Receiver<String>>,
-    #[cfg(windows)]
     account: String,
+    #[cfg(target_os = "linux")]
+    history: std::sync::Arc<std::sync::Mutex<native::History>>,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
-            enabled: cfg!(windows) && std::env::var("TG_NOTIFICATIONS").as_deref() != Ok("0"),
+            enabled: default_enabled(),
             started: timestamp(),
             seen: VecDeque::new(),
             displayed: VecDeque::new(),
-            #[cfg(windows)]
             worker: None,
-            #[cfg(windows)]
             errors: None,
-            #[cfg(windows)]
+            #[cfg(target_os = "linux")]
+            history: Default::default(),
             account: {
                 use std::hash::{Hash, Hasher};
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -56,7 +53,7 @@ impl Default for State {
 
 impl State {
     pub fn requests(&self) -> Vec<Value> {
-        if !cfg!(windows) {
+        if !supported() {
             return vec![];
         }
         [("notification_group_size_max", 1), ("notification_group_count_max", if self.enabled { 10 } else { 0 })]
@@ -66,11 +63,10 @@ impl State {
             })).collect()
     }
     pub fn toggle(&mut self) {
-        self.enabled = !self.enabled && cfg!(windows);
+        self.enabled = !self.enabled && supported();
         self.seen.clear();
         self.displayed.clear();
         self.started = timestamp();
-        #[cfg(windows)]
         if self.worker.is_some() {
             self.dispatch(Command::Clear);
         }
@@ -78,7 +74,6 @@ impl State {
 
     pub fn update(&mut self, update: &Value, store: &Store, ready: bool) {
         if ready {
-            #[cfg(windows)]
             if self.enabled && update["@type"] == "updateActiveNotifications" {
                 // Clear previous-run toasts instead of replaying the startup backlog.
                 self.dispatch(Command::Clear);
@@ -167,25 +162,6 @@ impl State {
         commands
     }
 
-    #[cfg(not(windows))]
-    fn dispatch(&mut self, command: Command) {
-        // No backend/dependency or helper process is loaded on other platforms.
-        match command {
-            Command::Show {
-                group,
-                title,
-                body,
-                silent,
-            } => {
-                let _ = (group, title, body, silent);
-            }
-            Command::Remove(group) => {
-                let _ = group;
-            }
-        }
-    }
-
-    #[cfg(windows)]
     fn dispatch(&mut self, command: Command) {
         use std::sync::mpsc::{self, TrySendError};
         let command = if let Some(worker) = &self.worker {
@@ -200,16 +176,21 @@ impl State {
         let (errors, error_receiver) = mpsc::sync_channel(1);
         let thread_errors = errors.clone();
         let account = self.account.clone();
+        #[cfg(target_os = "linux")]
+        let history = self.history.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("teleaf-notifications".into())
             .spawn(move || {
-                if let Err(error) = native::run(receiver, &account) {
-                    let _ = thread_errors
-                        .try_send(format!("Windows 通知不可用：{error}；请检查系统通知设置"));
+                #[cfg(target_os = "linux")]
+                let result = native::run(receiver, &account, &history);
+                #[cfg(not(target_os = "linux"))]
+                let result = native::run(receiver, &account);
+                if let Err(error) = result {
+                    let _ = thread_errors.try_send(format!("桌面通知不可用：{error}"));
                 }
             })
         {
-            let _ = errors.try_send(format!("无法启动 Windows 通知线程：{error}"));
+            let _ = errors.try_send(format!("无法启动通知线程：{error}"));
             self.errors = Some(error_receiver);
             return;
         }
@@ -219,7 +200,6 @@ impl State {
     }
 
     pub fn poll_error(&mut self) -> Option<String> {
-        #[cfg(windows)]
         if let Some(error) = self
             .errors
             .as_ref()
@@ -240,23 +220,41 @@ fn timestamp() -> i64 {
         .as_secs() as i64
 }
 
+pub const fn supported() -> bool {
+    cfg!(any(windows, target_os = "macos", target_os = "linux"))
+}
+
+fn default_enabled() -> bool {
+    default_for(
+        supported(),
+        std::env::var("TG_NOTIFICATIONS").ok().as_deref(),
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some(),
+        !cfg!(target_os = "linux")
+            || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+            || std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some(),
+    )
+}
+
+fn default_for(supported: bool, preference: Option<&str>, remote: bool, desktop: bool) -> bool {
+    supported && preference != Some("0") && (preference == Some("1") || (!remote && desktop))
+}
+
 pub fn test_notification() -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        sender
-            .send(Command::Show {
-                group: 1,
-                title: "Teleaf 通知测试".into(),
-                body: "Windows 原生通知已连接。此测试不登录账号或发送消息。".into(),
-                silent: true,
-            })
-            .map_err(|e| e.to_string())?;
-        drop(sender);
-        native::run(receiver, "teleaf-test")
-    }
-    #[cfg(not(windows))]
-    Err("原生通知测试目前支持 Windows 10/11".into())
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    sender
+        .send(Command::Show {
+            group: 1,
+            title: "Teleaf 通知测试".into(),
+            body: "桌面通知已连接。此测试不登录账号或发送消息。".into(),
+            silent: true,
+        })
+        .map_err(|e| e.to_string())?;
+    drop(sender);
+    #[cfg(target_os = "linux")]
+    return native::run(receiver, "teleaf-test", &Default::default());
+    #[cfg(not(target_os = "linux"))]
+    native::run(receiver, "teleaf-test")
 }
 
 fn clean(text: &str, limit: usize) -> String {
@@ -294,11 +292,35 @@ fn message_body(message: &Value) -> String {
 
 #[cfg(windows)]
 mod native;
+#[cfg(target_os = "linux")]
+#[path = "notifications/linux.rs"]
+mod native;
+#[cfg(target_os = "macos")]
+#[path = "notifications/macos.rs"]
+mod native;
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+mod native {
+    pub(super) fn run(_: std::sync::mpsc::Receiver<super::Command>, _: &str) -> Result<(), String> {
+        Err("这个平台暂不支持桌面通知".into())
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn remote_headless_and_explicit_notification_preferences() {
+        assert!(default_for(true, None, false, true));
+        assert!(!default_for(true, None, true, true));
+        assert!(!default_for(true, None, false, false));
+        assert!(default_for(true, Some("1"), true, false));
+        assert!(!default_for(true, Some("0"), false, true));
+        assert!(!default_for(false, Some("1"), false, true));
+        let state = State::default();
+        assert!(state.worker.is_none() && state.errors.is_none());
+    }
 
     fn fixture() -> (State, Store, Value) {
         let state = State {
@@ -365,14 +387,14 @@ mod tests {
     }
 
     #[test]
-    fn mentions_notify_and_windows_options_enable_the_tdlib_api() {
+    fn mentions_notify_and_options_enable_the_tdlib_api() {
         let (mut state, store, mut update) = fixture();
         update["type"]["@type"] = json!("notificationGroupTypeMentions");
         assert!(matches!(
             &state.commands(&update, &store, 110)[..],
             [Command::Show { .. }]
         ));
-        if cfg!(windows) {
+        if supported() {
             let requests = state.requests();
             assert_eq!(requests[0]["name"], "notification_group_size_max");
             assert_eq!(requests[0]["value"]["value"], 1);

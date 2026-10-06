@@ -14,7 +14,7 @@ pub const HELP: &str = "Teleaf — Telegram 终端客户端
 用法：teleaf [选项]
   --demo       离线演示，不读取账号配置
   --check      检查随附 TDLib 能否加载，不登录或打开数据库
-  --test-notification  测试 Windows 原生通知，无需登录
+  --test-notification  测试系统桌面通知，无需登录
   --version    显示版本
   --help       显示帮助
 

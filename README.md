@@ -290,17 +290,21 @@ $env:TG_IMAGE_PROTOCOL = 'sixel'
 
 Linux / WSL 使用 `libtdjson.so`，macOS 使用 `libtdjson.dylib`；`TDLIB_PATH` 指向对应系统的库。交互式实测主机为 macOS；五个平台已在原生 CI 构建和测试，Windows ConPTY 输入已验证，原生图片输出有协议测试。Linux/Windows 的交互式终端 GPU 显示及真实账号上传仍需实机验证。PTY 测试使用 Unix API，只能在 macOS/Linux/WSL 运行，不能直接在原生 PowerShell 运行。
 
-## Windows 消息通知
+## 桌面消息通知
 
-Windows 10/11 默认启用原生 WinRT 提醒，应用运行时接收消息；设置页可用鼠标或 `Tab` / `Enter` 切换 **Windows 通知**。开关只影响本次运行；长期关闭可先在 PowerShell 设置 `$env:TG_NOTIFICATIONS="0"` 再启动。
+从 v0.1.4 起，macOS、Linux 桌面和 Windows 10/11 支持系统原生提醒，应用运行且登录时接收消息。设置页可用鼠标或 `Tab` / `Enter` 切换 **桌面通知**。开关只影响本次运行；长期关闭可设置 `TG_NOTIFICATIONS=0`（PowerShell：`$env:TG_NOTIFICATIONS="0"`）。SSH 和无桌面的 Linux 默认关闭，可用 `TG_NOTIFICATIONS=1` 显式开启；它通知的是程序所在机器，不转发到 SSH 客户端。
 
-提醒使用 [TDLib Notification API](https://core.telegram.org/tdlib/notification-api)，支持普通消息与提及，遵循 Telegram 通知/静音设置；忽略启动前的历史通知、自己发送的消息和重复事件，同一通知组的新消息替换已有提醒。消息读完或通知撤回后移除对应提醒。只使用文字和媒体类型摘要，不下载通知图片。
+提醒使用 [TDLib Notification API](https://core.telegram.org/tdlib/notification-api)，支持普通消息与提及，遵循 Telegram 通知/静音设置；忽略启动前的历史通知、自己发送的消息和重复事件。同一通知组的新消息替换已有提醒，消息读完或通知撤回后移除对应提醒。只使用文字和媒体类型摘要，不下载通知图片。当前是只读提醒，不支持点击跳转聊天。
 
-第一次通知会为当前用户创建 **Teleaf Notifications** 开始菜单快捷方式及 `teleaf-notification` 通知关闭协议，无需管理员权限。当前通知是只读提醒，点击关闭，不跳转会话；关闭处理进程立即退出，不加载 TDLib 或打开账号数据库。Windows 系统通知设置中可关闭声音、预览或整个应用的提醒；勿扰模式也会影响弹窗。
+| 平台 | 实现和配置 |
+| --- | --- |
+| macOS 15+ | 安装包附带 **Teleaf Notifications.app**，使用 [UserNotifications](https://developer.apple.com/documentation/usernotifications/unusernotificationcenter)；首次显示提醒时请求系统通知权限。拒绝后可在系统设置 → 通知中开启 Teleaf Notifications，再打开程序里的通知开关。必须保留助手和主程序在同一目录；Homebrew 会自动一起安装。源码构建需要 Xcode Command Line Tools 中的 Swift 编译器。 |
+| Linux X11 / Wayland | 直接连接用户会话的 [D-Bus 桌面通知服务](https://specifications.freedesktop.org/notification/latest-single/)，支持通知替换、撤回及静音提示；无需 `notify-send` 或额外 CLI。需要桌面提供 `org.freedesktop.Notifications`（例如 GNOME/KDE 或 dunst/mako）。没有服务时提示并关闭本次提醒，可在启用服务后通过设置重试。已显示编号仅在当前程序内存中保存，可跨空闲线程重启复用；退出重开后不能撤回上一进程遗留的通知。 |
+| Windows 10/11 | 原生 WinRT Toast；第一次通知创建当前用户的 **Teleaf Notifications** 开始菜单快捷方式及 `teleaf-notification` 关闭协议，无需管理员权限。点击关闭时处理进程立即退出，不加载 TDLib 或账号数据库。 |
 
-通知线程按需启动、队列最多 16 项、空闲 30 秒后退出；去重及已显示记录有数量上限，不增加聊天轮询。macOS/Linux 本轮没有原生通知后端。
+通知线程按需启动、队列最多 16 项、空闲 30 秒后退出；去重和已显示记录有数量上限，不增加聊天轮询。macOS 主程序不加载 AppKit/UserNotifications，仅在处理通知时启动助手，批量合并同组操作后退出；助手运行时会有临时内存占用。Linux D-Bus 连接只在工作线程活动时存在，编号缓存最多 128 组。通知被系统权限、专注/勿扰模式或桌面服务限制时，仍可正常聊天。
 
-先运行 `teleaf --test-notification` 检查系统提醒，无需登录；测试通知为静音。再保持 Teleaf 登录，用另一个账号向未静音会话发消息，检查弹窗与通知中心；读完消息后检查提醒撤回，再检查静音、设置关闭与连续群消息。CI 覆盖通知过滤和 Windows XML/快捷方式标识，实际弹窗、声音和勿扰模式需 Windows 桌面验证。
+先运行 `teleaf --test-notification` 检查系统提醒，无需登录；测试为静音，macOS 首次可能显示授权框。再保持 Teleaf 登录，用另一个账号向未静音会话发消息，检查弹窗与通知中心；读完消息后检查提醒撤回，再检查静音、设置关闭与连续群消息。测试覆盖 TDLib 过滤、Windows XML/快捷方式标识、macOS 助手内容和 Linux 私有 D-Bus 协议。实际横幅、声音和勿扰模式需对应桌面验证。
 
 ## TDLib
 
@@ -358,7 +362,7 @@ cargo run -- --demo
 
 `test-clipboard-pty.py` 检查 F7、附件粘贴入口、SSH 回退、取消和静置零输出；不读取系统剪贴板。Rust 测试检查剪贴板 PNG 暂存、取消/移除清理、确认后源文件保留、回复/草稿及过期结果；macOS 另外使用私有剪贴板验证 PNG、TIFF、文件列表和文字，不修改用户剪贴板。Windows 和 Wayland/X11 的真实桌面剪贴板仍需对应平台实测。
 
-真实账号登录、服务端功能兼容性和性能目标仍需在目标终端实测。草稿同步、跨平台通知、语音、群组管理、动态贴纸播放和通话等仍在 [计划](PLAN.md) 中。
+真实账号登录、服务端功能兼容性和性能目标仍需在目标终端实测。草稿同步、点击通知跳转聊天、语音、群组管理、动态贴纸播放和通话等仍在 [计划](PLAN.md) 中。
 
 ### Windows 原生回归验证
 

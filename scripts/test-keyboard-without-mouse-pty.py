@@ -23,7 +23,7 @@ def settings_mouse_off(terminal):
 def restore_from_settings(terminal):
     terminal.send(b'\x1b[14~')
     terminal.wait('设置与连接')
-    terminal.send(b'\x1b[Z\r')  # Shift+Tab selects the last button
+    terminal.send(b'\x1b[Z\x1b[Z\r')  # Back past Notifications to Mouse
     terminal.wait('鼠标：开')
     assert b'\x1b[?1000h' in terminal.output
     terminal.send(b'\x1b')

@@ -2607,7 +2607,11 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = modal(frame, app, centered(area, 70, 21), "设置与连接");
     let rows = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(if cfg!(windows) { 3 } else { 2 }),
+        Constraint::Length(if crate::notifications::supported() {
+            3
+        } else {
+            2
+        }),
     ])
     .split(inner);
     let tools = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2625,15 +2629,15 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         },
         Action::ToggleMouse,
     );
-    if cfg!(windows) {
+    if crate::notifications::supported() {
         button(
             frame,
             app,
             Rect::new(rows[1].x, rows[1].y + 2, rows[1].width, 1),
             if app.notifications.enabled {
-                "[Windows 通知：开]"
+                "[桌面通知：开]"
             } else {
-                "[Windows 通知：关]"
+                "[桌面通知：关]"
             },
             Action::ToggleNotifications,
         );

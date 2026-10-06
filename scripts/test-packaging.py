@@ -137,10 +137,13 @@ with tempfile.TemporaryDirectory() as folder:
             (staging / 'tdlib').mkdir(parents=True)
             (staging / 'teleaf.exe').write_bytes(b'executable')
             (staging / 'tdlib/tdjson.dll').write_bytes(b'runtime')
+            helper = staging / 'Teleaf Notifications.app/Contents/MacOS/teleaf-notifications'
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b'native helper')
             archive = folder / 'teleaf.zip'
             release.write_archive(staging, archive)
             with zipfile.ZipFile(archive) as z:
-                self.assertEqual(set(z.namelist()), {'teleaf.exe', 'tdlib/tdjson.dll'})
+                self.assertEqual(set(z.namelist()), {'teleaf.exe', 'tdlib/tdjson.dll', 'Teleaf Notifications.app/Contents/MacOS/teleaf-notifications'})
                 self.assertEqual(z.read('tdlib/tdjson.dll'), b'runtime')
 
 
