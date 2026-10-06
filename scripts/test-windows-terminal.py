@@ -150,9 +150,11 @@ def clipboard_regression():
         with tempfile.TemporaryDirectory(prefix='teleaf-clipboard-conpty-') as directory:
             terminal = Terminal(directory, True, 'halfblocks')
             try:
-                terminal.wait('离线演示')
+                # The demo header renders before its image fixtures and chat
+                # updates arrive. Wait for a selectable chat before Enter.
+                terminal.wait('产品讨论')
                 terminal.send('\r')
-                terminal.read(.5)
+                terminal.wait('图片直接放在这条消息里')
                 png_format = user.RegisterClipboardFormatW('PNG')
                 assert png_format
                 fixtures = [
