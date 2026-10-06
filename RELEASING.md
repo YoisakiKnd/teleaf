@@ -21,7 +21,7 @@ Telegram 官网注册错误仍需在官网解决；已有应用无需再次创�
 
 1. 使用 `YoisakiKnd/teleaf` 仓库，将当前源码连同 `.github/`、`packaging/` 和 `scripts/` 推送到默认分支。`target/`、本地账号数据和 `.env` 不提交。
 2. 在 Actions 页面手动运行 **Release packages**，先检查五个平台能否构建和加载 TDLib。手动运行只生成 Actions artifacts，不发布 Release 或修改包清单。
-3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.5`。标签必须与 Cargo 版本完全一致。
+3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.6`。标签必须与 Cargo 版本完全一致。
 4. 标签触发构建、运行库打包和加载检查；全部成功后创建 GitHub Release，发布各平台压缩包、SHA-256、Homebrew 配方和 Scoop 清单。
 5. 发布任务将生成的 `Formula/teleaf.rb` 提交到主仓库默认分支；主仓库仍充当显式 URL 的 Homebrew tap。独立的 [scoop-bucket](https://github.com/YoisakiKnd/scoop-bucket) 仓库每小时读取主仓库的最新稳定 Release，核对 Windows 安装包 URL、`SHA256SUMS` 和 GitHub 资产哈希，再将 Release 附带的 `teleaf.json` 提交为 `bucket/teleaf.json`。Scoop 用户无需克隆主项目源码。
 
@@ -33,7 +33,7 @@ GitHub 定时任务可能延迟，长期无活动的公开仓库也可能被停�
 
 ## Scoop 发布约定
 
-2026-10-04 起按用户的新要求，稳定版本只推送主仓库 `YoisakiKnd/teleaf` 并更新 `YoisakiKnd/scoop-teleaf` 的 `bucket/teleaf.json`，不再为 `Mythos-404/eimer` 创建或更新 PR。已提交的历史 PR 保留，由维护者自行处理。这项约定同时保存在 `AGENTS.md`。
+2026-10-04 起按用户的新要求，稳定版本只推送主仓库 `YoisakiKnd/teleaf` 并更新 `YoisakiKnd/scoop-bucket` 的 `bucket/teleaf.json`，不再为 `Mythos-404/eimer` 创建或更新 PR。已提交的历史 PR 保留，由维护者自行处理。这项约定同时保存在 `AGENTS.md`。
 
 Scoop 清单必须与该次实际发布的 Windows ZIP 版本、下载地址、SHA-256 和 MIT 许可证一致，核验成功后再同步。
 
@@ -91,9 +91,21 @@ Windows CI 在一次性桌面写入合成剪贴板，ConPTY 验证 CF_DIB 截图
 
 已下载五个平台的正式归档，核验 SHA256SUMS、GitHub 资产摘要、程序、TDLib、许可证和更新后的文档。Homebrew 配方已同步（`84600af`）；自有 Scoop [同步任务 37405233893](https://github.com/YoisakiKnd/scoop-bucket/actions/runs/37405233893) 成功（清单提交 `e6c652c`）。两份安装清单与 Release 附带文件逐字节相同。Windows ZIP SHA-256：`edb15ac378e90e7e62f1085f553392af93e34de51275db5f5c23e3cf738ffcbb`。
 
+## 0.1.6 发布验证
+
+2026-10-06 已发布 [v0.1.6](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.6)，标签对应 `6f2bac62b790b3b2884709c5a0fe7e9c2de029d1`。修复 Windows 首次通知设置查询返回 `0x80070490`，补齐当前用户的应用身份元数据和进程标识；快捷方式在 STA 注册，通知工厂随 MTA 工作线程释放，保留空闲 30 秒退出机制。错误提示增加具体阶段和系统禁用原因。
+
+[分支 CI 37415491797](https://github.com/YoisakiKnd/teleaf/actions/runs/37415491797) 和 [标签 CI 37415732079](https://github.com/YoisakiKnd/teleaf/actions/runs/37415732079) 均通过。Windows 原生回归使用独立随机 AUMID，复现首次 `Setting` 的“找不到元素”，验证注册元数据、第一条实际 `Show` 后设置可查询，以及通知撤回；CI 合成提醒抑制弹窗。快捷方式身份、多次 COM 初始化/退出、133 项单元测试、Clippy 和 ConPTY 键鼠/剪贴板测试全部通过。测试同时暴露并修复了关闭 COM 后继续使用全局工厂缓存的访问异常；失败的修复尝试没有发布安装包。
+
+[发布任务 37415732061](https://github.com/YoisakiKnd/teleaf/actions/runs/37415732061) 最终五个平台全部成功：Windows 133 项，macOS / Linux 各 131 项单元测试，7 项打包测试、Clippy 和 TDLib 1.8.61 加载通过。首次 macOS Intel 构建的一项既有图片缓存测试超过 4 秒等待上限；在新 CI 机器重跑后通过，源码及全部断言保持不变。发布前使用实际 Linux x64 安装包验证内置项目凭据直接进入手机号页并保留已有配置；没有提交真实手机号或验证码。
+
+已下载五个平台正式归档，核对 SHA256SUMS、GitHub 资产摘要、程序、TDLib、MIT 和第三方许可证，以及 README、CHANGELOG 和三个指南的内容。Homebrew 配方同步提交为 `92fa629`；自有 Scoop [同步任务 37416631841](https://github.com/YoisakiKnd/scoop-bucket/actions/runs/37416631841) 成功，清单提交为 `50f550b`。两份安装清单与 Release 附带文件逐字节一致，版本、URL、MIT 元数据和哈希均已核验。Windows ZIP SHA-256：`f34df11d0868a1b963127a2ad4b97298c3d9b1ad20062370d04c826fe6579b44`。没有为 eimer 创建或更新 PR。
+
+用户报告的环境为 Windows 11、Teleaf 0.1.5；升级后可重新运行 `teleaf --test-notification`。CI 验证原生 API，不代替用户桌面的实际横幅、声音、通知权限和勿扰模式验收。本轮没有重新测量真实账号内存。
+
 ## 用户安装
 
-[v0.1.5](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.5)及安装清单已发布：
+[v0.1.6](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.6)及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/teleaf https://github.com/YoisakiKnd/teleaf
@@ -135,7 +147,7 @@ TDLib 上游发布包固定为 tdlib-rs `v1.4.0` 中的 TDLib `1.8.61`，平台�
 
 ```sh
 cargo build --release --locked
-python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.5
+python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.6
 python3 scripts/test-packaging.py
 ```
 
@@ -146,7 +158,7 @@ Windows 的 binary 参数为 `target/release/teleaf.exe`，打包机需要 Visua
 五个平台的产物齐全后，可以独立生成包清单：
 
 ```sh
-python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.5 --assets target/dist --output target/packages
+python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.6 --assets target/dist --output target/packages
 ```
 
 输出真实配方、Scoop 清单和 SHA256SUMS。该命令拒绝缺失的平台产物和不合法的仓库/版本输入；生成器只写本地文件，不创建远程仓库或发布内容。
