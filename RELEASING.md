@@ -81,9 +81,19 @@ Scoop 仓库已更名为 `YoisakiKnd/scoop-bucket`，旧 `scoop-teleaf` 地址�
 
 实际横幅、声音、通知权限拒绝后的桌面行为及专注/勿扰模式仍需对应平台实测；可运行 `teleaf --test-notification` 检查静音提醒，macOS 首次显示时需允许系统通知权限。详细配置见 [通知指南](docs/CONFIGURATION.md#桌面消息通知)。本轮没有重新测量真实账号内存；通知线程、队列和后台组件的生命周期限制见配置指南。
 
+## 0.1.5 发布验证
+
+2026-10-06 已发布 [v0.1.5](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.5)，标签对应 `e46814fd80e464e3493a80604f0e7ae5b0fb4459`。本版补齐原生 Windows 的 CF_DIB 截图粘贴及错误提示；位图回退在解码前检查大小，RGB 截图直接编码 PNG，减少整图拷贝。README 和使用指南说明终端文字粘贴与 F7 图片粘贴的区别。
+
+[分支 CI 37404445767](https://github.com/YoisakiKnd/teleaf/actions/runs/37404445767)、[标签 CI 37404705255](https://github.com/YoisakiKnd/teleaf/actions/runs/37404705255) 和 [发布任务 37404705217](https://github.com/YoisakiKnd/teleaf/actions/runs/37404705217) 全部通过。五个平台各 131 项 Rust 测试、7 项打包测试、Clippy 和随包 TDLib 加载检查成功，实际 Linux x64 发布包通过内置凭据登录启动门禁；未提交手机号或验证码。
+
+Windows CI 在一次性桌面写入合成剪贴板，ConPTY 验证 CF_DIB 截图、损坏 PNG 的位图回退、F7 / 直接传给程序的 Ctrl+V、关闭鼠标后粘贴、取消暂存清理、损坏和超大位图，以及多行文字。首次端到端测试在演示会话尚未加载时按 Enter；改为等待会话和消息出现后重跑成功，保留完整粘贴断言。普通本地运行跳过剪贴板写入测试。真实终端的默认粘贴键绑定及用户截图工具仍可按使用指南自行验收。
+
+已下载五个平台的正式归档，核验 SHA256SUMS、GitHub 资产摘要、程序、TDLib、许可证和更新后的文档。Homebrew 配方已同步（`84600af`）；自有 Scoop [同步任务 37405233893](https://github.com/YoisakiKnd/scoop-bucket/actions/runs/37405233893) 成功（清单提交 `e6c652c`）。两份安装清单与 Release 附带文件逐字节相同。Windows ZIP SHA-256：`edb15ac378e90e7e62f1085f553392af93e34de51275db5f5c23e3cf738ffcbb`。
+
 ## 用户安装
 
-[v0.1.4](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.4)及安装清单已发布：
+[v0.1.5](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.5)及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/teleaf https://github.com/YoisakiKnd/teleaf
