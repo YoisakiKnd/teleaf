@@ -21,7 +21,7 @@ Telegram 官网注册错误仍需在官网解决；已有应用无需再次创�
 
 1. 使用 `YoisakiKnd/teleaf` 仓库，将当前源码连同 `.github/`、`packaging/` 和 `scripts/` 推送到默认分支。`target/`、本地账号数据和 `.env` 不提交。
 2. 在 Actions 页面手动运行 **Release packages**，先检查五个平台能否构建和加载 TDLib。手动运行只生成 Actions artifacts，不发布 Release 或修改包清单。
-3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.3`。标签必须与 Cargo 版本完全一致。
+3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.4`。标签必须与 Cargo 版本完全一致。
 4. 标签触发构建、运行库打包和加载检查；全部成功后创建 GitHub Release，发布各平台压缩包、SHA-256、Homebrew 配方和 Scoop 清单。
 5. 发布任务将生成的 `Formula/teleaf.rb` 提交到主仓库默认分支；主仓库仍充当显式 URL 的 Homebrew tap。独立的 [scoop-bucket](https://github.com/YoisakiKnd/scoop-bucket) 仓库每小时读取主仓库的最新稳定 Release，核对 Windows 安装包 URL、`SHA256SUMS` 和 GitHub 资产哈希，再将 Release 附带的 `teleaf.json` 提交为 `bucket/teleaf.json`。Scoop 用户无需克隆主项目源码。
 
@@ -67,9 +67,23 @@ Homebrew 配方由发布任务同步（`58db450`）；自有 Scoop [同步任务
 
 Scoop 仓库已更名为 `YoisakiKnd/scoop-bucket`，旧 `scoop-teleaf` 地址重定向到同一仓库；新安装命令使用新地址。Windows 实际通知弹窗、声音、勿扰模式和终端 GPU 图片显示仍需桌面实机验证，CI 与 ConPTY 不能代替这些检查。可先运行 `teleaf --test-notification` 做无需登录的静音通知测试。
 
+## 0.1.4 发布验证
+
+2026-10-06 已发布 [v0.1.4](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.4)，最终标签对应 `b91ecacb195336aa0b3a4aa7bb8024d35e9f660c`。本版补齐 macOS / Linux 桌面通知，统一通知开关和测试命令，并重写 README 首页，将使用、配置和开发说明拆分到 `docs/`，完整文档随包分发。
+
+[分支 CI 37398631178](https://github.com/YoisakiKnd/teleaf/actions/runs/37398631178)、[标签 CI 37398634129](https://github.com/YoisakiKnd/teleaf/actions/runs/37398634129) 及 [正式发布 37398633984](https://github.com/YoisakiKnd/teleaf/actions/runs/37398633984) 均通过。五个平台各 127 项单元测试，以及 Clippy、打包检查和 TDLib 加载通过；Linux 使用私有 D-Bus 验证替换、撤回、线程重连和服务重启后的编号重置，macOS 验证随包助手内容，Windows 覆盖 XML/快捷方式身份及 ConPTY 输入。
+
+首次构建在共享 Intel CI 上触发已有图片测试的 2 秒等待超时，未生成 Release。将测试总等待上限改为 20 秒、保留全部显示断言后，更新尚未发布的标签并重跑五个平台；最终安装包仅来自全部通过的构建。
+
+发布前用实际 Linux x64 安装包验证内置项目凭据能直接进入手机号页且保留已有配置。正式 macOS ARM 包在本机通过相同启动检查，以及通知助手签名、内容自检与系统服务连接检查。源码助手的隔离测试命名空间撤回接口也通过。以上检查没有提交手机号或验证码，也没有弹通知或申请通知权限。
+
+正式下载的五份压缩包、SHA256SUMS、GitHub 资产摘要、TDLib、许可证和新版文档均已核验；README 与三个指南的文字内容与仓库一致（Windows 使用 CRLF 行尾）。Homebrew 配方由发布任务同步（`dde0688`）；自有 Scoop [同步任务 37399219572](https://github.com/YoisakiKnd/scoop-bucket/actions/runs/37399219572) 成功（清单提交 `de23701`）。两份安装清单与 Release 附带文件逐字节相同，版本、URL、MIT 元数据和哈希一致。Windows ZIP SHA-256：`be4dde6cd2f1be1dcb902018da10b09aee4a13b997b9a768778d96b1cff37b2a`。没有为 eimer 创建或更新 PR。
+
+实际横幅、声音、通知权限拒绝后的桌面行为及专注/勿扰模式仍需对应平台实测；可运行 `teleaf --test-notification` 检查静音提醒，macOS 首次显示时需允许系统通知权限。详细配置见 [通知指南](docs/CONFIGURATION.md#桌面消息通知)。本轮没有重新测量真实账号内存；通知线程、队列和后台组件的生命周期限制见配置指南。
+
 ## 用户安装
 
-[v0.1.3](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.3)及安装清单已发布：
+[v0.1.4](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.4)及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/teleaf https://github.com/YoisakiKnd/teleaf
@@ -111,7 +125,7 @@ TDLib 上游发布包固定为 tdlib-rs `v1.4.0` 中的 TDLib `1.8.61`，平台�
 
 ```sh
 cargo build --release --locked
-python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.3
+python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.4
 python3 scripts/test-packaging.py
 ```
 
@@ -122,7 +136,7 @@ Windows 的 binary 参数为 `target/release/teleaf.exe`，打包机需要 Visua
 五个平台的产物齐全后，可以独立生成包清单：
 
 ```sh
-python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.3 --assets target/dist --output target/packages
+python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.4 --assets target/dist --output target/packages
 ```
 
 输出真实配方、Scoop 清单和 SHA256SUMS。该命令拒绝缺失的平台产物和不合法的仓库/版本输入；生成器只写本地文件，不创建远程仓库或发布内容。
