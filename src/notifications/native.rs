@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{
-    NotificationSetting, ToastNotification, ToastNotificationManager, ToastNotifier,
+    IToastNotificationFactory, IToastNotificationManagerStatics, IToastNotificationManagerStatics2,
+    NotificationSetting, ToastNotification, ToastNotificationHistory, ToastNotificationManager,
+    ToastNotifier,
 };
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::Com::StructuredStorage::{
@@ -19,7 +21,8 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::System::WinRT::{
-    RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RO_INIT_TYPE, RoInitialize, RoUninitialize,
+    IActivationFactory, RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RO_INIT_TYPE, RoInitialize,
+    RoUninitialize,
 };
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::{
@@ -64,6 +67,74 @@ impl Drop for Apartment {
         // SAFETY: Balances this thread's successful RoInitialize, after COM objects drop.
         unsafe {
             RoUninitialize();
+        }
+    }
+}
+
+// The generated static constructors cache activation factories for the whole
+// process. RoUninitialize can invalidate those pointers when our idle worker
+// exits. Own the factories only for this apartment, and release them first.
+struct Factories {
+    document: IActivationFactory,
+    toast: IToastNotificationFactory,
+    manager: IToastNotificationManagerStatics,
+    history: IToastNotificationManagerStatics2,
+}
+
+impl Factories {
+    fn new() -> windows::core::Result<Self> {
+        Ok(Self {
+            document: windows::core::factory::<XmlDocument, IActivationFactory>()?,
+            toast: windows::core::factory::<ToastNotification, IToastNotificationFactory>()?,
+            manager: windows::core::factory::<
+                ToastNotificationManager,
+                IToastNotificationManagerStatics,
+            >()?,
+            history: windows::core::factory::<
+                ToastNotificationManager,
+                IToastNotificationManagerStatics2,
+            >()?,
+        })
+    }
+
+    fn document(&self) -> windows::core::Result<XmlDocument> {
+        // SAFETY: this owned factory belongs to the initialized current apartment.
+        unsafe { self.document.ActivateInstance()?.cast() }
+    }
+
+    fn notifier(&self, app_id: &HSTRING) -> windows::core::Result<ToastNotifier> {
+        // SAFETY: typed factory vtable, live HSTRING input and writable output;
+        // from_abi takes the returned reference only after a successful HRESULT.
+        unsafe {
+            let mut result = std::ptr::null_mut();
+            (self.manager.vtable().CreateToastNotifierWithId)(
+                self.manager.as_raw(),
+                std::mem::transmute_copy(app_id),
+                &mut result,
+            )
+            .and_then(|| windows::core::Type::from_abi(result))
+        }
+    }
+
+    fn toast(&self, document: &XmlDocument) -> windows::core::Result<ToastNotification> {
+        // SAFETY: typed factory and live XML object, with a writable ABI output.
+        unsafe {
+            let mut result = std::ptr::null_mut();
+            (self.toast.vtable().CreateToastNotification)(
+                self.toast.as_raw(),
+                document.as_raw(),
+                &mut result,
+            )
+            .and_then(|| windows::core::Type::from_abi(result))
+        }
+    }
+
+    fn history(&self) -> windows::core::Result<ToastNotificationHistory> {
+        // SAFETY: typed factory, writable output, and HRESULT-checked ownership.
+        unsafe {
+            let mut result = std::ptr::null_mut();
+            (self.history.vtable().History)(self.history.as_raw(), &mut result)
+                .and_then(|| windows::core::Type::from_abi(result))
         }
     }
 }
@@ -208,9 +279,11 @@ pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), Stri
         register()?;
     }
     let _apartment = Apartment::new().map_err(|e| format!("初始化 Windows 通知组件失败：{e}"))?;
+    let factories = Factories::new().map_err(|e| format!("加载 Windows 通知工厂失败：{e}"))?;
     let app_id = HSTRING::from(APP_ID);
     let account = HSTRING::from(account);
-    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&app_id)
+    let notifier = factories
+        .notifier(&app_id)
         .map_err(|e| format!("创建 Windows 通知发送器失败（{APP_ID}）：{e}"))?;
     let mut pending_setting = !check_known_setting(&notifier)?;
     // An idle worker exits; the next notification creates one again, with no timer in the UI.
@@ -225,9 +298,9 @@ pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), Stri
             } => (
                 "发送 Windows 通知",
                 (|| {
-                    let document = XmlDocument::new()?;
+                    let document = factories.document()?;
                     document.LoadXml(&HSTRING::from(xml(&title, &body, silent)))?;
-                    let toast = ToastNotification::CreateToastNotification(&document)?;
+                    let toast = factories.toast(&document)?;
                     // One toast per Telegram group; new messages replace it in Action Center.
                     toast.SetTag(&HSTRING::from(group.to_string()))?;
                     toast.SetGroup(&account)?;
@@ -236,7 +309,7 @@ pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), Stri
             ),
             Command::Remove(group) => (
                 "撤回 Windows 通知",
-                ToastNotificationManager::History().and_then(|history| {
+                factories.history().and_then(|history| {
                     missing_history_is_ok(history.RemoveGroupedTagWithId(
                         &HSTRING::from(group.to_string()),
                         &account,
@@ -246,7 +319,7 @@ pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), Stri
             ),
             Command::Clear => (
                 "清理 Windows 通知",
-                ToastNotificationManager::History().and_then(|history| {
+                factories.history().and_then(|history| {
                     missing_history_is_ok(history.RemoveGroupWithId(&account, &app_id))
                 }),
             ),
@@ -314,6 +387,7 @@ mod tests {
     fn fresh_notification_identity_sends_before_reading_initial_settings() {
         use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegDeleteTreeW, RegGetValueW};
         let _apartment = Apartment::new().unwrap();
+        let factories = Factories::new().unwrap();
         let mut nonce = [0u8; 16];
         getrandom::getrandom(&mut nonce).unwrap();
         let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -329,7 +403,8 @@ mod tests {
             }
         }
         let _cleanup = Cleanup(key.clone());
-        let before = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(&app_id))
+        let before = factories
+            .notifier(&HSTRING::from(&app_id))
             .and_then(|notifier| notifier.Setting());
         println!("Windows unregistered notification identity: {before:?}");
         register_identity(&app_id).unwrap();
@@ -358,7 +433,8 @@ mod tests {
         assert_eq!(read("CustomActivator"), format!("{{{STUB_CLSID:?}}}"));
         // No real app registration or account is touched. In particular, an
         // uninitialized Setting must not block the first real Show operation.
-        let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(&app_id))
+        let notifier = factories
+            .notifier(&HSTRING::from(&app_id))
             .expect("fresh registered AUMID must create a notifier");
         let setting =
             known_setting(&notifier).expect("first-use lookup handles a missing settings row");
@@ -368,7 +444,7 @@ mod tests {
         {
             // Exercise Show on disposable CI desktops without a popup. Normal
             // local unit tests never request a notification or alter real app IDs.
-            let document = XmlDocument::new().unwrap();
+            let document = factories.document().unwrap();
             document
                 .LoadXml(&HSTRING::from(xml(
                     "Teleaf CI",
@@ -376,7 +452,7 @@ mod tests {
                     true,
                 )))
                 .unwrap();
-            let toast = ToastNotification::CreateToastNotification(&document).unwrap();
+            let toast = factories.toast(&document).unwrap();
             let tag = HSTRING::from("fixture");
             let group = HSTRING::from("teleaf-ci");
             toast.SetTag(&tag).unwrap();
@@ -401,11 +477,11 @@ mod tests {
                         .contains(setting_name(setting))
                 );
             }
-            missing_history_is_ok(
-                ToastNotificationManager::History()
-                    .unwrap()
-                    .RemoveGroupedTagWithId(&tag, &group, &HSTRING::from(&app_id)),
-            )
+            missing_history_is_ok(factories.history().unwrap().RemoveGroupedTagWithId(
+                &tag,
+                &group,
+                &HSTRING::from(&app_id),
+            ))
             .unwrap();
             println!("Windows notification Show / Remove API: PASS (CI fixture, popup suppressed)");
         }
@@ -430,8 +506,9 @@ mod tests {
     #[test]
     fn toast_text_is_xml_data_and_shortcut_has_our_identity() {
         let _apartment = Apartment::shell().unwrap();
+        let factories = Factories::new().unwrap();
         eprintln!("Windows shortcut regression: apartment initialized");
-        let document = XmlDocument::new().unwrap();
+        let document = factories.document().unwrap();
         document
             .LoadXml(&HSTRING::from(xml(
                 "群 <&>",
@@ -487,14 +564,20 @@ mod tests {
         std::fs::remove_dir_all(folder).unwrap();
         drop(nodes);
         drop(document);
+        drop(factories);
         drop(_apartment);
         // Production switches the same worker from synchronous Shell setup to
         // WinRT notifications. No COM object may cross that apartment boundary.
-        let _notification_apartment = Apartment::new().unwrap();
-        XmlDocument::new()
-            .unwrap()
-            .LoadXml(&HSTRING::from(xml("Teleaf", "Apartment transition", true)))
-            .unwrap();
+        for _ in 0..3 {
+            let _notification_apartment = Apartment::new().unwrap();
+            let factories = Factories::new().unwrap();
+            factories
+                .document()
+                .unwrap()
+                .LoadXml(&HSTRING::from(xml("Teleaf", "Apartment transition", true)))
+                .unwrap();
+            let _notifier = factories.notifier(&HSTRING::from(APP_ID)).unwrap();
+        }
         eprintln!("Windows shortcut regression: completed");
     }
 }
