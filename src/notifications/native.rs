@@ -18,7 +18,9 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_SZ, RegCloseKey, RegCreateKeyW, RegSetValueExW,
 };
 use windows::Win32::System::Variant::VT_LPWSTR;
-use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+use windows::Win32::System::WinRT::{
+    RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RO_INIT_TYPE, RoInitialize, RoUninitialize,
+};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::{
     FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
@@ -42,9 +44,17 @@ const STUB_CLSID: GUID = GUID::from_u128(0x3bb04cc8_54d8_4bc0_9798_0d0397bb7556)
 struct Apartment;
 impl Apartment {
     fn new() -> windows::core::Result<Self> {
+        Self::initialize(RO_INIT_MULTITHREADED)
+    }
+
+    fn shell() -> windows::core::Result<Self> {
+        Self::initialize(RO_INIT_SINGLETHREADED)
+    }
+
+    fn initialize(kind: RO_INIT_TYPE) -> windows::core::Result<Self> {
         // SAFETY: This dedicated thread has not initialized COM elsewhere.
         unsafe {
-            RoInitialize(RO_INIT_MULTITHREADED)?;
+            RoInitialize(kind)?;
         }
         Ok(Self)
     }
@@ -189,8 +199,15 @@ fn xml(title: &str, body: &str, silent: bool) -> String {
 }
 
 pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), String> {
+    {
+        // Shell links use an STA. Complete and release every Shell object before
+        // entering the MTA used by the blocking notification queue. This avoids
+        // cross-apartment Shell proxies and needs no extra thread/message loop.
+        let _shell =
+            Apartment::shell().map_err(|e| format!("初始化 Windows 通知快捷方式组件失败：{e}"))?;
+        register()?;
+    }
     let _apartment = Apartment::new().map_err(|e| format!("初始化 Windows 通知组件失败：{e}"))?;
-    register()?;
     let app_id = HSTRING::from(APP_ID);
     let account = HSTRING::from(account);
     let notifier = ToastNotificationManager::CreateToastNotifierWithId(&app_id)
@@ -412,7 +429,7 @@ mod tests {
 
     #[test]
     fn toast_text_is_xml_data_and_shortcut_has_our_identity() {
-        let _apartment = Apartment::new().unwrap();
+        let _apartment = Apartment::shell().unwrap();
         eprintln!("Windows shortcut regression: apartment initialized");
         let document = XmlDocument::new().unwrap();
         document
@@ -468,6 +485,16 @@ mod tests {
             assert_eq!(*value.Anonymous.Anonymous.Anonymous.puuid, STUB_CLSID);
         }
         std::fs::remove_dir_all(folder).unwrap();
+        drop(nodes);
+        drop(document);
+        drop(_apartment);
+        // Production switches the same worker from synchronous Shell setup to
+        // WinRT notifications. No COM object may cross that apartment boundary.
+        let _notification_apartment = Apartment::new().unwrap();
+        XmlDocument::new()
+            .unwrap()
+            .LoadXml(&HSTRING::from(xml("Teleaf", "Apartment transition", true)))
+            .unwrap();
         eprintln!("Windows shortcut regression: completed");
     }
 }
