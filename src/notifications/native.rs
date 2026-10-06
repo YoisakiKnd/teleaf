@@ -413,6 +413,7 @@ mod tests {
     #[test]
     fn toast_text_is_xml_data_and_shortcut_has_our_identity() {
         let _apartment = Apartment::new().unwrap();
+        eprintln!("Windows shortcut regression: apartment initialized");
         let document = XmlDocument::new().unwrap();
         document
             .LoadXml(&HSTRING::from(xml(
@@ -434,6 +435,7 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join("test.lnk");
         shortcut(&path, &std::env::current_exe().unwrap(), APP_ID).unwrap();
+        eprintln!("Windows shortcut regression: saved identity");
         // SAFETY: COM is initialized and the test file path remains valid.
         unsafe {
             let link: IShellLinkW =
@@ -444,8 +446,10 @@ mod tests {
                 windows::Win32::System::Com::STGM_READ,
             )
             .unwrap();
+            eprintln!("Windows shortcut regression: loaded shortcut");
             let properties: IPropertyStore = link.cast().unwrap();
             let value = properties.GetValue(&APP_ID_KEY).unwrap();
+            eprintln!("Windows shortcut regression: read app ID");
             assert_eq!(value.Anonymous.Anonymous.vt, VT_LPWSTR);
             let identity = value
                 .Anonymous
@@ -456,6 +460,7 @@ mod tests {
                 .unwrap();
             assert_eq!(identity, APP_ID);
             let value = properties.GetValue(&ACTIVATOR_KEY).unwrap();
+            eprintln!("Windows shortcut regression: read activator");
             assert_eq!(
                 value.Anonymous.Anonymous.vt,
                 windows::Win32::System::Variant::VT_CLSID
@@ -463,5 +468,6 @@ mod tests {
             assert_eq!(*value.Anonymous.Anonymous.Anonymous.puuid, STUB_CLSID);
         }
         std::fs::remove_dir_all(folder).unwrap();
+        eprintln!("Windows shortcut regression: completed");
     }
 }
