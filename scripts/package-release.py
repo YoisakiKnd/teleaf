@@ -116,6 +116,9 @@ def package(binary, name, version, output, archive=None):
         else:
             windows_crt(staging)
         shutil.copyfile(ROOT / 'README.md', staging / 'README.md')
+        shutil.copytree(ROOT / 'docs', staging / 'docs')
+        for document in ('CHANGELOG.md', 'RELEASING.md', 'MEMORY_BUDGET.md', 'PLAN.md', 'FRONTEND_REVIEW.md'):
+            shutil.copyfile(ROOT / document, staging / document)
         shutil.copytree(ROOT / 'packaging/licenses', staging / 'LICENSES')
         if (ROOT / 'LICENSE').exists():
             shutil.copyfile(ROOT / 'LICENSE', staging / 'LICENSE')
