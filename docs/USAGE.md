@@ -117,6 +117,8 @@ scoop update teleaf
 
 系统剪贴板在 macOS 按需调用系统 JXA / AppKit 辅助进程，在 Windows、Linux X11 / 支持 data-control 的 Wayland 桌面通过 [arboard](https://github.com/1Password/arboard) 读取图片、文件列表和文字。macOS 主进程不加载 AppKit，辅助进程读取完成后退出。读取只在点击或按键后启动一个临时线程，不监听剪贴板；文件列表优先保留原文件，截图暂存为无损 PNG，再使用原附件确认流程。Ghostty 的 `Cmd+V`、Windows Terminal 的 `Ctrl+V` 可能由终端拦截并只粘贴文字；复制截图后使用 **F7** 最可靠。文字和路径的终端普通粘贴继续有效。
 
+Windows Terminal 的默认文字粘贴可用 `Ctrl+V` 或 `Ctrl+Shift+V`；具体以终端键绑定为准。图片不会通过终端的文字粘贴送到程序，应按 **F7** 或点击附件页的“粘贴”。原生 Windows 从 v0.1.5 起补齐 `CF_DIB` 位图读取，兼容只提供这种格式的截图工具，也能在 PNG 数据损坏时尝试有效位图。读取失败会显示位图错误；该回退在解码前检查 64 MiB 数据及 1600 万像素上限，取消附件会删除暂存 PNG。
+
 截图尺寸上限 1600 万像素，像素只在读取和 PNG 编码期间驻留，完成后释放；此上限在系统剪贴板解码后检查，因此系统读取的瞬时内存可能更高。临时文件在取消时删除，已提交的文件保留到 TDLib 关闭后清理，避免异步上传提前丢失源文件；本次运行暂存磁盘总量上限 256 MiB。正常退出会清理已暂存的文件；读取未完成或强制终止可能留下系统临时文件。读取失败时提示改用文件路径。
 
 拖拽是否发送路径由终端决定。SSH 不读取远端或本机图片剪贴板；本机文件须先传到远端，再使用远端路径。WSL 的剪贴板入口读取 Linux 图形会话剪贴板，不承诺读取 Windows 位图；文件路径粘贴支持把 `C:\Users\…` 转换为默认的 `/mnt/c/…`，自定义挂载时直接填写实际 Linux 路径。
@@ -133,4 +135,3 @@ scoop update teleaf
 - 选中贴纸后点击 **☆收藏 / ★取消收藏**，或按 `f`；收藏结果从服务器刷新。`Esc` 或点击面板外关闭。
 
 最近、收藏和已安装列表通过 [TDLib](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_installed_sticker_sets.html) 读取，搜索使用 [searchStickers](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1search_stickers.html)。贴纸包只在打开时取内容，最多缓存 4 个包，每包 256 项；最近、收藏各最多 256 项，搜索最多 64 项。仅下载当前网格可见的预览，最多 4 个并发；面板遮住的聊天图片暂停准备。动态贴纸仍显示静态缩略图；终端不支持原生图片时使用字符预览或 emoji 占位。
-

@@ -21,7 +21,7 @@ Telegram 官网注册错误仍需在官网解决；已有应用无需再次创�
 
 1. 使用 `YoisakiKnd/teleaf` 仓库，将当前源码连同 `.github/`、`packaging/` 和 `scripts/` 推送到默认分支。`target/`、本地账号数据和 `.env` 不提交。
 2. 在 Actions 页面手动运行 **Release packages**，先检查五个平台能否构建和加载 TDLib。手动运行只生成 Actions artifacts，不发布 Release 或修改包清单。
-3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.4`。标签必须与 Cargo 版本完全一致。
+3. 确认 `Cargo.toml` 的版本后，推送对应标签，例如 `v0.1.5`。标签必须与 Cargo 版本完全一致。
 4. 标签触发构建、运行库打包和加载检查；全部成功后创建 GitHub Release，发布各平台压缩包、SHA-256、Homebrew 配方和 Scoop 清单。
 5. 发布任务将生成的 `Formula/teleaf.rb` 提交到主仓库默认分支；主仓库仍充当显式 URL 的 Homebrew tap。独立的 [scoop-bucket](https://github.com/YoisakiKnd/scoop-bucket) 仓库每小时读取主仓库的最新稳定 Release，核对 Windows 安装包 URL、`SHA256SUMS` 和 GitHub 资产哈希，再将 Release 附带的 `teleaf.json` 提交为 `bucket/teleaf.json`。Scoop 用户无需克隆主项目源码。
 
@@ -125,7 +125,7 @@ TDLib 上游发布包固定为 tdlib-rs `v1.4.0` 中的 TDLib `1.8.61`，平台�
 
 ```sh
 cargo build --release --locked
-python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.4
+python3 scripts/package-release.py --binary target/release/teleaf --version 0.1.5
 python3 scripts/test-packaging.py
 ```
 
@@ -136,7 +136,7 @@ Windows 的 binary 参数为 `target/release/teleaf.exe`，打包机需要 Visua
 五个平台的产物齐全后，可以独立生成包清单：
 
 ```sh
-python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.4 --assets target/dist --output target/packages
+python3 scripts/generate-packages.py --repository YoisakiKnd/teleaf --version 0.1.5 --assets target/dist --output target/packages
 ```
 
 输出真实配方、Scoop 清单和 SHA256SUMS。该命令拒绝缺失的平台产物和不合法的仓库/版本输入；生成器只写本地文件，不创建远程仓库或发布内容。

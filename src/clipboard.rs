@@ -9,6 +9,11 @@ use std::sync::{
 
 use crate::InputMode;
 
+#[cfg(any(windows, test))]
+mod dib;
+#[cfg(windows)]
+mod windows;
+
 pub enum Content {
     Files(Vec<PathBuf>),
     Image(TemporaryImage),
@@ -113,6 +118,18 @@ fn read_local() -> Result<Content, String> {
     }
     if let Ok(image) = clipboard.get_image() {
         return stage_image(image.width, image.height, &image.bytes).map(Content::Image);
+    }
+    // arboard reads PNG / CF_DIBV5 on Windows. Some screenshot tools only
+    // provide CF_DIB, or an invalid PNG alongside a valid bitmap.
+    #[cfg(windows)]
+    if let Some(image) = windows::read_dib()? {
+        return stage_pixels(
+            image.width() as usize,
+            image.height() as usize,
+            image.as_bytes(),
+            image.color(),
+        )
+        .map(Content::Image);
     }
     let text = clipboard
         .get_text()
@@ -230,22 +247,30 @@ fn read_macos(script: &str, arguments: &[&std::path::Path]) -> Result<Content, S
 
 #[cfg(any(test, not(target_os = "macos")))]
 fn stage_image(width: usize, height: usize, pixels_rgba: &[u8]) -> Result<TemporaryImage, String> {
-    let pixels = width.checked_mul(height).ok_or("剪贴板图片尺寸过大")?;
-    if pixels == 0 || pixels > 16_000_000 || width > 32768 || height > 32768 {
+    stage_pixels(width, height, pixels_rgba, image::ColorType::Rgba8)
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn stage_pixels(
+    width: usize,
+    height: usize,
+    pixels: &[u8],
+    color: image::ColorType,
+) -> Result<TemporaryImage, String> {
+    if !matches!(color, image::ColorType::Rgb8 | image::ColorType::Rgba8) {
+        return Err("不支持的剪贴板像素格式".into());
+    }
+    let count = width.checked_mul(height).ok_or("剪贴板图片尺寸过大")?;
+    if count == 0 || count > 16_000_000 || width > 32768 || height > 32768 {
         return Err("剪贴板图片超过 1600 万像素；请保存为文件后以原文件发送".into());
     }
-    if pixels_rgba.len() != pixels * 4 {
+    if pixels.len() != count * usize::from(color.channel_count()) {
         return Err("剪贴板图片像素数据不完整".into());
     }
     let (mut staged, file) = temporary_file()?;
     use image::ImageEncoder;
     image::codecs::png::PngEncoder::new(file)
-        .write_image(
-            pixels_rgba,
-            width as u32,
-            height as u32,
-            image::ExtendedColorType::Rgba8,
-        )
+        .write_image(pixels, width as u32, height as u32, color.into())
         .map_err(|e| format!("无法编码剪贴板图片：{e}"))?;
     staged.bytes = fs::metadata(&staged.path).map_err(|e| e.to_string())?.len();
     Ok(staged)

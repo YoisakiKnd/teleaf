@@ -1477,7 +1477,7 @@ fn run(demo: bool) -> io::Result<()> {
                                 },
                             });
                         } else if key.code == KeyCode::F(7)
-                            || (key.code == KeyCode::Char('v')
+                            || (matches!(key.code, KeyCode::Char('v' | 'V'))
                                 && key.modifiers.contains(KeyModifiers::CONTROL))
                         {
                             start_clipboard_paste(&mut app);

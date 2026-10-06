@@ -83,7 +83,7 @@ teleaf --demo
 
 打开附件浏览器，或直接把文件拖入终端、粘贴本地路径。复制了截图或文件后，用 **F7** 读取剪贴板并进入附件确认页。
 
-确认页可多选文件、添加说明，按 **F5** 切换图片 / 原文件，按 **F8** 发送，`Esc` 取消。Ghostty 的 `Cmd+V`、Windows Terminal 的 `Ctrl+V` 可能只粘贴文字；截图使用 F7。SSH 和 WSL 的剪贴板限制见 [配置说明](docs/CONFIGURATION.md#多平台与终端适配)。
+确认页可多选文件、添加说明，按 **F5** 切换图片 / 原文件，按 **F8** 发送，`Esc` 取消。Ghostty 的 `Cmd+V`、Windows Terminal 的 `Ctrl+V` / `Ctrl+Shift+V` 是终端文字粘贴；截图使用 **F7**。Windows 截图兼容 PNG、CF_DIBV5 和 CF_DIB 位图。SSH 和 WSL 的剪贴板限制见 [配置说明](docs/CONFIGURATION.md#多平台与终端适配)。
 
 ### 图片显示
 
