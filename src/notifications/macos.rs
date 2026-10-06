@@ -93,7 +93,7 @@ pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), Stri
     while let Ok(first) = receiver.recv_timeout(Duration::from_secs(30)) {
         let mut batch = vec![first];
         // Coalesce queued updates to the same group before launching one short-lived helper.
-        while batch.len() < 16 {
+        for _ in 1..16 {
             let Ok(next) = receiver.try_recv() else {
                 break;
             };
