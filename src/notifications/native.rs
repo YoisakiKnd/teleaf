@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{
-    NotificationSetting, ToastNotification, ToastNotificationManager,
+    NotificationSetting, ToastNotification, ToastNotificationManager, ToastNotifier,
 };
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::System::Com::StructuredStorage::{
@@ -141,9 +141,8 @@ fn identity_key(app_id: &str) -> String {
 }
 
 fn register_identity(app_id: &str) -> Result<(), String> {
-    // Register synchronously before querying Setting(). Start-menu indexing is
-    // asynchronous and a shortcut alone may not yet resolve on a fresh install.
-    // This is per-user metadata, as used by Microsoft's notification toolkit.
+    // Per-user display/activation metadata, as used by Microsoft's toolkit;
+    // this is separate from the notification database's first-send registration.
     let key = identity_key(app_id);
     registry_string(&key, "DisplayName", "Teleaf Notifications")?;
     registry_string(&key, "CustomActivator", &format!("{{{STUB_CLSID:?}}}"))
@@ -196,17 +195,10 @@ pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), Stri
     let account = HSTRING::from(account);
     let notifier = ToastNotificationManager::CreateToastNotifierWithId(&app_id)
         .map_err(|e| format!("创建 Windows 通知发送器失败（{APP_ID}）：{e}"))?;
-    let setting = notifier
-        .Setting()
-        .map_err(|e| format!("读取 Windows 通知设置失败（{APP_ID}）：{e}"))?;
-    if setting != NotificationSetting::Enabled {
-        return Err(format!(
-            "Windows 禁止 Teleaf Notifications 显示通知（{}）；请检查系统通知设置或组策略",
-            setting_name(setting)
-        ));
-    }
+    let mut pending_setting = !check_known_setting(&notifier)?;
     // An idle worker exits; the next notification creates one again, with no timer in the UI.
     while let Ok(command) = receiver.recv_timeout(Duration::from_secs(30)) {
+        let showing = matches!(&command, Command::Show { .. });
         let (stage, result) = match command {
             Command::Show {
                 group,
@@ -243,8 +235,38 @@ pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), Stri
             ),
         };
         result.map_err(|e| format!("{stage}失败：{e}"))?;
+        if showing && pending_setting {
+            // Check actual policy once the first real notification has created
+            // the settings row. No dummy toast or periodic polling is required.
+            pending_setting = !check_known_setting(&notifier)?;
+        }
     }
     Ok(())
+}
+
+fn known_setting(notifier: &ToastNotifier) -> windows::core::Result<Option<NotificationSetting>> {
+    match notifier.Setting() {
+        Ok(setting) => Ok(Some(setting)),
+        // A plain Win32 app's settings entry may not exist until its first Show.
+        // Never make that lookup a prerequisite for the first real notification.
+        // Windows still enforces application, user and policy blocks in Show.
+        Err(error) if error.code().0 as u32 == 0x80070490 => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn check_known_setting(notifier: &ToastNotifier) -> Result<bool, String> {
+    let setting = known_setting(notifier)
+        .map_err(|e| format!("读取 Windows 通知设置失败（{APP_ID}）：{e}"))?;
+    if let Some(setting) = setting
+        && setting != NotificationSetting::Enabled
+    {
+        return Err(format!(
+            "Windows 禁止 Teleaf Notifications 显示通知（{}）；请检查系统通知设置或组策略",
+            setting_name(setting)
+        ));
+    }
+    Ok(setting.is_some())
 }
 
 fn setting_name(setting: NotificationSetting) -> &'static str {
@@ -272,7 +294,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fresh_notification_identity_resolves_before_any_toast_or_start_menu_indexing() {
+    fn fresh_notification_identity_sends_before_reading_initial_settings() {
         use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegDeleteTreeW, RegGetValueW};
         let _apartment = Apartment::new().unwrap();
         let mut nonce = [0u8; 16];
@@ -317,19 +339,15 @@ mod tests {
         };
         assert_eq!(read("DisplayName"), "Teleaf Notifications");
         assert_eq!(read("CustomActivator"), format!("{{{STUB_CLSID:?}}}"));
-        // No toast is shown, no real app registration or account is touched.
-        // Enabled/disabled are both valid; lookup itself must not throw 0x80070490.
+        // No real app registration or account is touched. In particular, an
+        // uninitialized Setting must not block the first real Show operation.
         let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(&app_id))
             .expect("fresh registered AUMID must create a notifier");
-        let setting = notifier
-            .Setting()
-            .expect("fresh registered AUMID must resolve its settings");
-        println!(
-            "Windows fresh notification identity: {}",
-            setting_name(setting)
-        );
+        let setting =
+            known_setting(&notifier).expect("first-use lookup handles a missing settings row");
+        println!("Windows registered identity before first toast: {setting:?}");
         if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
-            && setting == NotificationSetting::Enabled
+            && (setting.is_none() || setting == Some(NotificationSetting::Enabled))
         {
             // Exercise Show on disposable CI desktops without a popup. Normal
             // local unit tests never request a notification or alter real app IDs.
@@ -350,6 +368,22 @@ mod tests {
             notifier
                 .Show(&toast)
                 .expect("fresh registered AUMID must accept a toast");
+            let setting = notifier
+                .Setting()
+                .expect("settings resolve after the first real Show");
+            println!(
+                "Windows notification setting after Show: {}",
+                setting_name(setting)
+            );
+            if setting == NotificationSetting::Enabled {
+                assert!(check_known_setting(&notifier).unwrap());
+            } else {
+                assert!(
+                    check_known_setting(&notifier)
+                        .unwrap_err()
+                        .contains(setting_name(setting))
+                );
+            }
             missing_history_is_ok(
                 ToastNotificationManager::History()
                     .unwrap()

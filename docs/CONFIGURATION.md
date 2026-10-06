@@ -78,4 +78,4 @@ Linux / WSL 使用 `libtdjson.so`，macOS 使用 `libtdjson.dylib`；`TDLIB_PATH
 
 先运行 `teleaf --test-notification` 检查系统提醒，无需登录；测试为静音，macOS 首次可能显示授权框。再保持 Teleaf 登录，用另一个账号向未静音会话发消息，检查弹窗与通知中心；读完消息后检查提醒撤回，再检查静音、设置关闭与连续群消息。测试覆盖 TDLib 过滤、Windows XML/快捷方式标识、macOS 助手内容和 Linux 私有 D-Bus 协议。实际横幅、声音和勿扰模式需对应桌面验证。
 
-Windows 从 v0.1.6 起会在当前用户注册自己的 `AppUserModelId` 元数据和通知快捷方式，然后查询系统设置；不需要管理员权限。遇到 `0x80070490`（找不到元素）时，先确认 `teleaf --version` 并升级，重新运行通知测试。新版本的错误会注明发生在注册、创建发送器、读取设置或发送阶段；系统关闭通知时也会区分应用、当前用户或组策略。若仍失败，反馈完整错误和 Windows 版本即可。注册方式参考 [Microsoft 通知工具包](https://github.com/CommunityToolkit/WindowsCommunityToolkit/blob/main/Microsoft.Toolkit.Uwp.Notifications/Toasts/Compat/ToastNotificationManagerCompat.cs)。
+Windows 从 v0.1.6 起会在当前用户注册自己的 `AppUserModelId` 元数据和通知快捷方式；不需要管理员权限。首次发送之前，Windows 可能还没有该应用的通知设置项，查询会返回 `0x80070490`（找不到元素）；此时继续提交第一条实际通知，由系统按权限决定显示，不生成额外的占位通知。遇到旧版本的这个错误时，先确认 `teleaf --version` 并升级，重新运行通知测试。其他错误会注明发生在注册、创建发送器、读取设置或发送阶段；系统关闭通知时也会区分应用、当前用户或组策略。若仍失败，反馈完整错误和 Windows 版本即可。首次查询行为参考 [Microsoft 通知工具包](https://github.com/CommunityToolkit/WindowsCommunityToolkit/blob/main/Microsoft.Toolkit.Uwp.Notifications/Toasts/Compat/ToastNotifierCompat.cs)。
