@@ -2962,7 +2962,9 @@ pub(crate) mod tests {
         assert!(output(&terminal).contains("[贴纸]"));
         let rows = app.timeline_rows.clone();
         let size = Size::new(47, 8);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // Shared Intel CI runs image-heavy tests concurrently; wait for completion
+        // under a total deadline rather than imposing a two-second speed requirement.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while app.media.get_inline(71, size).is_none() || app.media.get_inline(72, size).is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
