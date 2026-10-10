@@ -134,6 +134,14 @@ brew info YoisakiKnd/tap/teleaf
 
 `brew update` 根据旧 tap 的映射迁移安装来源。若旧 Homebrew 版本仍未更新来源，可执行 `brew reinstall YoisakiKnd/tap/teleaf`；账号配置位于安装目录外，会继续保留。用 `brew info` 确认新来源后，可移除不再使用的旧 tap：`brew untap YoisakiKnd/teleaf`。
 
+### 2026-10-10 Homebrew 迁移验证
+
+Homebrew 分发已迁入 [YoisakiKnd/homebrew-tap](https://github.com/YoisakiKnd/homebrew-tap)，提交 `c92db6de51ceb8661fce21d70e5b2a1d56349420`。继续使用正式版 `v0.1.6`，本次没有重新发布二进制。新 tap 的 `Formula/teleaf.rb` 与该 Release 附带配方逐字节一致；四个平台实际归档的 SHA-256 均与新获取的 GitHub 资产摘要及 `SHA256SUMS` 一致，许可证元数据为 MIT。原有 NakuruMusic 配方及其工作流保持原样。
+
+[自动同步任务 38027935284](https://github.com/YoisakiKnd/homebrew-tap/actions/runs/38027935284) 已通过：5 项同步回归测试通过，成功获取并核验最新稳定版；后续每小时检查新版本，校验完成后更新配方并触发安装验证。[安装任务 38027935226](https://github.com/YoisakiKnd/homebrew-tap/actions/runs/38027935226) 的 macOS ARM64、macOS x64、Linux ARM64、Linux x64 四项全部通过，实际执行新 tap 的 `brew install`、`brew test` 和可执行文件符号链接检查，验证程序版本及随包 TDLib 加载。
+
+主仓库迁移提交为 `638e89031ad27d42a42fcec84a3ce8b3ff4724e6`：README 和发布说明使用新入口，旧 tap 提供 `tap_migrations.json`，发布工作流继续生成 Release 配方资产，由新 tap 同步。主仓库不再保存或自动回写安装配方。7 项本地打包测试、Ruby 配方语法及两仓库差异格式检查通过。此次仅迁移 Homebrew 分发，Scoop 继续使用已验证的 `v0.1.6` 清单。
+
 ## 发布包结构
 
 ```text
