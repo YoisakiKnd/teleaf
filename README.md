@@ -19,8 +19,8 @@
 ### macOS / Linux · Homebrew
 
 ```sh
-brew tap YoisakiKnd/teleaf https://github.com/YoisakiKnd/teleaf
-brew install YoisakiKnd/teleaf/teleaf
+brew tap YoisakiKnd/tap
+brew install YoisakiKnd/tap/teleaf
 teleaf
 ```
 
@@ -110,6 +110,7 @@ teleaf --test-notification
 ## 升级与排查
 
 - Homebrew：`brew update`，然后 `brew upgrade teleaf`。
+- 旧 `YoisakiKnd/teleaf` tap 用户先执行 `brew update` 应用迁移规则；新的分发仓库为 [homebrew-tap](https://github.com/YoisakiKnd/homebrew-tap)。
 - Scoop：`scoop update`，然后 `scoop update teleaf`。
 - 检查版本和运行库：`teleaf --version`、`teleaf --check`。
 - 查看数据目录、图片协议和连接状态：按 `F4` 打开设置。
