@@ -45,6 +45,7 @@ fn begin_input(app: &mut App, mode: InputMode) {
 }
 
 pub fn finish_input(app: &mut App) {
+    app.clear_reactions();
     app.selection = None;
     app.draft.clear();
     app.draft_cursor = usize::MAX;
@@ -128,19 +129,41 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                         Err(error) => app.attachments.as_mut().unwrap().error = Some(error),
                     }
                 }
+            } else if (app.confirm_delete_many && app.confirm_delete.is_some())
+                || (app.forward_many && app.forward_message.is_some())
+            {
+                app.confirm_batch(worker);
             } else if let Some(message_id) = app.confirm_delete {
-                if let Some(chat) = app.store.active_chat
-                    && send_request(app, worker, actions::delete(chat, message_id, true))
-                {
-                    app.confirm_delete = None;
+                if let Some(chat) = app.store.active_chat {
+                    let ids = if app.confirm_delete_many && !app.multi_select.is_empty() {
+                        app.multi_select.clone()
+                    } else {
+                        vec![message_id]
+                    };
+                    if send_request(app, worker, actions::delete_many(chat, ids, true)) {
+                        app.confirm_delete = None;
+                        if app.confirm_delete_many {
+                            app.confirm_delete_many = false;
+                            app.multi_select.clear();
+                        }
+                    }
                 }
             } else if let Some(message_id) = app.forward_message {
-                if let (Some(from), Some(to)) = (app.store.active_chat, app.selected_chat)
-                    && send_request(app, worker, actions::forward(from, message_id, to))
-                {
-                    app.forward_message = None;
-                    app.selected_chat = app.store.active_chat;
-                    app.reveal_chat = true;
+                if let (Some(from), Some(to)) = (app.store.active_chat, app.selected_chat) {
+                    let ids = if app.forward_many && !app.multi_select.is_empty() {
+                        app.multi_select.clone()
+                    } else {
+                        vec![message_id]
+                    };
+                    if send_request(app, worker, actions::forward_many(from, ids, to)) {
+                        app.forward_message = None;
+                        if app.forward_many {
+                            app.forward_many = false;
+                            app.multi_select.clear();
+                        }
+                        app.selected_chat = app.store.active_chat;
+                        app.reveal_chat = true;
+                    }
                 }
             } else if app.sticker_picker {
                 if let Some(sticker) = app.sticker_items().get(app.sticker_cursor)
@@ -205,6 +228,7 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
             app.focus_messages = false;
         }
         Action::Bottom => {
+            app.return_to_latest(worker);
             app.quote_back = None;
             app.timeline_anchor = None;
             app.timeline_top = app.timeline_max;
@@ -219,12 +243,142 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
         Action::Folders => {
             app.close_overlays();
             app.show_folders = true;
-            app.folder_offset = app
+            app.folder_cursor = app
                 .store
                 .chat_lists()
                 .iter()
                 .position(|(list, _)| *list == app.store.selected_list)
                 .unwrap_or(0);
+            app.modal_scroll = 0;
+        }
+        Action::CycleTheme => {
+            if crate::theme::cycle() {
+                app.notice = Some(format!(
+                    "界面配色已切换为：{}",
+                    crate::theme::palette().name
+                ));
+                app.notice_error = false;
+            } else {
+                app.notice = Some("当前终端不支持切换配色（NO_COLOR 或基础色模式）".into());
+                app.notice_error = true;
+            }
+        }
+        Action::QuickSwitch => {
+            if app.quick_switcher.is_some() {
+                app.quick_switcher = None;
+            } else {
+                app.close_overlays();
+                app.reset_quick_search();
+                app.quick_switcher = Some(crate::QuickSwitcher::default());
+            }
+        }
+        Action::ChatInfo => {
+            if app.store.active_chat.is_none() {
+                app.notice = Some("请先打开一个会话".into());
+            } else {
+                let next = !app.show_chat_info;
+                if next && app.chat_info_modal {
+                    app.close_overlays();
+                }
+                app.show_chat_info = next;
+                app.modal_scroll = 0;
+                if next {
+                    app.request_chat_info(worker);
+                }
+            }
+        }
+        Action::ToggleMute => app.toggle_chat_setting(worker, false),
+        Action::TogglePin => app.toggle_chat_setting(worker, true),
+        Action::DismissPinBanner => {
+            app.collapsed_pin_chat = app.store.active_chat;
+        }
+        Action::QuickReact(index) => return app.pick_reaction(worker, index),
+        Action::CycleMediaFilter => app.parity.filter = app.parity.filter.next(),
+        Action::CleanStorage => {
+            if app.show_settings && app.auth.state == "authorizationStateReady" {
+                app.parity.storage_confirmation = true;
+            }
+        }
+        Action::ConfirmStorage => app.confirm_storage_cleanup(worker),
+        Action::CancelStorage => app.parity.storage_confirmation = false,
+        Action::ToggleMultiSelect => {
+            if !app.multi_select.is_empty() {
+                app.multi_select.clear();
+            } else if let Some(id) = app.selected_message {
+                app.selection = None;
+                app.composer_focus = false;
+                app.input_mode = InputMode::Off;
+                app.multi_select.push(id);
+                app.notice = Some("多选模式：Space/点击勾选 · Esc 取消".into());
+            } else {
+                app.notice = Some("请先选择一条消息".into());
+            }
+        }
+        Action::MultiClear => {
+            app.multi_select.clear();
+        }
+        Action::MultiCopy => {
+            if !app.multi_select.is_empty() {
+                let mut combined = String::new();
+                for msg in app.active_messages() {
+                    if app.multi_select.contains(&msg.id) && !msg.text.is_empty() {
+                        if !combined.is_empty() {
+                            combined.push('\n');
+                        }
+                        combined.push_str(&msg.text);
+                    }
+                }
+                if combined.is_empty() {
+                    app.notice = Some("所选消息没有可复制的文字".into());
+                } else {
+                    let count = app.multi_select.len();
+                    app.notice = Some(match copy(&combined) {
+                        Ok(()) => format!("已复制 {count} 条消息文字"),
+                        Err(e) => format!("复制失败：{e}；可按 F6 使用终端选字"),
+                    });
+                    app.multi_select.clear();
+                }
+            }
+        }
+        Action::MultiForward => {
+            if let Some(&first) = app.multi_select.first() {
+                app.drag = None;
+                app.mouse_press = None;
+                app.forward_many = true;
+                app.forward_message = Some(first);
+                app.reveal_chat = true;
+                app.start_batch(worker, true);
+            }
+        }
+        Action::MultiDelete => {
+            if let Some(&first) = app.multi_select.first() {
+                app.drag = None;
+                app.mouse_press = None;
+                app.confirm_delete_many = true;
+                app.confirm_delete = Some(first);
+                app.start_batch(worker, false);
+            }
+        }
+        Action::OpenMessageLink => {
+            if let Some(url) = app
+                .selected_message()
+                .and_then(crate::store::Message::first_link)
+            {
+                match crate::open_url(&url) {
+                    Ok(()) => app.notice = Some(format!("已打开链接：{url}")),
+                    Err(error) => {
+                        app.notice = Some(error);
+                        app.notice_error = true;
+                    }
+                }
+            } else {
+                app.notice = Some("当前消息没有可打开的链接".into());
+            }
+        }
+        Action::JumpToMessage => {
+            if let Some(target) = app.selected_message {
+                app.jump_to(worker, target);
+            }
         }
         Action::ClearSearch => {
             app.show_search = false;
@@ -295,11 +449,26 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
         }
         Action::OpenExternal => app.open_selected_external(),
         Action::Preview => {
-            if let Some(request) = app.preview_selected() {
+            if let Some((id, active)) = app.selected_message().and_then(|msg| {
+                let media = msg.media.as_ref()?;
+                (media.kind.is_large_file() && media.path.is_none()).then(|| {
+                    (
+                        media.file_id,
+                        app.large_file_pending(media.file_id)
+                            || msg
+                                .info
+                                .media_meta
+                                .as_ref()
+                                .is_some_and(|meta| meta.downloading),
+                    )
+                })
+            }) {
+                app.control_large_file(worker, id, active);
+            } else if let Some(request) = app.preview_selected() {
                 let id = request["file_id"].as_i64().unwrap_or(0) as i32;
                 if !send_request(app, worker, request) {
                     app.requested_files.remove(&id);
-                    app.failed_files.insert(id);
+                    app.mark_file_failed(id);
                 }
             }
         }
@@ -337,14 +506,26 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                 }
                 Action::QuoteBack => {
                     if let Some(position) = app.quote_back.take() {
-                        app.timeline_anchor = position.anchor;
-                        app.selected_message = position.selected;
-                        app.reveal_message = false;
+                        if let Some(id) = position.selected
+                            && !app.store.messages.iter().any(|message| message.id == id)
+                        {
+                            if position.anchor.is_none() {
+                                app.return_to_latest(worker);
+                                app.timeline_anchor = None;
+                            } else {
+                                app.jump_to(worker, id);
+                            }
+                        } else {
+                            app.timeline_anchor = position.anchor;
+                            app.selected_message = position.selected;
+                            app.reveal_message = false;
+                        }
                     }
                 }
                 Action::React => {
                     if let Some(id) = app.selected_message {
                         begin_input(app, InputMode::React(id));
+                        app.request_reactions(worker, id);
                     }
                 }
                 Action::Edit => {
@@ -396,7 +577,12 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                         });
                     }
                 }
-                Action::Search => begin_input(app, InputMode::Search),
+                Action::Search => {
+                    if app.chat_info_modal {
+                        app.show_chat_info = false;
+                    }
+                    begin_input(app, InputMode::Search);
+                }
                 Action::Photo => open_attachments(app, true),
                 Action::File => open_attachments(app, false),
                 Action::Stickers => {
@@ -595,6 +781,39 @@ pub fn pan_key(app: &mut App, key: KeyCode) -> bool {
     }
     before != app.preview_view
 }
+fn scroll_modal(app: &mut App, top: usize) -> bool {
+    if let Some(sw) = &mut app.quick_switcher {
+        let count = app.store.quick_switch_entries(&sw.query).len();
+        let next = top.min(count.saturating_sub(1));
+        let changed = sw.selected != next;
+        sw.selected = next;
+        changed
+    } else if app.show_help || app.show_settings || app.show_folders || app.show_chat_info {
+        let next = top.min(usize::from(u16::MAX)) as u16;
+        let changed = app.modal_scroll != next;
+        app.modal_scroll = next;
+        changed
+    } else if let Some(picker) = &mut app.attachments {
+        let max = picker.entries.len().saturating_sub(picker.visible);
+        let next = top.min(max);
+        let changed = picker.offset != next;
+        picker.offset = next;
+        picker.cursor = picker.cursor.max(picker.offset).min(
+            (picker.offset + picker.visible.saturating_sub(1))
+                .min(picker.entries.len().saturating_sub(1)),
+        );
+        changed
+    } else if app.action_menu.is_some() {
+        let max = crate::menu::items(app).count().saturating_sub(1);
+        let next = Some(top.min(max));
+        let changed = app.action_menu != next;
+        app.action_menu = next;
+        changed
+    } else {
+        false
+    }
+}
+
 fn move_drag(app: &mut App, mouse: MouseEvent) -> bool {
     let Some(drag) = app.drag else {
         app.mouse_press = None;
@@ -636,6 +855,8 @@ fn move_drag(app: &mut App, mouse: MouseEvent) -> bool {
             });
             if pane == Pane::Timeline {
                 ui::set_timeline_top(app, top)
+            } else if pane == Pane::Modal {
+                scroll_modal(app, top)
             } else {
                 let changed = app.chat_offset != top;
                 app.chat_offset = top;
@@ -682,7 +903,7 @@ fn click_action(app: &mut App, worker: &TdWorker, target: Target, mouse: MouseEv
             && time.elapsed() <= std::time::Duration::from_millis(350)
     });
     app.last_click = Some((target, mouse.column, mouse.row, std::time::Instant::now()));
-    if double {
+    if double && app.multi_select.is_empty() && !app.show_search {
         app.last_click = None;
         if let Some(point) = point(target) {
             activate(app, worker, target);
@@ -713,7 +934,11 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
     }
     match mouse.kind {
         MouseEventKind::Moved => return false,
-        MouseEventKind::Drag(MouseButton::Left) => return move_drag(app, mouse),
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let top = app.timeline_top;
+            let changed = move_drag(app, mouse);
+            return changed | (app.timeline_top > top && app.load_newer_near_bottom(worker));
+        }
         MouseEventKind::Drag(_) => return false,
         _ => {}
     }
@@ -859,6 +1084,7 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                 Some(
                     Target::AttachmentEntry(_)
                     | Target::Cursor(Editor::AttachmentPath | Editor::AttachmentCaption, _)
+                    | Target::Scroll(Pane::Modal, _)
                     | Target::Panel(Pane::Modal)
                     | Target::Modal,
                 ) if app.attachments.is_some() => {
@@ -882,9 +1108,12 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                         .min(app.store.chat_lists().len().saturating_sub(1));
                     before != app.folder_offset
                 }
-                Some(Target::Folder(_) | Target::Panel(Pane::Modal) | Target::Modal)
-                    if app.show_folders =>
-                {
+                Some(
+                    Target::Folder(_)
+                    | Target::Scroll(Pane::Modal, _)
+                    | Target::Panel(Pane::Modal)
+                    | Target::Modal,
+                ) if app.show_folders => {
                     let before = app.modal_scroll;
                     app.modal_scroll = before
                         .saturating_add_signed(delta as i16)
@@ -904,6 +1133,9 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                         ..
                     })
                     | Target::Scroll(Pane::Timeline, _)
+                    | Target::ReferencedMessage(_)
+                    | Target::Quote(_, _)
+                    | Target::Reaction(_, _)
                     | Target::Command(Action::Bottom),
                 ) => {
                     let changed = ui::scroll_timeline(app, delta);
@@ -915,7 +1147,7 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                     {
                         perform(app, worker, Action::History);
                     }
-                    changed
+                    changed | (delta > 0 && app.load_newer_near_bottom(worker))
                 }
                 Some(
                     Target::Panel(Pane::Chats) | Target::Chat(_) | Target::Scroll(Pane::Chats, _),
@@ -929,9 +1161,12 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                     );
                     before != app.chat_offset
                 }
-                Some(Target::Action(_) | Target::Panel(Pane::Modal) | Target::Modal)
-                    if app.action_menu.is_some() =>
-                {
+                Some(
+                    Target::Action(_)
+                    | Target::Scroll(Pane::Modal, _)
+                    | Target::Panel(Pane::Modal)
+                    | Target::Modal,
+                ) if app.action_menu.is_some() => {
                     let before = app.action_menu;
                     app.action_menu = before.map(|i| {
                         i.saturating_add_signed(direction)
@@ -964,9 +1199,25 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                     }
                     before != app.sticker_panel.top
                 }
-                Some(Target::Panel(Pane::Modal) | Target::Modal)
-                    if app.show_help || app.show_settings =>
-                {
+                Some(
+                    Target::QuickSwitchChat(_)
+                    | Target::GlobalSearchHit(_, _)
+                    | Target::Cursor(Editor::QuickSwitch, _)
+                    | Target::Scroll(Pane::Modal, _)
+                    | Target::Panel(Pane::Modal)
+                    | Target::Modal,
+                ) if app.quick_switcher.is_some() => {
+                    let count = app.quick_entries().len();
+                    let sw = app.quick_switcher.as_mut().unwrap();
+                    let before = sw.selected;
+                    sw.selected = before
+                        .saturating_add_signed(direction)
+                        .min(count.saturating_sub(1));
+                    before != sw.selected
+                }
+                Some(
+                    Target::Scroll(Pane::Modal, _) | Target::Panel(Pane::Modal) | Target::Modal,
+                ) if app.show_help || app.show_settings || app.show_chat_info => {
                     let before = app.modal_scroll;
                     app.modal_scroll = before.saturating_add_signed(delta as i16);
                     before != app.modal_scroll
@@ -1012,6 +1263,15 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                 .min(app.store.chat_lists().len().saturating_sub(1));
             before != app.folder_offset
         }
+        Target::Media(id)
+        | Target::MessageAction(id, Action::Preview)
+        | Target::Reaction(id, _)
+        | Target::Quote(id, _)
+            if !app.multi_select.is_empty() =>
+        {
+            activate(app, worker, Target::Message(id))
+        }
+        Target::Media(id) if app.show_search => app.jump_to(worker, id),
         Target::Media(id) | Target::MessageAction(id, Action::Preview) => {
             activate(app, worker, Target::Message(id));
             perform(app, worker, Action::Preview);
@@ -1043,26 +1303,110 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
             }
             changed
         }
-        Target::ReferencedMessage(id) => {
-            if !app.store.messages.iter().any(|message| message.id == id) {
-                return false;
-            }
+        Target::ReferencedMessage(id) if !app.multi_select.is_empty() => {
+            let mut owners = app
+                .active_messages()
+                .iter()
+                .filter(|message| {
+                    message.info.reply.as_ref().is_some_and(|reply| {
+                        Some(reply.chat_id) == app.store.active_chat && reply.message_id == id
+                    })
+                })
+                .map(|message| message.id);
+            let owner = owners.next().filter(|_| owners.next().is_none());
+            owner.is_some_and(|id| activate(app, worker, Target::Message(id)))
+        }
+        Target::Quote(_, id) | Target::ReferencedMessage(id) => {
             app.quote_back.get_or_insert(crate::ReadingPosition {
                 anchor: app.timeline_anchor,
                 selected: app.selected_message,
             });
-            activate(app, worker, Target::Message(id));
-            app.reveal_message = true;
-            app.selection = None;
-            true
+            app.jump_to(worker, id)
         }
         Target::Message(id) => {
+            if !app.multi_select.is_empty() {
+                app.selected_message = Some(id);
+                app.focus_messages = true;
+                app.toggle_multi_select_message(id);
+                return true;
+            }
+            if app.show_search {
+                return app.jump_to(worker, id);
+            }
             let changed =
                 app.selected_message != Some(id) || !app.focus_messages || app.composer_focus;
             app.selected_message = Some(id);
             app.focus_messages = true;
             app.composer_focus = false;
             changed
+        }
+        Target::GlobalSearchHit(chat, message) => app.open_global_hit(worker, chat, message),
+        Target::QuickSwitchChat(id) => {
+            app.quick_switcher = None;
+            app.selected_chat = Some(id);
+            for request in app.open_selected() {
+                send_request(app, worker, request);
+            }
+            true
+        }
+        Target::Cursor(Editor::QuickSwitch, position) => {
+            if let Some(sw) = &mut app.quick_switcher {
+                let next = text::cursor(&sw.query, position);
+                let changed = sw.cursor != next;
+                sw.cursor = next;
+                changed
+            } else {
+                false
+            }
+        }
+        Target::PinnedBanner(id) => {
+            app.multi_select.is_empty() && activate(app, worker, Target::ReferencedMessage(id))
+        }
+        Target::Reaction(message_id, index) => {
+            let info = app
+                .active_messages()
+                .iter()
+                .find(|m| m.id == message_id)
+                .and_then(|m| m.info.reactions.get(index))
+                .map(|r| (r.emoji.clone(), r.custom_emoji_id, r.chosen));
+            if let (Some(chat_id), Some((emoji, custom_id, chosen))) = (app.store.active_chat, info)
+            {
+                let mut request = if chosen {
+                    actions::remove_reaction(chat_id, message_id, emoji.clone())
+                } else {
+                    actions::react(chat_id, message_id, emoji.clone())
+                };
+                if let Some(id) = custom_id {
+                    request["reaction_type"] = serde_json::json!({
+                        "@type": "reactionTypeCustomEmoji",
+                        "custom_emoji_id": id.to_string()
+                    });
+                }
+                if send_request(app, worker, request) && app.demo {
+                    for message in app
+                        .store
+                        .messages
+                        .iter_mut()
+                        .chain(&mut app.store.search_results)
+                        .filter(|m| m.id == message_id)
+                    {
+                        if let Some(r) = message.info.reactions.get_mut(index) {
+                            if r.chosen {
+                                r.chosen = false;
+                                r.count = r.count.saturating_sub(1);
+                            } else {
+                                r.chosen = true;
+                                r.count = r.count.saturating_add(1);
+                            }
+                        }
+                        message.info.reactions.retain(|r| r.count > 0);
+                    }
+                    app.timeline_heights.remove(&message_id);
+                }
+                true
+            } else {
+                false
+            }
         }
         Target::Composer => {
             if app.sticker_picker {
@@ -1138,7 +1482,11 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
             true
         }
         Target::Command(action) => perform(app, worker, action),
-        Target::Scroll(Pane::Timeline, top) => ui::set_timeline_top(app, top),
+        Target::Scroll(Pane::Timeline, top) => {
+            let forward = top > app.timeline_top;
+            ui::set_timeline_top(app, top) | (forward && app.load_newer_near_bottom(worker))
+        }
+        Target::Scroll(Pane::Modal, top) => scroll_modal(app, top),
         Target::Scroll(Pane::Chats, top) => {
             let changed = top != app.chat_offset;
             app.chat_offset = top;
@@ -1148,6 +1496,8 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
             if app.action_menu.is_some()
                 || app.show_help
                 || app.show_settings
+                || app.quick_switcher.is_some()
+                || (app.show_chat_info && app.chat_info_modal)
                 || app.preview_message.is_some()
                 || app.show_folders
                 || app.sticker_picker
@@ -1305,7 +1655,8 @@ mod tests {
         assert_eq!(app.timeline_anchor, anchor);
         assert_eq!(app.timeline_top, top);
         assert_eq!(app.pending_messages, 1);
-        app.apply(TdEvent::Update(json!({"@type":"messages","@extra":"history:1","messages":[{"id":0,"chat_id":1,"content":{"@type":"messageText","text":{"text":"更早消息"}}}]})));
+        let request = app.history_request(1, 1);
+        app.apply(TdEvent::Update(json!({"@type":"messages","@extra":request["@extra"],"messages":[{"id":0,"chat_id":1,"content":{"@type":"messageText","text":{"text":"更早消息"}}}]})));
         draw(&mut app, 80, 24);
         assert_eq!(app.timeline_anchor, anchor);
         assert!(app.timeline_top > top);

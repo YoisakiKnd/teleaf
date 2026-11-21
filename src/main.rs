@@ -10,11 +10,13 @@ mod interaction;
 mod media;
 mod menu;
 mod notifications;
+mod parity;
 mod quick_message;
 mod resample;
 mod selection;
 mod stickers;
 mod store;
+mod sync;
 mod tdlib;
 mod terminal;
 mod text;
@@ -66,6 +68,17 @@ struct ReadingPosition {
     anchor: Option<(i64, usize)>,
     selected: Option<i64>,
 }
+
+#[derive(Default)]
+struct QuickSwitcher {
+    query: String,
+    global_messages: bool,
+    cursor: usize,
+    selected: usize,
+    scroll: usize,
+}
+
+const QUICK_REACTIONS: [&str; 8] = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉", "👏"];
 
 const MOUSE_CAPTURE: &str = "\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const MOUSE_RELEASE: &str = "\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
@@ -144,8 +157,11 @@ struct App {
     tdlib_connected: bool,
     connection_label: String,
     notice: Option<String>,
+    notice_error: bool,
     auth: AuthFlow,
     store: Store,
+    sync: sync::Sync,
+    parity: parity::Parity,
     media: MediaManager,
     selected_chat: Option<i64>,
     selected_message: Option<i64>,
@@ -159,6 +175,14 @@ struct App {
     notifications: notifications::State,
     show_help: bool,
     show_settings: bool,
+    show_chat_info: bool,
+    chat_info_modal: bool,
+    quick_switcher: Option<QuickSwitcher>,
+    collapsed_pin_chat: Option<i64>,
+    multi_select: Vec<i64>,
+    confirm_delete_many: bool,
+    forward_many: bool,
+    composer_width: usize,
     settings_focus: Option<ui::Action>,
     action_menu: Option<usize>,
     menu_scope: menu::Scope,
@@ -179,8 +203,10 @@ struct App {
     reveal_chat: bool,
     mouse_enabled: bool,
     folder_offset: usize,
+    folder_cursor: usize,
     show_folders: bool,
     visible_media: Vec<i32>,
+    visible_read_ids: Vec<i64>,
     selection: Option<selection::Selection>,
     drag: Option<interaction::Drag>,
     last_click: Option<(ui::Target, u16, u16, Instant)>,
@@ -192,6 +218,7 @@ struct App {
     drafts: VecDeque<(i64, SavedDraft)>,
     suspended_input: Option<(InputMode, String, usize)>,
     modal_scroll: u16,
+    modal_visible: usize,
     hit_targets: Vec<(ratatui::layout::Rect, ui::Target)>,
     search_query: String,
     show_search: bool,
@@ -219,8 +246,11 @@ impl App {
             tdlib_connected: false,
             connection_label: "连接中".into(),
             notice: None,
+            notice_error: false,
             auth,
             store: Store::default(),
+            sync: sync::Sync::default(),
+            parity: parity::Parity::default(),
             media,
             selected_chat: None,
             selected_message: None,
@@ -234,6 +264,14 @@ impl App {
             notifications: notifications::State::default(),
             show_help: false,
             show_settings: false,
+            show_chat_info: false,
+            chat_info_modal: false,
+            quick_switcher: None,
+            collapsed_pin_chat: None,
+            multi_select: Vec::new(),
+            confirm_delete_many: false,
+            forward_many: false,
+            composer_width: 40,
             action_menu: None,
             menu_scope: menu::Scope::default(),
             menu_generation: 0,
@@ -254,8 +292,10 @@ impl App {
             mouse_enabled: true,
             settings_focus: None,
             folder_offset: 0,
+            folder_cursor: 0,
             show_folders: false,
             visible_media: Vec::new(),
+            visible_read_ids: Vec::new(),
             mouse_press: None,
             selection: None,
             drag: None,
@@ -267,6 +307,7 @@ impl App {
             drafts: VecDeque::new(),
             suspended_input: None,
             modal_scroll: 0,
+            modal_visible: 1,
             hit_targets: Vec::new(),
             search_query: String::new(),
             show_search: false,
@@ -304,6 +345,12 @@ impl App {
                     return (None, changed);
                 }
                 let menu_changed = menu::invalidate(self, &value);
+                if let Some(changed) = self.receive_parity(&value) {
+                    return (None, changed || menu_changed);
+                }
+                if let Some((request, changed)) = self.receive_sync(&value) {
+                    return (request, changed || menu_changed);
+                }
                 let was_ready = self.auth.state == "authorizationStateReady";
                 self.update_count += 1;
                 self.last_update = value
@@ -328,6 +375,8 @@ impl App {
                         .into();
                     return (None, true);
                 }
+                let media_changed =
+                    self.last_update == "updateFile" && self.observe_large_file(&value["file"]);
                 if self.last_update == "updateFile" || self.last_update == "file" {
                     let file = if self.last_update == "updateFile" {
                         value.get("file")
@@ -342,6 +391,7 @@ impl App {
                         && let Some(id) = file.get("id").and_then(Value::as_i64)
                     {
                         self.requested_files.remove(&(id as i32));
+                        self.failed_files.remove(&(id as i32));
                     }
                 }
                 if self.last_update == "error" && value["@extra"].as_str() == Some("sender-name") {
@@ -355,19 +405,8 @@ impl App {
                         .and_then(|id| id.parse::<i32>().ok())
                 {
                     self.requested_files.remove(&id);
-                    if self.failed_files.len() >= 128 {
-                        self.failed_files.clear();
-                    }
-                    self.failed_files.insert(id);
-                }
-                if matches!(self.last_update.as_str(), "messages" | "error")
-                    && value["@extra"]
-                        .as_str()
-                        .and_then(|extra| extra.strip_prefix("history:"))
-                        .and_then(|id| id.parse::<i64>().ok())
-                        == self.store.active_chat
-                {
-                    self.history_loading = false;
+                    self.mark_file_failed(id);
+                    return (None, true);
                 }
                 // Invalidate only affected layout heights; file and chat updates keep them.
                 match self.last_update.as_str() {
@@ -426,7 +465,24 @@ impl App {
                         self.timeline_anchor = Some((new, offset));
                     }
                 }
-                let store_changed = self.store.apply(&value);
+                let store_changed = self.store.apply(&value) || media_changed;
+                if self.last_update == "updateFile"
+                    && let Some(id) = value["file"]["id"].as_i64()
+                    && self.large_file_pending(id as i32)
+                    && !self.cancelling_large_file(id as i32)
+                {
+                    self.store.set_downloading(id as i32, true);
+                }
+                let list_request = self.hydrate_positioned_chat(&value);
+                let unread_request = if self.last_update == "messages"
+                    && value["@extra"]
+                        .as_str()
+                        .is_some_and(|extra| extra.starts_with("history:"))
+                {
+                    self.locate_first_unread()
+                } else {
+                    None
+                };
                 stickers::on_response(self, &value);
                 if self.last_update == "updateChatFolders" {
                     self.folder_offset = 0;
@@ -436,10 +492,11 @@ impl App {
                     }
                 }
                 if self.selected_chat.is_none()
-                    || !self
-                        .store
-                        .chat_ids()
-                        .any(|id| Some(id) == self.selected_chat)
+                    || (self.selected_chat != self.store.active_chat
+                        && !self
+                            .store
+                            .chat_ids()
+                            .any(|id| Some(id) == self.selected_chat))
                 {
                     self.selected_chat = self.store.chat_ids().next();
                 }
@@ -489,23 +546,8 @@ impl App {
                 {
                     return (Some(actions::load_chats()), true);
                 }
-                if matches!(self.last_update.as_str(), "messages" | "updateNewMessage")
-                    && let Some(chat_id) = self.store.active_chat
-                {
-                    let ids: Vec<i64> = self
-                        .store
-                        .messages
-                        .iter()
-                        .rev()
-                        .take(20)
-                        .map(|message| message.id)
-                        .collect();
-                    if !ids.is_empty() {
-                        return (Some(actions::view_messages(chat_id, ids)), store_changed);
-                    }
-                }
                 (
-                    auth_request,
+                    unread_request.or(list_request).or(auth_request),
                     !was_ready || store_changed || auth_changed || menu_changed,
                 )
             }
@@ -530,6 +572,8 @@ impl App {
         self.show_help
             || self.show_settings
             || self.show_folders
+            || self.quick_switcher.is_some()
+            || (self.show_chat_info && self.chat_info_modal)
             || self.action_menu.is_some()
             || self.sticker_picker
             || self.attachments.is_some()
@@ -553,17 +597,49 @@ impl App {
         self.show_folders = false;
         self.show_help = false;
         self.show_settings = false;
+        self.quick_switcher = None;
+        self.clear_global_search();
+        self.cancel_batch();
+        self.reset_storage_view();
+        if self.chat_info_modal {
+            self.show_chat_info = false;
+        }
         self.settings_focus = None;
         self.action_menu = None;
         self.sticker_picker = false;
         self.attachments = None;
         self.confirm_delete = None;
+        self.confirm_delete_many = false;
         if self.forward_message.take().is_some() {
+            self.forward_many = false;
             self.selected_chat = self.store.active_chat;
             self.reveal_chat = true;
         }
         self.preview_message = None;
+        self.media.last_error = None;
         self.modal_scroll = 0;
+    }
+
+    fn toggle_multi_select_message(&mut self, id: i64) {
+        if let Some(pos) = self
+            .multi_select
+            .iter()
+            .position(|existing| *existing == id)
+        {
+            self.multi_select.remove(pos);
+        } else if self.multi_select.len() < 100 {
+            self.multi_select.push(id);
+        }
+    }
+
+    fn local_draft_preview(&self, chat_id: i64) -> Option<&str> {
+        if self.store.active_chat == Some(chat_id) && !self.draft.is_empty() {
+            return Some(&self.draft);
+        }
+        self.drafts
+            .iter()
+            .find(|(id, saved)| *id == chat_id && !saved.text.is_empty())
+            .map(|(_, saved)| saved.text.as_str())
     }
 
     fn open_selected(&mut self) -> Vec<Value> {
@@ -578,15 +654,23 @@ impl App {
         self.selection = None;
         self.drag = None;
         self.last_click = None;
+        self.media.last_error = None;
+        let mut requests: Vec<_> = self.flush_draft(Instant::now(), true).into_iter().collect();
         self.save_draft();
         self.clipboard.cancel();
         self.store.open(id);
+        self.cancel_batch();
+        self.clear_reactions();
+        self.parity.filter = parity::MediaFilter::All;
         self.quick_message.cancel_preparation();
         self.message_check = None;
         self.restore_draft(id);
         self.selected_message = None;
         self.preview_message = None;
         self.show_search = false;
+        self.multi_select.clear();
+        self.confirm_delete_many = false;
+        self.forward_many = false;
         self.focus_messages = true;
         self.timeline_anchor = None;
         self.quote_back = None;
@@ -594,16 +678,13 @@ impl App {
         self.visible_media.clear();
         self.history_loading = true;
         self.timeline_heights.clear();
-        let mut requests = Vec::new();
         if let Some(previous) = previous
             && previous != id
         {
-            requests.push(json!({"@type": "closeChat", "chat_id": previous}));
+            requests
+                .push(json!({"@type": "closeChat", "chat_id": previous, "@extra":"close-session"}));
         }
-        if previous != Some(id) {
-            requests.push(json!({"@type": "openChat", "chat_id": id}));
-        }
-        requests.push(actions::history(id, 0));
+        self.sync_open(id, &mut requests);
         requests
     }
 
@@ -685,8 +766,15 @@ impl App {
 
     fn submit_input(&mut self) -> Option<Value> {
         let chat_id = self.store.active_chat?;
-        let text = self.draft.trim().to_owned();
-        if text.is_empty() {
+        let text: String = if self.input_mode == InputMode::Search {
+            self.draft.trim().chars().take(256).collect()
+        } else {
+            self.draft.trim().to_owned()
+        };
+        if text.is_empty()
+            && !(self.input_mode == InputMode::Search
+                && self.parity.filter != parity::MediaFilter::All)
+        {
             return None;
         }
         let request = match self.input_mode {
@@ -694,7 +782,11 @@ impl App {
             InputMode::Send => actions::send_text(chat_id, text, None),
             InputMode::Reply(message_id) => actions::send_text(chat_id, text, Some(message_id)),
             InputMode::Edit(message_id) => actions::edit_text(chat_id, message_id, text),
-            InputMode::Search => actions::search(chat_id, text),
+            InputMode::Search => {
+                let mut request = actions::search(chat_id, text);
+                request["filter"] = json!({"@type":self.parity.filter.tdlib_type()});
+                request
+            }
             InputMode::React(message_id) => actions::react(chat_id, message_id, text),
         };
         Some(request)
@@ -704,9 +796,7 @@ impl App {
         if self.store.history_exhausted || self.history_loading {
             return None;
         }
-        let request = actions::history(self.store.active_chat?, self.store.oldest_message_id()?);
-        self.history_loading = true;
-        Some(request)
+        Some(self.history_request(self.store.active_chat?, self.store.oldest_message_id()?))
     }
 
     fn preview_selected(&mut self) -> Option<Value> {
@@ -719,10 +809,10 @@ impl App {
         self.preview_view = media::View::default();
         self.drag = None;
         if missing {
-            self.failed_files.remove(&file_id);
-            if !self.requested_files.insert(file_id) {
+            if self.requested_files.len() >= 4 || !self.requested_files.insert(file_id) {
                 return None;
             }
+            self.failed_files.remove(&file_id);
             return Some(actions::download(file_id));
         }
         None
@@ -743,9 +833,6 @@ impl App {
                         .is_some_and(|media| media.file_id == *id && media.path.is_none())
                 })
         })?;
-        if self.requested_files.len() >= 128 {
-            return None;
-        }
         self.requested_files
             .insert(id)
             .then(|| actions::download(id))
@@ -780,6 +867,8 @@ fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> i
         execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
     }
     let draw_result = terminal.draw(|frame| ui::draw(frame, app)).map(|_| ());
+    let visible = std::mem::take(&mut app.visible_read_ids);
+    app.record_viewport(visible, Instant::now());
     let end_result = if synchronized {
         execute!(terminal.backend_mut(), EndSynchronizedUpdate)
     } else {
@@ -805,6 +894,8 @@ fn drain_events(receiver: &Receiver<TdEvent>, app: &mut App, worker: &TdWorker) 
                     changed |= !send_request(app, worker, request);
                 }
                 changed |= redraw;
+                app.refresh_visible_chat_info(worker);
+                changed |= app.service_batch(worker);
                 changed |= menu::complete_pending(app, worker);
             }
             Err(TryRecvError::Empty) => return changed,
@@ -815,12 +906,16 @@ fn drain_events(receiver: &Receiver<TdEvent>, app: &mut App, worker: &TdWorker) 
 }
 
 fn send_request(app: &mut App, worker: &TdWorker, request: Value) -> bool {
-    let quick = request["@extra"]["kind"] == "quick-message";
+    let extra = &request["@extra"];
+    let quick = extra["kind"] == "quick-message";
+    let tag = extra.as_str().unwrap_or_default().to_owned();
     if let Err(error) = worker.request(request) {
+        app.request_queue_failed(&tag);
         if quick {
             app.quick_message.request_failed();
         }
         app.notice = Some(error);
+        app.notice_error = true;
         false
     } else {
         true
@@ -902,6 +997,7 @@ fn accept_clipboard(
             picker.error = Some(error.clone());
         }
         app.notice = Some(error);
+        app.notice_error = true;
     }
 }
 
@@ -911,6 +1007,11 @@ fn paste_text(app: &mut App, text: &str) {
     }
     if app.auth.setup.is_some() || app.auth.state != "authorizationStateReady" {
         app.auth.paste(text);
+    } else if let Some(switcher) = &mut app.quick_switcher {
+        let clean: String = text.chars().filter(|c| !c.is_control()).take(128).collect();
+        text::insert(&mut switcher.query, &mut switcher.cursor, &clean, 128);
+        switcher.selected = 0;
+        switcher.scroll = 0;
     } else if app.attachments.is_some() {
         if let Some(picker) = &mut app.attachments {
             if picker.focus == attachments::Focus::Caption {
@@ -985,12 +1086,16 @@ fn submit_composer(app: &mut App, worker: &TdWorker) -> bool {
         }
         return true;
     }
-    if let Some(request) = app.submit_input()
-        && send_request(app, worker, request)
-    {
+    if let Some(mut request) = app.submit_input() {
+        if app.input_mode == InputMode::Search {
+            app.tag_search(&mut request);
+        }
+        if !send_request(app, worker, request) {
+            return false;
+        }
         let keep_composer = matches!(app.input_mode, InputMode::Send | InputMode::Reply(_));
         if app.input_mode == InputMode::Search {
-            app.search_query = app.draft.clone();
+            app.search_query = app.draft.trim().chars().take(256).collect();
             app.show_search = true;
             app.store.search_results.clear();
             app.selected_message = None;
@@ -999,6 +1104,9 @@ fn submit_composer(app: &mut App, worker: &TdWorker) -> bool {
         app.timeline_anchor = None;
         app.pending_messages = 0;
         interaction::finish_input(app);
+        if keep_composer {
+            app.reset_draft_snapshot();
+        }
         if keep_composer && app.input_mode == InputMode::Off {
             app.input_mode = InputMode::Send;
             app.composer_focus = true;
@@ -1011,14 +1119,29 @@ fn submit_composer(app: &mut App, worker: &TdWorker) -> bool {
 }
 
 fn handle_settings_key(app: &mut App, worker: &TdWorker, code: KeyCode) {
+    if app.parity.storage_confirmation {
+        match code {
+            KeyCode::Enter | KeyCode::Char('y') => app.confirm_storage_cleanup(worker),
+            KeyCode::Esc | KeyCode::Char('n') => app.parity.storage_confirmation = false,
+            _ => {}
+        }
+        return;
+    }
     let actions = &[
         ui::Action::ApiSetup,
         ui::Action::OpenLink,
         ui::Action::ToggleMouse,
         ui::Action::ToggleNotifications,
     ][..if notifications::supported() { 4 } else { 3 }];
+    let page = app.modal_visible.saturating_sub(1).max(1) as u16;
     match code {
         KeyCode::Esc | KeyCode::Char('s') => app.close_overlays(),
+        KeyCode::Char('t') => {
+            interaction::perform(app, worker, ui::Action::CycleTheme);
+        }
+        KeyCode::Char('c') => {
+            interaction::perform(app, worker, ui::Action::CleanStorage);
+        }
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
             let previous = app
                 .settings_focus
@@ -1034,11 +1157,41 @@ fn handle_settings_key(app: &mut App, worker: &TdWorker, code: KeyCode) {
                 interaction::perform(app, worker, action);
             }
         }
-        KeyCode::Down | KeyCode::PageDown => {
+        KeyCode::Down | KeyCode::Char('j') => {
             app.modal_scroll = app.modal_scroll.saturating_add(1);
         }
-        KeyCode::Up | KeyCode::PageUp => {
+        KeyCode::Up | KeyCode::Char('k') => {
             app.modal_scroll = app.modal_scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown => {
+            app.modal_scroll = app.modal_scroll.saturating_add(page);
+        }
+        KeyCode::PageUp => {
+            app.modal_scroll = app.modal_scroll.saturating_sub(page);
+        }
+        _ => {}
+    }
+}
+
+fn handle_help_key(app: &mut App, code: KeyCode) {
+    let page = app.modal_visible.saturating_sub(1).max(1) as u16;
+    match code {
+        KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('s') | KeyCode::F(1) => {
+            app.show_settings = false;
+            app.show_help = false;
+            app.modal_scroll = 0;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.modal_scroll = app.modal_scroll.saturating_add(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.modal_scroll = app.modal_scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown => {
+            app.modal_scroll = app.modal_scroll.saturating_add(page);
+        }
+        KeyCode::PageUp => {
+            app.modal_scroll = app.modal_scroll.saturating_sub(page);
         }
         _ => {}
     }
@@ -1055,28 +1208,101 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         check.cancel_pending();
     }
     app.notice = None;
+    app.notice_error = false;
+    app.media.last_error = None;
     app.auth.clear_message();
     if code == KeyCode::Esc && !app.has_overlay() && selection::active(app) {
         app.selection = None;
         return false;
     }
-    if app.show_folders {
-        let lists = app.store.chat_lists();
+    if app.quick_switcher.is_some() {
+        let entries = app.quick_entries();
+        let page = app.modal_visible.max(1);
         match code {
             KeyCode::Esc => app.close_overlays(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                let sw = app.quick_switcher.as_mut().unwrap();
+                sw.global_messages = !sw.global_messages;
+                sw.selected = 0;
+                sw.scroll = 0;
+                app.reset_quick_search();
+                app.clear_global_search();
+            }
             KeyCode::Up => {
-                app.folder_offset = app.folder_offset.saturating_sub(1);
-                app.modal_scroll = app.folder_offset.saturating_sub(5) as u16;
+                if let Some(sw) = &mut app.quick_switcher {
+                    sw.selected = sw.selected.saturating_sub(1);
+                }
             }
             KeyCode::Down => {
-                app.folder_offset = (app.folder_offset + 1).min(lists.len() - 1);
-                app.modal_scroll = app.folder_offset.saturating_sub(5) as u16;
+                if let Some(sw) = &mut app.quick_switcher {
+                    sw.selected = (sw.selected + 1).min(entries.len().saturating_sub(1));
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(sw) = &mut app.quick_switcher {
+                    sw.selected = sw.selected.saturating_sub(page);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(sw) = &mut app.quick_switcher {
+                    sw.selected = (sw.selected + page).min(entries.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                let selected = app
+                    .quick_switcher
+                    .as_ref()
+                    .map_or(0, |sw| sw.selected)
+                    .min(entries.len().saturating_sub(1));
+                if let Some(&(chat_id, ..)) = entries.get(selected) {
+                    if app.global_message_mode() {
+                        if let Some((chat, message)) = app.global_hit_key(chat_id as usize) {
+                            app.open_global_hit(worker, chat, message);
+                        }
+                    } else {
+                        interaction::perform_target(
+                            app,
+                            worker,
+                            ui::Target::QuickSwitchChat(chat_id),
+                        );
+                    }
+                }
+            }
+            key => {
+                if let Some(sw) = &mut app.quick_switcher
+                    && text::edit(&mut sw.query, &mut sw.cursor, key)
+                {
+                    sw.query.truncate(text::cursor(&sw.query, 128));
+                    sw.cursor = sw.cursor.min(sw.query.len());
+                    sw.selected = 0;
+                    sw.scroll = 0;
+                }
+            }
+        }
+        return false;
+    }
+    if app.show_folders {
+        let lists = app.store.chat_lists();
+        let page = app.modal_visible.max(1);
+        match code {
+            KeyCode::Esc => app.close_overlays(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.folder_cursor = app.folder_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.folder_cursor = (app.folder_cursor + 1).min(lists.len().saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                app.folder_cursor = app.folder_cursor.saturating_sub(page);
+            }
+            KeyCode::PageDown => {
+                app.folder_cursor = (app.folder_cursor + page).min(lists.len().saturating_sub(1));
             }
             KeyCode::Enter => {
                 interaction::perform_target(
                     app,
                     worker,
-                    ui::Target::Folder(lists[app.folder_offset.min(lists.len() - 1)].0),
+                    ui::Target::Folder(lists[app.folder_cursor.min(lists.len() - 1)].0),
                 );
             }
             _ => {}
@@ -1099,9 +1325,7 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         return false;
     }
     if app.show_help {
-        if matches!(code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(1)) {
-            app.show_help = false;
-        }
+        handle_help_key(app, code);
         return false;
     }
     if app.show_settings {
@@ -1139,6 +1363,8 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
             interaction::perform(app, worker, ui::Action::Confirm);
         } else if matches!(code, KeyCode::Esc | KeyCode::Char('n')) {
             app.confirm_delete = None;
+            app.confirm_delete_many = false;
+            app.cancel_batch();
         }
         return false;
     }
@@ -1189,6 +1415,25 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         return false;
     }
     if app.input_mode != InputMode::Off && app.composer_focus {
+        if matches!(app.input_mode, InputMode::React(_))
+            && matches!(code, KeyCode::PageUp | KeyCode::PageDown)
+        {
+            let pages = app.reaction_choices().len().div_ceil(8);
+            app.parity.reaction_page = app
+                .parity
+                .reaction_page
+                .saturating_add_signed(if code == KeyCode::PageUp { -1 } else { 1 })
+                .min(pages.saturating_sub(1));
+            return false;
+        }
+        if let InputMode::React(_) = app.input_mode
+            && app.draft.is_empty()
+            && let KeyCode::Char(c @ '1'..='8') = code
+        {
+            let index = usize::from(c as u8 - b'1');
+            interaction::perform(app, worker, ui::Action::QuickReact(index));
+            return false;
+        }
         match code {
             KeyCode::Esc => {
                 interaction::finish_input(app);
@@ -1199,6 +1444,20 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
             }
             KeyCode::Enter => {
                 submit_composer(app, worker);
+            }
+            KeyCode::Up => {
+                app.selection = None;
+                app.draft_cursor = text::move_vertical(
+                    &app.draft,
+                    app.draft_cursor,
+                    app.composer_width.max(1),
+                    -1,
+                );
+            }
+            KeyCode::Down => {
+                app.selection = None;
+                app.draft_cursor =
+                    text::move_vertical(&app.draft, app.draft_cursor, app.composer_width.max(1), 1);
             }
             key => {
                 let removed =
@@ -1220,7 +1479,19 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         KeyCode::Char('?') => app.show_help = true,
         KeyCode::Char('s') => app.show_settings = true,
         KeyCode::Char(' ') => {
-            interaction::perform(app, worker, ui::Action::ChatMenu);
+            if !app.multi_select.is_empty() && app.focus_messages {
+                if let Some(id) = app.selected_message {
+                    app.toggle_multi_select_message(id);
+                }
+            } else {
+                interaction::perform(app, worker, ui::Action::ChatMenu);
+            }
+        }
+        KeyCode::Esc if !app.multi_select.is_empty() => {
+            app.multi_select.clear();
+        }
+        KeyCode::Esc if app.show_chat_info => {
+            app.show_chat_info = false;
         }
         KeyCode::Esc if app.show_search => {
             app.show_search = false;
@@ -1244,6 +1515,9 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         KeyCode::Down | KeyCode::Char('j') => {
             if app.focus_messages {
                 app.move_message(1);
+                if app.selected_message == app.store.messages.last().map(|msg| msg.id) {
+                    app.load_newer_near_bottom(worker);
+                }
             } else {
                 app.move_selected(1);
             }
@@ -1253,14 +1527,15 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
                 send_request(app, worker, request);
             }
         }
+        KeyCode::Enter if app.focus_messages && app.show_search && app.multi_select.is_empty() => {
+            interaction::perform(app, worker, ui::Action::JumpToMessage);
+        }
         KeyCode::Enter | KeyCode::Char('v') if app.focus_messages => {
             if app
                 .selected_message()
                 .is_some_and(|message| message.media.is_some())
             {
-                if let Some(request) = app.preview_selected() {
-                    send_request(app, worker, request);
-                }
+                interaction::perform(app, worker, ui::Action::Preview);
             } else if app.selected_message.is_some() {
                 menu::open_message(app, worker);
             }
@@ -1270,6 +1545,7 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         }
         KeyCode::PageDown if app.focus_messages => {
             ui::scroll_timeline(app, 5);
+            app.load_newer_near_bottom(worker);
         }
         KeyCode::End if app.focus_messages => {
             interaction::perform(app, worker, ui::Action::Bottom);
@@ -1302,6 +1578,16 @@ fn run(demo: bool) -> io::Result<()> {
     let mut last_draw = Instant::now() - Duration::from_secs(1);
 
     'running: loop {
+        if dirty {
+            app.observe_draft(Instant::now());
+        }
+        if let Some(request) = app.flush_draft(Instant::now(), false) {
+            dirty |= !send_request(&mut app, &worker, request);
+        }
+        dirty |= app.service_quick_search(&worker);
+        dirty |= app.service_global_search(&worker, Instant::now());
+        dirty |= app.service_storage(&worker);
+        dirty |= app.store.expire_typing(Instant::now());
         dirty |= drain_events(&worker.events, &mut app, &worker);
         for (sender, request) in app.store.sender_requests() {
             if !send_request(&mut app, &worker, request) {
@@ -1325,6 +1611,7 @@ fn run(demo: bool) -> io::Result<()> {
         }
         if let Some(error) = app.notifications.poll_error() {
             app.notice = Some(error);
+            app.notice_error = true;
             if app.auth.state == "authorizationStateReady" && !app.demo {
                 for request in app.notifications.requests() {
                     send_request(&mut app, &worker, request);
@@ -1353,16 +1640,24 @@ fn run(demo: bool) -> io::Result<()> {
             dirty |= interaction::tick(&mut app);
         }
         if dirty && last_draw.elapsed() >= Duration::from_millis(33) {
+            app.observe_draft(Instant::now());
             render(&mut terminal.terminal, &mut app)?;
             dirty = false;
             last_draw = Instant::now();
         }
 
-        if event::poll(if dirty || app.drag.is_some() {
+        if !dirty {
+            dirty |= app.report_viewport(&worker, Instant::now());
+        }
+        let timeout = if dirty || app.drag.is_some() {
             Duration::from_millis(10)
         } else {
             Duration::from_millis(100)
-        })? {
+        };
+        let timeout = app.next_sync_deadline(!dirty).map_or(timeout, |deadline| {
+            timeout.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        if event::poll(timeout)? {
             for _ in 0..64 {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -1420,16 +1715,32 @@ fn run(demo: bool) -> io::Result<()> {
                         } else if app.show_settings {
                             handle_settings_key(&mut app, &worker, key.code);
                         } else if app.show_help {
-                            if matches!(
-                                key.code,
-                                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('s')
-                            ) {
-                                app.show_settings = false;
-                                app.show_help = false;
-                            } else if matches!(key.code, KeyCode::Down | KeyCode::PageDown) {
-                                app.modal_scroll = app.modal_scroll.saturating_add(1);
-                            } else if matches!(key.code, KeyCode::Up | KeyCode::PageUp) {
-                                app.modal_scroll = app.modal_scroll.saturating_sub(1);
+                            handle_help_key(&mut app, key.code);
+                        } else if key.code == KeyCode::Char('k')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                            && app.auth.setup.is_none()
+                            && app.auth.state == "authorizationStateReady"
+                        {
+                            interaction::perform(&mut app, &worker, ui::Action::QuickSwitch);
+                        } else if key.code == KeyCode::Char('f')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                            && app.input_mode == InputMode::Search
+                        {
+                            interaction::perform(&mut app, &worker, ui::Action::CycleMediaFilter);
+                        } else if key.code == KeyCode::Char('w')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            if let Some(sw) = &mut app.quick_switcher {
+                                if text::delete_prev_word(&mut sw.query, &mut sw.cursor) {
+                                    sw.selected = 0;
+                                    sw.scroll = 0;
+                                }
+                            } else if app.composer_focus
+                                && app.input_mode != InputMode::Off
+                                && !app.has_overlay()
+                            {
+                                selection::remove_from_draft(&mut app);
+                                text::delete_prev_word(&mut app.draft, &mut app.draft_cursor);
                             }
                         } else if key.code == KeyCode::Char('u')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1438,6 +1749,11 @@ fn run(demo: bool) -> io::Result<()> {
                                 || app.auth.state != "authorizationStateReady"
                             {
                                 app.auth.clear_input();
+                            } else if let Some(sw) = &mut app.quick_switcher {
+                                sw.query.clear();
+                                sw.cursor = 0;
+                                sw.selected = 0;
+                                sw.scroll = 0;
                             } else if let Some(picker) = &mut app.attachments {
                                 match picker.focus {
                                     attachments::Focus::Path => {
@@ -1522,6 +1838,26 @@ fn run(demo: bool) -> io::Result<()> {
                             {
                                 selection::remove_from_draft(&mut app);
                                 text::insert(&mut app.draft, &mut app.draft_cursor, "\n", 262144);
+                            } else if key.code == KeyCode::Backspace
+                                && key.modifiers.contains(KeyModifiers::ALT)
+                                && app.composer_focus
+                                && app.input_mode != InputMode::Off
+                                && !app.has_overlay()
+                            {
+                                selection::remove_from_draft(&mut app);
+                                text::delete_prev_word(&mut app.draft, &mut app.draft_cursor);
+                            } else if matches!(key.code, KeyCode::Left | KeyCode::Right)
+                                && key.modifiers.contains(KeyModifiers::ALT)
+                                && app.composer_focus
+                                && app.input_mode != InputMode::Off
+                                && !app.has_overlay()
+                            {
+                                app.selection = None;
+                                app.draft_cursor = if key.code == KeyCode::Left {
+                                    text::prev_word(&app.draft, app.draft_cursor)
+                                } else {
+                                    text::next_word(&app.draft, app.draft_cursor)
+                                };
                             } else if handle_ready_key(&mut app, &worker, key.code) {
                                 break 'running;
                             }
@@ -1572,6 +1908,9 @@ fn run(demo: bool) -> io::Result<()> {
         }
     }
 
+    if let Some(request) = app.flush_draft(Instant::now(), true) {
+        send_request(&mut app, &worker, request);
+    }
     worker.shutdown();
     Ok(())
 }

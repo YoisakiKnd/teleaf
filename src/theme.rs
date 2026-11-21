@@ -1,6 +1,7 @@
-//! A small, immutable palette, detected once; rendering never probes the terminal.
+//! A small, immutable palette table, detected once; rendering never probes the terminal.
 use ratatui::style::{Color, Modifier, Style};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
@@ -16,11 +17,20 @@ pub struct Palette {
     pub selected: Color,
     pub on_accent: Color,
     monochrome: bool,
+    terminal_ansi: bool,
 }
 
 impl Palette {
     pub fn base(self) -> Style {
         Style::default().fg(self.text).bg(self.background)
+    }
+
+    pub fn surface_base(self) -> Style {
+        Style::default().fg(self.text).bg(self.surface)
+    }
+
+    pub fn is_monochrome(self) -> bool {
+        self.monochrome
     }
 
     pub fn selection(self) -> Style {
@@ -29,6 +39,19 @@ impl Palette {
             style.add_modifier(Modifier::REVERSED)
         } else {
             style
+        }
+    }
+
+    pub fn muted_on_selection(self) -> Style {
+        if self.monochrome {
+            Style::default().fg(self.text).add_modifier(Modifier::DIM)
+        } else if self.terminal_ansi {
+            // Avoid ANSI Gray on DarkGray low-contrast collisions in terminal palettes.
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(self.muted)
         }
     }
 
@@ -58,6 +81,7 @@ const DARK: Palette = Palette {
     selected: Color::Rgb(42, 58, 68),
     on_accent: Color::Rgb(15, 42, 30),
     monochrome: false,
+    terminal_ansi: false,
 };
 
 const LIGHT: Palette = Palette {
@@ -73,6 +97,7 @@ const LIGHT: Palette = Palette {
     selected: Color::Rgb(216, 232, 222),
     on_accent: Color::Rgb(255, 255, 255),
     monochrome: false,
+    terminal_ansi: false,
 };
 
 const TERMINAL: Palette = Palette {
@@ -88,24 +113,28 @@ const TERMINAL: Palette = Palette {
     selected: Color::DarkGray,
     on_accent: Color::Black,
     monochrome: false,
+    terminal_ansi: true,
+};
+
+const MONOCHROME: Palette = Palette {
+    name: "单色",
+    text: Color::Reset,
+    muted: Color::Reset,
+    border: Color::Reset,
+    accent: Color::Reset,
+    incoming: Color::Reset,
+    error: Color::Reset,
+    background: Color::Reset,
+    surface: Color::Reset,
+    selected: Color::Reset,
+    on_accent: Color::Reset,
+    monochrome: true,
+    terminal_ansi: false,
 };
 
 fn choose(requested: &str, truecolor: bool, indexed: bool, no_color: bool) -> Palette {
     if no_color {
-        return Palette {
-            name: "单色",
-            text: Color::Reset,
-            muted: Color::Reset,
-            border: Color::Reset,
-            accent: Color::Reset,
-            incoming: Color::Reset,
-            error: Color::Reset,
-            background: Color::Reset,
-            surface: Color::Reset,
-            selected: Color::Reset,
-            on_accent: Color::Reset,
-            monochrome: true,
-        };
+        return MONOCHROME;
     }
     if requested == "terminal" || (!truecolor && !indexed) {
         return TERMINAL;
@@ -159,9 +188,16 @@ fn indexed_color(color: Color) -> Color {
     Color::Indexed(closest.1)
 }
 
-pub fn palette() -> &'static Palette {
-    static PALETTE: OnceLock<Palette> = OnceLock::new();
-    PALETTE.get_or_init(|| {
+struct Table {
+    palettes: [Palette; 3],
+    locked: bool,
+}
+
+static TABLE: OnceLock<Table> = OnceLock::new();
+static ACTIVE: AtomicU8 = AtomicU8::new(0);
+
+fn table() -> &'static Table {
+    TABLE.get_or_init(|| {
         let requested = std::env::var("TG_THEME").unwrap_or_else(|_| "auto".into());
         let requested = match requested.as_str() {
             "dark" | "light" | "terminal" => requested.as_str(),
@@ -180,10 +216,42 @@ pub fn palette() -> &'static Palette {
                 "ghostty" | "iTerm.app" | "WezTerm" | "vscode"
             )
             || std::env::var_os("WT_SESSION").is_some();
+        let indexed = term.contains("256color");
         let no_color =
             std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) || term == "dumb";
-        choose(requested, truecolor, term.contains("256color"), no_color)
+        let initial = if no_color || (!truecolor && !indexed) || requested == "terminal" {
+            2
+        } else if requested == "light" {
+            1
+        } else {
+            0
+        };
+        ACTIVE.store(initial, Ordering::Relaxed);
+        Table {
+            palettes: [
+                choose("dark", truecolor, indexed, no_color),
+                choose("light", truecolor, indexed, no_color),
+                choose("terminal", truecolor, indexed, no_color),
+            ],
+            locked: no_color || (!truecolor && !indexed),
+        }
     })
+}
+
+pub fn palette() -> &'static Palette {
+    let table = table();
+    let index = usize::from(ACTIVE.load(Ordering::Relaxed)).min(2);
+    &table.palettes[index]
+}
+
+pub fn cycle() -> bool {
+    let table = table();
+    if table.locked {
+        return false;
+    }
+    let current = ACTIVE.load(Ordering::Relaxed);
+    ACTIVE.store((current + 1) % 3, Ordering::Relaxed);
+    true
 }
 
 #[cfg(test)]
@@ -207,8 +275,16 @@ mod tests {
         );
         let mono = choose("dark", true, true, true);
         assert_eq!(mono.background, Color::Reset);
+        assert!(mono.is_monochrome());
         assert!(mono.selection().add_modifier.contains(Modifier::REVERSED));
         assert!(mono.primary().add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(TERMINAL.muted_on_selection().fg, Some(Color::Reset));
+        assert!(
+            TERMINAL
+                .muted_on_selection()
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
     }
 
     #[test]
@@ -253,6 +329,7 @@ mod tests {
         ] {
             for fg in [p.text, p.muted, p.accent, p.incoming, p.error] {
                 assert!(contrast(fg, p.background) >= 4.5);
+                assert!(contrast(fg, p.surface) >= 4.5);
                 assert!(contrast(fg, p.selected) >= 4.5);
             }
             assert!(contrast(p.on_accent, p.accent) >= 4.5);

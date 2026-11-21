@@ -68,6 +68,108 @@ pub fn edit(text: &mut String, position: &mut usize, key: KeyCode) -> bool {
     before != *position
 }
 
+pub fn prev_word(text: &str, position: usize) -> usize {
+    let pos = cursor(text, position);
+    if pos == 0 {
+        return 0;
+    }
+    let slice = &text[..pos];
+    let mut graphemes: Vec<(usize, &str)> = slice.grapheme_indices(true).collect();
+    while let Some(&(_, g)) = graphemes.last() {
+        if g.chars().all(char::is_whitespace) {
+            graphemes.pop();
+        } else {
+            break;
+        }
+    }
+    let Some(&(_, last)) = graphemes.last() else {
+        return 0;
+    };
+    let is_word = |g: &str| {
+        g.chars()
+            .any(|c| c.is_alphanumeric() || c == '_' || (!c.is_ascii() && !c.is_whitespace()))
+    };
+    let target_word = is_word(last);
+    let mut start = graphemes.last().unwrap().0;
+    while let Some(&(i, g)) = graphemes.last() {
+        if is_word(g) == target_word && !g.chars().all(char::is_whitespace) {
+            start = i;
+            graphemes.pop();
+        } else {
+            break;
+        }
+    }
+    start
+}
+
+pub fn next_word(text: &str, position: usize) -> usize {
+    let pos = cursor(text, position);
+    if pos >= text.len() {
+        return text.len();
+    }
+    let mut iter = text[pos..].grapheme_indices(true).peekable();
+    while let Some(&(_, g)) = iter.peek() {
+        if g.chars().all(char::is_whitespace) {
+            iter.next();
+        } else {
+            break;
+        }
+    }
+    let Some(&(_, first)) = iter.peek() else {
+        return text.len();
+    };
+    let is_word = |g: &str| {
+        g.chars()
+            .any(|c| c.is_alphanumeric() || c == '_' || (!c.is_ascii() && !c.is_whitespace()))
+    };
+    let target_word = is_word(first);
+    let mut end = pos;
+    for (i, g) in iter {
+        if is_word(g) == target_word && !g.chars().all(char::is_whitespace) {
+            end = pos + i + g.len();
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+pub fn delete_prev_word(text: &mut String, position: &mut usize) -> bool {
+    *position = cursor(text, *position);
+    let target = prev_word(text, *position);
+    if target < *position {
+        text.replace_range(target..*position, "");
+        *position = target;
+        true
+    } else {
+        false
+    }
+}
+
+pub fn move_vertical(text: &str, position: usize, width: usize, delta: isize) -> usize {
+    let pos = cursor(text, position);
+    let list = rows(text, width);
+    if list.len() <= 1 || delta == 0 {
+        return pos;
+    }
+    let current = list.iter().rposition(|row| row.start <= pos).unwrap_or(0);
+    let target = current.saturating_add_signed(delta).min(list.len() - 1);
+    if target == current {
+        return pos;
+    }
+    let col = UnicodeWidthStr::width(&text[list[current].start..pos.min(list[current].end)]);
+    let row = list[target];
+    let mut used = 0;
+    for (i, g) in text[row.start..row.end].grapheme_indices(true) {
+        let size = UnicodeWidthStr::width(g);
+        if used + size > col {
+            return row.start + i;
+        }
+        used += size;
+    }
+    row.end
+}
+
 #[derive(Clone, Copy)]
 pub struct Row {
     pub start: usize,
@@ -161,5 +263,20 @@ mod tests {
         assert_eq!(hit(&text, row, 2, false), "中".len());
         assert_eq!(hit(&text, row, 3, false), "中".len());
         assert_eq!(row_count("ab\n中文\n", 2), 4);
+    }
+
+    #[test]
+    fn vertical_movement_and_word_editing_respect_graphemes_and_widths() {
+        let mut text = "hello world\n中文测试行".to_owned();
+        let mut pos = text.len();
+        let up = move_vertical(&text, pos, 20, -1);
+        assert!(up <= "hello world".len());
+        let down = move_vertical(&text, up, 20, 1);
+        assert!(down > "hello world".len());
+        assert!(delete_prev_word(&mut text, &mut pos));
+        assert_eq!(text, "hello world\n");
+        let word_end = next_word("hello world", 0);
+        assert_eq!(word_end, 5);
+        assert_eq!(prev_word("hello world", 11), 6);
     }
 }

@@ -4,9 +4,82 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, SyncSender};
 
+fn demo_search_matches(message: &Value, query: &str, filter: Option<&str>) -> bool {
+    let content = &message["content"];
+    let text = content
+        .pointer("/text/text")
+        .or_else(|| content.pointer("/caption/text"))
+        .or_else(|| content.pointer("/document/file_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let matches_filter = match filter {
+        Some("searchMessagesFilterPhoto") => content["@type"] == "messagePhoto",
+        Some("searchMessagesFilterDocument") => content["@type"] == "messageDocument",
+        Some("searchMessagesFilterVoiceNote") => content["@type"] == "messageVoiceNote",
+        Some("searchMessagesFilterUrl") => text.contains("https://") || text.contains("http://"),
+        Some("searchMessagesFilterPinned") => message["is_pinned"] == true,
+        _ => true,
+    };
+    matches_filter && text.to_lowercase().contains(&query.to_lowercase())
+}
+
 fn messages(chat_id: i64, path: &str, detail_path: &str) -> Vec<Value> {
     let file = json!({"id":42,"local":{"path":path,"is_downloading_completed":true}});
     let detail = json!({"id":43,"local":{"path":detail_path,"is_downloading_completed":false}});
+    if chat_id == 2 {
+        return vec![
+            json!({
+                "id": 1, "chat_id": chat_id, "date": 1700000000,
+                "sender_id": {"@type": "messageSenderUser", "user_id": 101},
+                "forward_info":{"origin":{"@type":"messageOriginHiddenUser","sender_name":"项目公告"}},
+                "content": {
+                    "@type": "messageText",
+                    "text": {
+                        "text": "欢迎查看桌面端对齐演示：支持粗体、行内代码 cargo test、链接 https://telegram.org 以及隐藏剧透内容。",
+                        "entities": [
+                            {"offset": 14, "length": 2, "type": {"@type": "textEntityTypeBold"}},
+                            {"offset": 22, "length": 10, "type": {"@type": "textEntityTypeCode"}},
+                            {"offset": 36, "length": 20, "type": {"@type": "textEntityTypeUrl"}},
+                            {"offset": 61, "length": 4, "type": {"@type": "textEntityTypeSpoiler"}}
+                        ]
+                    }
+                },
+                "interaction_info": {
+                    "reactions": {
+                        "reactions": [
+                            {"type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "total_count": 3, "is_chosen": true},
+                            {"type": {"@type": "reactionTypeEmoji", "emoji": "🔥"}, "total_count": 2, "is_chosen": false}
+                        ]
+                    }
+                }
+            }),
+            json!({
+                "id": 2, "chat_id": chat_id, "date": 1700000060, "is_outgoing": true,
+                "sender_id": {"@type": "messageSenderUser", "user_id": 999},
+                "content": {
+                    "@type": "messageDocument",
+                    "document": {
+                        "file_name": "teleaf-desktop-spec.pdf",
+                        "document": {
+                            "id": 44, "size": 2516582,
+                            "local": {"path": "", "is_downloading_active": true, "is_downloading_completed": false, "downloaded_size": 1635778}
+                        }
+                    }
+                }
+            }),
+            json!({
+                "id": 3, "chat_id": chat_id, "date": 1700000120,
+                "sender_id": {"@type": "messageSenderUser", "user_id": 101},
+                "content": {
+                    "@type": "messageVoiceNote",
+                    "voice_note": {
+                        "duration": 18,
+                        "voice": {"id": 45, "size": 98304, "local": {"path": "", "is_downloading_completed": false, "downloaded_size": 0}}
+                    }
+                }
+            }),
+        ];
+    }
     let mut messages = vec![
         json!({"id":1,"chat_id":chat_id,"content":{"@type":"messageText","text":{"text":"离线演示：点击分组和会话，滚动消息；这里的操作不会发送到 Telegram。"}}}),
         json!({"id":2,"chat_id":chat_id,"content":{"@type":"messagePhoto","caption":{"text":"图片直接放在这条消息里"},"photo":{"sizes":[{"width":320,"height":160,"photo":file},{"width":1280,"height":640,"photo":detail}]}}}),
@@ -67,13 +140,36 @@ pub(crate) fn serve(events: SyncSender<TdEvent>, commands: Receiver<TdCommand>) 
         } else {
             json!({"@type":"chatListMain"})
         };
-        let mut positions = vec![json!({"list":main,"order":(100-id).to_string()})];
+        let mut positions =
+            vec![json!({"list":main,"order":(100-id).to_string(),"is_pinned":id == 2})];
         if folder > 0 {
-            positions.push(json!({"list":{"@type":"chatListFolder","chat_folder_id":folder},"order":(200-id).to_string()}));
+            positions.push(json!({"list":{"@type":"chatListFolder","chat_folder_id":folder},"order":(200-id).to_string(),"is_pinned":false}));
         }
-        if !send(
-            json!({"@type":"updateNewChat","chat":{"id":id,"title":title,"unread_count":id,"positions":positions,"last_message":{"content":{"@type":"messageText","text":{"text":"点击打开离线演示会话"}}}}}),
-        ) {
+        let mut chat_json = json!({
+            "id": id,
+            "title": title,
+            "unread_count": id,
+            "positions": positions,
+            "last_message": {"date": 1700000000 + id * 60, "content": {"@type": "messageText", "text": {"text": "点击打开离线演示会话"}}}
+        });
+        if id == 1 {
+            chat_json["subtitle"] = json!("12 位成员 · 3 人在线");
+            chat_json["username"] = json!("teleaf_product");
+            chat_json["bio"] =
+                json!("Teleaf 终端客户端产品讨论组。按 I 查看详情，Ctrl+K 快速切会话。");
+        } else if id == 2 {
+            chat_json["subtitle"] = json!("在线");
+            chat_json["username"] = json!("xiaolin_demo");
+            chat_json["bio"] = json!("演示富文本、回应、置顶横幅、未读分隔线与下载进度条。");
+            chat_json["unread_mention_count"] = json!(1);
+            chat_json["last_read_inbox_message_id"] = json!(2);
+            chat_json["pinned_message"] = json!({"id": 1, "excerpt": "欢迎查看桌面端对齐演示：支持粗体、行内代码、链接与回应"});
+        } else if id == 3 {
+            chat_json["notification_settings"] = json!({"mute_for": 2147483647});
+            chat_json["draft_message"] =
+                json!({"input_message_text": {"text": {"text": "评审纪要草稿待发"}}});
+        }
+        if !send(json!({"@type": "updateNewChat", "chat": chat_json})) {
             return;
         }
     }
@@ -104,6 +200,14 @@ pub(crate) fn serve(events: SyncSender<TdEvent>, commands: Receiver<TdCommand>) 
             continue;
         }
         let response = match request["@type"].as_str().unwrap_or("") {
+            "getMessageProperties" => json!({"@type":"messageProperties","@extra":extra,
+                "can_be_forwarded":true,"can_be_deleted_for_all_users":true,"can_be_deleted_only_for_self":true}),
+            "getMessageAvailableReactions" => json!({"@type":"availableReactions","@extra":extra,
+                "top_reactions":[{"type":{"@type":"reactionTypeEmoji","emoji":"👍"}},{"type":{"@type":"reactionTypeEmoji","emoji":"❤️"}}]}),
+            "getStorageStatisticsFast" => {
+                json!({"@type":"storageStatisticsFast","files_size":0,"@extra":extra})
+            }
+            "optimizeStorage" => json!({"@type":"storageStatistics","size":0,"@extra":extra}),
             "getMe" => json!({"@type":"user","id":999,"first_name":"我","@extra":extra}),
             "createPrivateChat" => {
                 let saved = json!({"@type":"chat","id":999,"title":"收藏夹",
@@ -152,20 +256,30 @@ pub(crate) fn serve(events: SyncSender<TdEvent>, commands: Receiver<TdCommand>) 
                 json!({"@type":"error","code":404,"message":"All chats loaded","@extra":extra})
             }
             "getChatHistory" => {
-                let mut history = if request["from_message_id"].as_i64() == Some(0) && chat != 999 {
-                    messages(chat, &path, &detail_path)
+                let mut history = if chat == 999 {
+                    Vec::new()
                 } else {
-                    vec![]
+                    messages(chat, &path, &detail_path)
                 };
-                if request["from_message_id"].as_i64() == Some(0) {
-                    history.extend(
-                        posted
-                            .iter()
-                            .filter(|m| m["chat_id"].as_i64() == Some(chat))
-                            .cloned(),
-                    );
-                }
-                json!({"@type":"messages","@extra":extra,"messages":history})
+                history.extend(
+                    posted
+                        .iter()
+                        .filter(|m| m["chat_id"].as_i64() == Some(chat))
+                        .cloned(),
+                );
+                history.sort_by_key(|m| std::cmp::Reverse(m["id"].as_i64()));
+                let from = request["from_message_id"].as_i64().unwrap_or_default();
+                let offset = request["offset"].as_i64().unwrap_or_default();
+                let limit = request["limit"].as_u64().unwrap_or(50) as usize;
+                let start = if from == 0 {
+                    0
+                } else {
+                    history
+                        .partition_point(|m| m["id"].as_i64().is_some_and(|id| id > from))
+                        .saturating_add_signed(offset as isize)
+                };
+                let page: Vec<_> = history.into_iter().skip(start).take(limit).collect();
+                json!({"@type":"messages","@extra":extra,"messages":page})
             }
             "sendMessage" => {
                 next_id += 1;
@@ -180,12 +294,29 @@ pub(crate) fn serve(events: SyncSender<TdEvent>, commands: Receiver<TdCommand>) 
                 let query = request["query"].as_str().unwrap_or("");
                 let found: Vec<_> = messages(chat, &path, &detail_path)
                     .into_iter()
-                    .filter(|message| message.to_string().contains(query))
+                    .filter(|message| {
+                        demo_search_matches(message, query, request["filter"]["@type"].as_str())
+                    })
+                    .take(50)
                     .collect();
                 json!({"@type":"foundChatMessages","@extra":extra,"messages":found})
             }
+            "searchMessages" => {
+                let query = request["query"].as_str().unwrap_or("");
+                let found: Vec<_> = (1..=3)
+                    .flat_map(|chat| messages(chat, &path, &detail_path))
+                    .filter(|message| demo_search_matches(message, query, None))
+                    .take(32)
+                    .collect();
+                json!({"@type":"foundMessages","@extra":extra,"messages":found})
+            }
             "deleteMessages" => {
-                json!({"@type":"updateDeleteMessages","chat_id":chat,"message_ids":request["message_ids"]})
+                if !send(
+                    json!({"@type":"updateDeleteMessages","chat_id":chat,"message_ids":request["message_ids"]}),
+                ) {
+                    break;
+                }
+                json!({"@type":"ok","@extra":extra})
             }
             "editMessageText" => {
                 json!({"@type":"updateMessageContent","chat_id":chat,"message_id":request["message_id"],"new_content":{"@type":"messageText","text":request.pointer("/input_message_content/text").cloned().unwrap_or(Value::Null)}})

@@ -75,18 +75,22 @@ pub fn send_file(chat_id: i64, path: &str) -> Value {
     })
 }
 
-pub fn delete(chat_id: i64, message_id: i64, for_everyone: bool) -> Value {
+pub fn delete_many(chat_id: i64, message_ids: Vec<i64>, for_everyone: bool) -> Value {
     json!({
         "@type": "deleteMessages", "chat_id": chat_id,
-        "message_ids": [message_id], "revoke": for_everyone
+        "message_ids": message_ids, "revoke": for_everyone
     })
 }
 
 pub fn forward(from_chat_id: i64, message_id: i64, target_chat_id: i64) -> Value {
+    forward_many(from_chat_id, vec![message_id], target_chat_id)
+}
+
+pub fn forward_many(from_chat_id: i64, message_ids: Vec<i64>, target_chat_id: i64) -> Value {
     json!({
         "@type": "forwardMessages", "chat_id": target_chat_id,
         "topic_id": null, "from_chat_id": from_chat_id,
-        "message_ids": [message_id], "options": null,
+        "message_ids": message_ids, "options": null,
         "send_copy": false, "remove_caption": false
     })
 }
@@ -97,6 +101,65 @@ pub fn react(chat_id: i64, message_id: i64, emoji: String) -> Value {
         "message_id": message_id,
         "reaction_type": {"@type": "reactionTypeEmoji", "emoji": emoji},
         "is_big": false, "update_recent_reactions": true
+    })
+}
+
+pub fn remove_reaction(chat_id: i64, message_id: i64, emoji: String) -> Value {
+    json!({
+        "@type": "removeMessageReaction", "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction_type": {"@type": "reactionTypeEmoji", "emoji": emoji}
+    })
+}
+
+pub fn toggle_chat_mute(chat_id: i64, mute: bool) -> Value {
+    json!({
+        "@type": "setChatNotificationSettings",
+        "chat_id": chat_id,
+        "notification_settings": {
+            "@type": "chatNotificationSettings",
+            "use_default_mute_for": false,
+            "mute_for": if mute { i32::MAX } else { 0 },
+            "use_default_sound": true,
+            "use_default_show_preview": true,
+            "use_default_mute_stories": true,
+            "use_default_story_sound": true,
+            "use_default_show_story_sender": true,
+            "use_default_disable_pinned_message_notifications": true,
+            "use_default_disable_mention_notifications": true
+        },
+        "@extra": format!("mute:{chat_id}")
+    })
+}
+
+pub fn toggle_chat_pin(list: crate::store::ChatList, chat_id: i64, pinned: bool) -> Value {
+    json!({
+        "@type": "toggleChatIsPinned",
+        "chat_list": list.json(),
+        "chat_id": chat_id,
+        "is_pinned": pinned,
+        "@extra": format!("pin:{chat_id}")
+    })
+}
+
+pub fn jump_to_message(chat_id: i64, message_id: i64) -> Value {
+    json!({
+        "@type": "getChatHistory",
+        "chat_id": chat_id,
+        "from_message_id": message_id,
+        "offset": -20,
+        "limit": 50,
+        "only_local": false,
+        "@extra": format!("jump:{chat_id}:{message_id}")
+    })
+}
+
+pub fn search_chats(query: String) -> Value {
+    json!({
+        "@type": "searchChats",
+        "query": query,
+        "limit": 32,
+        "@extra": "quick-switch"
     })
 }
 
@@ -143,8 +206,24 @@ pub fn send_sticker(chat_id: i64, file_id: i32, emoji: &str, width: i32, height:
 pub fn view_messages(chat_id: i64, ids: Vec<i64>) -> Value {
     json!({
         "@type": "viewMessages", "chat_id": chat_id,
-        "message_ids": ids, "source": null, "force_read": false
+        "message_ids": ids, "source": {"@type":"messageSourceChatHistory"}, "force_read": false
     })
+}
+
+pub fn set_draft(chat_id: i64, text: &str, reply_to: Option<i64>) -> Value {
+    let draft = (!text.is_empty() || reply_to.is_some()).then(|| {
+        let mut content = text_content(text.to_owned());
+        content["clear_draft"] = json!(false);
+        json!({
+            "@type":"draftMessage",
+            "reply_to":reply_to.map(|message_id| json!({
+                "@type":"inputMessageReplyToMessage", "message_id":message_id
+            })),
+            "input_message_text":content
+        })
+    });
+    json!({"@type":"setChatDraftMessage","chat_id":chat_id,"topic_id":null,
+        "draft_message":draft,"@extra":format!("draft:{chat_id}")})
 }
 
 #[cfg(test)]

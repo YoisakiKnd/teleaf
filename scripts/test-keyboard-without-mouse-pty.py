@@ -5,11 +5,12 @@ Run cargo build first. Requires macOS/Linux and a build without bundled API keys
 """
 import tempfile
 from pathlib import Path
-from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
 
-Terminal = SourceFileLoader(
-    'recovery', str(Path(__file__).with_name('test-login-recovery-pty.py'))
-).load_module().Terminal
+spec = spec_from_file_location('recovery', Path(__file__).with_name('test-login-recovery-pty.py'))
+recovery = module_from_spec(spec)
+spec.loader.exec_module(recovery)
+Terminal = recovery.Terminal
 
 
 def settings_mouse_off(terminal):

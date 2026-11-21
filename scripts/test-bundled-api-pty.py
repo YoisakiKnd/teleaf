@@ -9,11 +9,12 @@ import argparse
 import re
 import tempfile
 from pathlib import Path
-from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
 
-Terminal = SourceFileLoader(
-    'recovery', str(Path(__file__).with_name('test-login-recovery-pty.py'))
-).load_module().Terminal
+spec = spec_from_file_location('recovery', Path(__file__).with_name('test-login-recovery-pty.py'))
+recovery = module_from_spec(spec)
+spec.loader.exec_module(recovery)
+Terminal = recovery.Terminal
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', type=Path, help='Use a packaged executable')

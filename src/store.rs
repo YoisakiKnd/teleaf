@@ -1,9 +1,17 @@
 //! Small UI-facing projection of TDLib updates. No raw JSON is retained.
 
+use std::time::{Duration, Instant};
+
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PinnedBanner {
+    pub id: i64,
+    pub excerpt: String,
+}
 
 #[derive(Clone)]
 pub struct Chat {
@@ -12,7 +20,99 @@ pub struct Chat {
     pub unread: i64,
     pub preview: String,
     pub read_outbox: i64,
+    pub read_inbox: i64,
+    pub latest_message_id: i64,
+    pub last_stamp: Option<crate::calendar::Stamp>,
+    pub pinned: bool,
+    pub muted: bool,
+    pub mention_count: i64,
+    pub draft_preview: String,
+    pub typing: String,
+    pub subtitle: String,
+    pub username: String,
+    pub bio: String,
+    pub pinned_message: Option<PinnedBanner>,
+    pub peer: Option<ChatPeer>,
+    pub notifications: NotificationSettings,
     orders: HashMap<ChatList, i64>,
+    pinned_lists: HashSet<ChatList>,
+}
+
+// Preserve the chat's existing overrides when changing only mute duration.
+const NOTIFICATION_FLAGS: &[&str] = &[
+    "use_default_sound",
+    "show_preview",
+    "use_default_show_preview",
+    "mute_stories",
+    "use_default_mute_stories",
+    "use_default_story_sound",
+    "show_story_sender",
+    "use_default_show_story_sender",
+    "show_story_poster",
+    "use_default_show_story_poster",
+    "disable_pinned_message_notifications",
+    "use_default_disable_pinned_message_notifications",
+    "disable_mention_notifications",
+    "use_default_disable_mention_notifications",
+];
+
+#[derive(Clone, Copy, Default)]
+pub struct NotificationSettings {
+    present: u16,
+    enabled: u16,
+    sound: Option<i64>,
+    story_sound: Option<i64>,
+}
+
+impl NotificationSettings {
+    fn parse(value: &Value) -> Self {
+        let mut settings = Self::default();
+        for (index, key) in NOTIFICATION_FLAGS.iter().enumerate() {
+            if let Some(enabled) = value[*key].as_bool() {
+                settings.present |= 1 << index;
+                settings.enabled |= u16::from(enabled) << index;
+            }
+        }
+        let sound_id = |key: &str| {
+            value[key]
+                .as_i64()
+                .or_else(|| value[key].as_str()?.parse().ok())
+        };
+        settings.sound = sound_id("sound_id");
+        settings.story_sound = sound_id("story_sound_id");
+        settings
+    }
+
+    pub fn preserve(self, value: &mut Value) {
+        for (index, key) in NOTIFICATION_FLAGS.iter().enumerate() {
+            if self.present & (1 << index) != 0 {
+                value[*key] = Value::Bool(self.enabled & (1 << index) != 0);
+            }
+        }
+        for (key, id) in [
+            ("sound_id", self.sound),
+            ("story_sound_id", self.story_sound),
+        ] {
+            if let Some(id) = id {
+                value[key] = Value::String(id.to_string());
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChatPeer {
+    Private(i64),
+    BasicGroup(i64),
+    Supergroup(i64),
+}
+
+#[derive(Clone)]
+pub struct ChatSummary {
+    pub id: i64,
+    pub username: String,
+    pub title: String,
+    pub subtitle: String,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
@@ -65,6 +165,47 @@ pub struct MessageInfo {
     pub pinned: bool,
     pub sending: Sending,
     pub reply: Option<Reply>,
+    pub forwarded_from: Option<ForwardOrigin>,
+    pub reactions: Vec<Reaction>,
+    pub entities: Vec<TextEntity>,
+    pub media_meta: Option<MediaMeta>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    pub emoji: String,
+    pub custom_emoji_id: Option<i64>,
+    pub count: u32,
+    pub chosen: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntityKind {
+    Bold,
+    Italic,
+    Code,
+    Pre,
+    Strike,
+    Spoiler,
+    Url,
+    TextUrl(String),
+    Mention,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextEntity {
+    pub start: usize,
+    pub end: usize,
+    pub kind: EntityKind,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct MediaMeta {
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub duration_secs: u32,
+    pub downloading: bool,
 }
 
 #[derive(Clone, Default)]
@@ -79,6 +220,12 @@ pub enum Sending {
 }
 
 #[derive(Clone)]
+pub enum ForwardOrigin {
+    Sender(Sender),
+    Hidden(String),
+}
+
+#[derive(Clone)]
 pub struct Reply {
     pub chat_id: i64,
     pub message_id: i64,
@@ -90,6 +237,10 @@ impl Message {
         std::mem::size_of::<Self>()
             + self.text.capacity()
             + self.author_signature.capacity()
+            + match &self.info.forwarded_from {
+                Some(ForwardOrigin::Hidden(name)) => name.capacity(),
+                _ => 0,
+            }
             + self
                 .info
                 .reply
@@ -107,6 +258,47 @@ impl Message {
                         .and_then(|file| file.path.as_ref())
                         .map_or(0, String::capacity)
             })
+            + self.info.reactions.capacity() * std::mem::size_of::<Reaction>()
+            + self
+                .info
+                .reactions
+                .iter()
+                .map(|r| r.emoji.capacity())
+                .sum::<usize>()
+            + self.info.entities.capacity() * std::mem::size_of::<TextEntity>()
+            + self
+                .info
+                .entities
+                .iter()
+                .map(|e| match &e.kind {
+                    EntityKind::TextUrl(url) => url.capacity(),
+                    _ => 0,
+                })
+                .sum::<usize>()
+            + self
+                .info
+                .media_meta
+                .as_ref()
+                .map_or(0, |meta| meta.file_name.capacity())
+    }
+    pub fn first_link(&self) -> Option<String> {
+        self.info
+            .entities
+            .iter()
+            .find_map(|entity| match &entity.kind {
+                EntityKind::TextUrl(url) if !url.is_empty() => Some(url.clone()),
+                EntityKind::Url => {
+                    let raw = self.text.get(entity.start..entity.end)?.trim();
+                    if raw.is_empty() {
+                        None
+                    } else if raw.starts_with("http://") || raw.starts_with("https://") {
+                        Some(raw.to_owned())
+                    } else {
+                        Some(format!("https://{raw}"))
+                    }
+                }
+                _ => None,
+            })
     }
     pub fn retryable(&self) -> bool {
         matches!(
@@ -117,25 +309,29 @@ impl Message {
             }
         )
     }
+    #[cfg(test)]
     pub fn status(&self, read_outbox: i64) -> String {
+        self.status_formatted(read_outbox, false)
+    }
+    pub fn status_formatted(&self, read_outbox: i64, compact: bool) -> String {
         let mut parts = Vec::with_capacity(4);
         if let Some(stamp) = self.info.stamp {
             parts.push(stamp.time());
         }
         if self.info.pinned {
-            parts.push("置顶".into());
+            parts.push(if compact { "顶" } else { "置顶" }.into());
         }
         if self.info.edited {
-            parts.push("已编辑".into());
+            parts.push(if compact { "编辑" } else { "已编辑" }.into());
         }
         match &self.info.sending {
-            Sending::Pending => parts.push("发送中".into()),
-            Sending::Failed { .. } => parts.push("发送失败".into()),
+            Sending::Pending => parts.push(if compact { "…" } else { "发送中" }.into()),
+            Sending::Failed { .. } => parts.push(if compact { "失败" } else { "发送失败" }.into()),
             Sending::Sent if self.outgoing => {
                 parts.push(if self.id > 0 && self.id <= read_outbox {
-                    "✓✓ 已读".into()
+                    if compact { "✓✓" } else { "✓✓ 已读" }.into()
                 } else {
-                    "✓ 已发送".into()
+                    if compact { "✓" } else { "✓ 已发送" }.into()
                 })
             }
             _ => {}
@@ -176,6 +372,13 @@ pub enum MediaKind {
     Sticker,
     Document,
     Video,
+    Voice,
+}
+
+impl MediaKind {
+    pub fn is_large_file(self) -> bool {
+        matches!(self, Self::Document | Self::Video | Self::Voice)
+    }
 }
 
 #[derive(Clone)]
@@ -212,9 +415,17 @@ pub struct Sticker {
 
 type ChatOrder = BTreeSet<(Reverse<i64>, Reverse<i64>)>;
 
+struct ChatAction {
+    chat: i64,
+    sender: Sender,
+    label: &'static str,
+    expires: Instant,
+}
+
 #[derive(Default)]
 pub struct Store {
     chats: HashMap<i64, Chat>,
+    unlisted_chats: VecDeque<i64>,
     ordered: HashMap<ChatList, ChatOrder>,
     pub selected_list: ChatList,
     pub folders: Vec<ChatFolder>,
@@ -223,6 +434,7 @@ pub struct Store {
     pub active_chat: Option<i64>,
     pub messages: Vec<Message>,
     pub search_results: Vec<Message>,
+    pub global_chat_results: Vec<ChatSummary>,
     pub recent_stickers: Vec<Sticker>,
     pub favorite_stickers: Vec<Sticker>,
     pub installed_sticker_sets: Vec<(i64, String)>,
@@ -230,6 +442,8 @@ pub struct Store {
     pub sticker_results: Vec<Sticker>,
     pub sticker_search_tag: String,
     pub history_exhausted: bool,
+    pub context_window: bool,
+    chat_actions: VecDeque<ChatAction>,
     sender_names: HashMap<Sender, String>,
     recent_senders: VecDeque<Sender>,
     requested_senders: HashSet<Sender>,
@@ -275,11 +489,108 @@ impl Store {
             return false;
         }
         self.selected_list = list;
+        for chat in self.chats.values_mut() {
+            chat.pinned = chat.pinned_lists.contains(&list);
+        }
         true
     }
 
     pub fn chat(&self, id: i64) -> Option<&Chat> {
         self.chats.get(&id)
+    }
+
+    pub fn chat_mut_by_id(&mut self, id: i64) -> Option<&mut Chat> {
+        self.chats.get_mut(&id)
+    }
+
+    pub fn quick_switch_entries(&self, query: &str) -> Vec<(i64, String, String, bool)> {
+        let needle = query.trim().to_lowercase();
+        type Rank = (u8, Reverse<i64>, Reverse<i64>);
+        type Entry = (i64, String, String, bool);
+        let mut ranked: Vec<(Rank, Entry)> = Vec::new();
+        let mut insert = |key, id, title: &str, subtitle: &str, remote| {
+            let index = ranked.partition_point(|(other, ..)| *other < key);
+            if index < 32 {
+                if ranked.len() == 32 {
+                    ranked.pop();
+                }
+                ranked.insert(
+                    index,
+                    (key, (id, title.to_owned(), subtitle.to_owned(), remote)),
+                );
+            }
+        };
+        let matching = |title: &str, username: &str, preview: &str| {
+            let title = title.to_lowercase();
+            let user = username.trim_start_matches('@').to_lowercase();
+            let username_query = needle.trim_start_matches('@');
+            if title == needle || (!username_query.is_empty() && user.starts_with(username_query)) {
+                0
+            } else if title.starts_with(&needle) {
+                1
+            } else if title.contains(&needle)
+                || (!username_query.is_empty() && user.contains(username_query))
+            {
+                2
+            } else if preview.to_lowercase().contains(&needle) {
+                4
+            } else {
+                5
+            }
+        };
+        for (&id, chat) in &self.chats {
+            let remote =
+                !needle.is_empty() && self.global_chat_results.iter().any(|item| item.id == id);
+            let rank = if needle.is_empty() {
+                if chat.pinned {
+                    0
+                } else if chat.unread > 0 {
+                    1
+                } else {
+                    2
+                }
+            } else {
+                matching(&chat.title, &chat.username, &chat.preview).min(if remote { 3 } else { 5 })
+            };
+            if rank == 5 {
+                continue;
+            }
+            let order = chat.orders.get(&ChatList::Main).copied().unwrap_or(0);
+            let sub = if chat.username.is_empty() {
+                chat.preview.clone()
+            } else {
+                format!("@{} · {}", chat.username, chat.preview)
+            };
+            insert(
+                (rank, Reverse(order), Reverse(id)),
+                id,
+                &chat.title,
+                &sub,
+                remote && rank == 3,
+            );
+        }
+        if !needle.is_empty() {
+            for remote in &self.global_chat_results {
+                if !self.chats.contains_key(&remote.id) {
+                    let rank = matching(&remote.title, &remote.username, &remote.subtitle).min(3);
+                    insert(
+                        (rank, Reverse(0), Reverse(remote.id)),
+                        remote.id,
+                        &remote.title,
+                        &remote.subtitle,
+                        true,
+                    );
+                }
+            }
+        }
+        ranked.into_iter().map(|(_, entry)| entry).collect()
+    }
+
+    pub fn has_chat_title(&self, id: i64) -> bool {
+        self.chats
+            .get(&id)
+            .is_some_and(|chat| !chat.title.is_empty())
+            || self.sender_names.contains_key(&Sender::Chat(id))
     }
 
     pub fn chat_title(&self, id: i64) -> String {
@@ -313,15 +624,34 @@ impl Store {
         }
     }
 
+    pub fn forward_label(&self, origin: &ForwardOrigin) -> String {
+        match origin {
+            ForwardOrigin::Sender(sender) => self
+                .sender_names
+                .get(sender)
+                .cloned()
+                .unwrap_or_else(|| match sender {
+                    Sender::Chat(id) => self.chat_title(*id),
+                    Sender::User(id) => format!("用户 {id}"),
+                })
+                .chars()
+                .take(80)
+                .collect(),
+            ForwardOrigin::Hidden(name) => name.clone(),
+        }
+    }
+
     // Only resolve senders in the bounded active message window. Never fetch group members.
     pub fn sender_requests(&mut self) -> Vec<(Sender, Value)> {
-        if self.requested_senders.len() > 1024 {
+        if self.requested_senders.len() >= 1024 {
             self.requested_senders.retain(|sender| {
                 self.messages
                     .iter()
                     .chain(&self.search_results)
-                    .any(|message| message.sender == Some(*sender))
+                    .any(|message| message.sender == Some(*sender)
+                        || matches!(message.info.forwarded_from, Some(ForwardOrigin::Sender(origin)) if origin == *sender))
                     || self.active_chat.map(Sender::Chat) == Some(*sender)
+                    || self.chat_actions.iter().any(|action| action.sender == *sender)
             });
         }
         let active = self
@@ -334,17 +664,30 @@ impl Store {
             })
             .map(Sender::Chat);
         let mut requests = Vec::new();
-        for sender in active.into_iter().chain(
-            self.messages
-                .iter()
-                .chain(&self.search_results)
-                .filter(|message| !message.outgoing)
-                .filter_map(|message| message.sender),
-        ) {
+        for sender in active
+            .into_iter()
+            .chain(self.chat_actions.iter().map(|action| action.sender))
+            .chain(
+                self.messages
+                    .iter()
+                    .chain(&self.search_results)
+                    .flat_map(|message| {
+                        let sender = message.sender.filter(|_| !message.outgoing);
+                        let origin = match message.info.forwarded_from {
+                            Some(ForwardOrigin::Sender(sender)) => Some(sender),
+                            _ => None,
+                        };
+                        sender.into_iter().chain(origin)
+                    }),
+            )
+        {
             if self.sender_names.contains_key(&sender)
                 || matches!(sender, Sender::Chat(id) if self.chats.get(&id).is_some_and(|chat| !chat.title.is_empty()))
             {
                 continue;
+            }
+            if self.requested_senders.len() >= 1024 {
+                break;
             }
             if self.requested_senders.insert(sender) {
                 requests.push((sender, sender.request()));
@@ -374,12 +717,25 @@ impl Store {
                 self.sender_names.remove(&old);
             }
         }
-        changed
+        let mut typing_changed = false;
+        if changed {
+            let chats: Vec<_> = self
+                .chat_actions
+                .iter()
+                .filter(|action| action.sender == sender)
+                .map(|action| action.chat)
+                .collect();
+            for id in chats {
+                typing_changed |= self.refresh_typing(id);
+            }
+        }
+        typing_changed || changed
             && (self
                 .messages
                 .iter()
                 .chain(&self.search_results)
-                .any(|message| message.sender == Some(sender))
+                .any(|message| message.sender == Some(sender)
+                    || matches!(message.info.forwarded_from, Some(ForwardOrigin::Sender(origin)) if origin == sender))
                 || self.active_chat.map(Sender::Chat) == Some(sender))
     }
 
@@ -389,8 +745,256 @@ impl Store {
             self.messages.clear();
             self.search_results.clear();
             self.history_exhausted = false;
+            self.context_window = false;
             self.requested_senders.clear();
         }
+    }
+
+    fn apply_chat_action(&mut self, update: &Value, now: Instant) -> bool {
+        let (Some(chat), Some(sender)) = (
+            update["chat_id"].as_i64(),
+            Sender::parse(&update["sender_id"]),
+        ) else {
+            return false;
+        };
+        if !self.chats.contains_key(&chat) {
+            return false;
+        }
+        let label = match kind(&update["action"]) {
+            "chatActionTyping" => "正在输入…",
+            "chatActionUploadingPhoto" => "正在发送图片…",
+            "chatActionUploadingDocument" => "正在发送文件…",
+            "chatActionUploadingVideo" => "正在发送视频…",
+            "chatActionRecordingVoiceNote" => "正在录制语音…",
+            "chatActionChoosingSticker" => "正在选贴纸…",
+            _ => "",
+        };
+        self.chat_actions
+            .retain(|action| (action.chat, action.sender) != (chat, sender));
+        let mut changed = false;
+        if !label.is_empty() {
+            if self.chat_actions.len() == 128
+                && let Some(old) = self.chat_actions.pop_front()
+            {
+                changed |= self.refresh_typing(old.chat);
+            }
+            self.chat_actions.push_back(ChatAction {
+                chat,
+                sender,
+                label,
+                expires: now + Duration::from_secs(5),
+            });
+        }
+        self.refresh_typing(chat) || changed
+    }
+
+    fn refresh_typing(&mut self, id: i64) -> bool {
+        let Some(chat) = self.chats.get(&id) else {
+            return false;
+        };
+        let typing = self
+            .chat_actions
+            .iter()
+            .rev()
+            .find(|action| action.chat == id)
+            .map_or_else(String::new, |action| {
+                if matches!(
+                    chat.peer,
+                    Some(ChatPeer::BasicGroup(_) | ChatPeer::Supergroup(_))
+                ) {
+                    let name = self
+                        .sender_names
+                        .get(&action.sender)
+                        .cloned()
+                        .unwrap_or_else(|| match action.sender {
+                            Sender::Chat(id) => self.chat_title(id),
+                            Sender::User(id) => format!("用户 {id}"),
+                        });
+                    format!(
+                        "{} {}",
+                        name.chars().take(48).collect::<String>(),
+                        action.label
+                    )
+                } else {
+                    action.label.to_owned()
+                }
+            });
+        let chat = self.chats.get_mut(&id).expect("chat");
+        if chat.typing == typing {
+            return false;
+        }
+        chat.typing = typing;
+        true
+    }
+
+    pub fn typing_deadline(&self) -> Option<Instant> {
+        self.chat_actions.front().map(|action| action.expires)
+    }
+
+    pub fn expire_typing(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        while self
+            .typing_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            let id = self.chat_actions.pop_front().expect("expired action").chat;
+            changed |= self.refresh_typing(id);
+        }
+        changed
+    }
+
+    pub fn remote_chat_summary(&self, id: i64, value: &Value) -> Option<ChatSummary> {
+        let (title, subtitle, username) = if let Some(chat) = self.chat(id) {
+            (
+                chat.title.clone(),
+                chat.preview.chars().take(160).collect(),
+                chat.username.clone(),
+            )
+        } else if value["id"].as_i64() == Some(id) && kind(value) == "chat" {
+            (
+                bounded_text(value.get("title"), 128),
+                preview(value.get("last_message"))
+                    .chars()
+                    .take(160)
+                    .collect(),
+                bounded_text(
+                    value
+                        .pointer("/usernames/active_usernames/0")
+                        .or_else(|| value.get("username")),
+                    64,
+                ),
+            )
+        } else {
+            return None;
+        };
+        Some(ChatSummary {
+            id,
+            title,
+            subtitle,
+            username,
+        })
+    }
+
+    pub fn extend_context(&mut self, values: &[Value], from: i64) -> bool {
+        let active = self.active_chat;
+        let mut count = 0;
+        let mut newest = from;
+        // TDLib returns newest first. Insert in chronological order so trimming retains the newer edge.
+        for value in values.iter().take(50).rev() {
+            if value["chat_id"].as_i64() != active {
+                continue;
+            }
+            count += 1;
+            if let Some(id) = value["id"].as_i64().filter(|id| *id > from) {
+                newest = newest.max(id);
+                self.add_message(value, false);
+            }
+        }
+        let latest = active
+            .and_then(|chat| self.chat(chat))
+            .map_or(0, |chat| chat.latest_message_id);
+        if (latest > 0 && newest >= latest) || (latest == 0 && count < 50) {
+            self.context_window = false;
+        }
+        newest > from
+    }
+
+    pub fn merge_open_chat(&mut self, id: i64, value: &Value, fresh_draft: bool) {
+        let Some(chat) = self.chats.get_mut(&id) else {
+            self.add_chat(value);
+            return;
+        };
+        if let Some(peer) = parse_peer(value) {
+            chat.peer = Some(peer);
+        }
+        for (field, target) in [
+            ("unread_count", &mut chat.unread),
+            ("last_read_inbox_message_id", &mut chat.read_inbox),
+            ("last_read_outbox_message_id", &mut chat.read_outbox),
+        ] {
+            if let Some(value) = value[field].as_i64() {
+                *target = value;
+            }
+        }
+        if let Some(id) = value.pointer("/last_message/id").and_then(Value::as_i64) {
+            chat.latest_message_id = chat.latest_message_id.max(id);
+        }
+        if let Some(settings) = value.get("notification_settings") {
+            chat.notifications = NotificationSettings::parse(settings);
+            chat.muted = integer(settings.get("mute_for")) > 0;
+        }
+        if let Some(pin) = value.get("pinned_message") {
+            chat.pinned_message = parse_pin_banner(pin);
+        }
+        if fresh_draft && value.get("draft_message").is_some() {
+            chat.draft_preview = bounded_text(
+                value.pointer("/draft_message/input_message_text/text/text"),
+                160,
+            );
+        }
+    }
+
+    pub fn replace_context(&mut self, values: &[Value], target: i64) -> bool {
+        // TDLib returns newest first. Reserve the target before filling around it.
+        let Some(origin) = values.iter().position(|value| {
+            value["chat_id"].as_i64() == self.active_chat && value["id"].as_i64() == Some(target)
+        }) else {
+            return false;
+        };
+        let Some(message) = parse_message(&values[origin]) else {
+            return false;
+        };
+        let budget = 6 * 1024 * 1024;
+        let mut bytes = message.retained_bytes();
+        if bytes > budget {
+            return false;
+        }
+        self.messages.clear();
+        self.messages.push(message);
+        for distance in 1..values.len().min(500) {
+            for index in [origin.checked_sub(distance), origin.checked_add(distance)]
+                .into_iter()
+                .flatten()
+            {
+                if self.messages.len() >= 500 {
+                    break;
+                }
+                if let Some(value) = values.get(index)
+                    && value["chat_id"].as_i64() == self.active_chat
+                    && let Some(message) = parse_message(value)
+                    && message.id != target
+                {
+                    bytes += message.retained_bytes();
+                    if bytes > budget {
+                        bytes -= message.retained_bytes();
+                        break;
+                    }
+                    self.messages.push(message);
+                }
+            }
+        }
+        self.messages.sort_unstable_by_key(|message| message.id);
+        self.messages.dedup_by_key(|message| message.id);
+        self.context_window = true;
+        self.history_exhausted = false;
+        true
+    }
+
+    pub fn set_pin_banner(&mut self, chat_id: i64, value: Option<&Value>) -> bool {
+        let Some(chat) = self.chats.get_mut(&chat_id) else {
+            return false;
+        };
+        let banner = value.and_then(|message| {
+            Some(PinnedBanner {
+                id: message["id"].as_i64()?,
+                excerpt: preview(Some(message)).chars().take(120).collect(),
+            })
+        });
+        if chat.pinned_message == banner {
+            return false;
+        }
+        chat.pinned_message = banner;
+        true
     }
 
     pub fn oldest_message_id(&self) -> Option<i64> {
@@ -406,6 +1010,9 @@ impl Store {
                 | "updateChatTitle"
                 | "updateChatReadInbox"
                 | "updateChatReadOutbox"
+                | "updateChatNotificationSettings"
+                | "updateChatUnreadMentionCount"
+                | "updateMessageInteractionInfo"
                 | "updateChatPosition"
                 | "updateChatLastMessage"
                 | "updateChatDraftMessage"
@@ -461,7 +1068,7 @@ impl Store {
             }
             "chat" => {
                 if let Some(id) = update.get("id").and_then(Value::as_i64) {
-                    let title = string(update.get("title"));
+                    let title = bounded_text(update.get("title"), 128);
                     if let Some(chat) = self.chats.get_mut(&id) {
                         chat.title = title.clone();
                     }
@@ -495,8 +1102,19 @@ impl Store {
                     .retain(|list, _| lists.iter().any(|(candidate, _)| candidate == list));
                 self.exhausted_lists
                     .retain(|list| lists.iter().any(|(candidate, _)| candidate == list));
+                for chat in self.chats.values_mut() {
+                    chat.orders
+                        .retain(|list, _| lists.iter().any(|(candidate, _)| candidate == list));
+                    chat.pinned_lists
+                        .retain(|list| lists.iter().any(|(candidate, _)| candidate == list));
+                }
+                self.chats.retain(|id, chat| {
+                    !chat.orders.is_empty()
+                        || Some(*id) == self.active_chat
+                        || self.unlisted_chats.contains(id)
+                });
                 if !lists.iter().any(|(list, _)| *list == self.selected_list) {
-                    self.selected_list = ChatList::Main;
+                    self.select_list(ChatList::Main);
                 }
             }
             "error" if integer(update.get("code")) == 404 => {
@@ -519,15 +1137,17 @@ impl Store {
             }
             "updateChatTitle" => {
                 if let Some(chat) = self.chat_mut(update) {
-                    chat.title = string(update.get("title"));
+                    chat.title = bounded_text(update.get("title"), 128);
                 }
                 if let Some(id) = update.get("chat_id").and_then(Value::as_i64) {
-                    self.save_sender(Sender::Chat(id), string(update.get("title")));
+                    self.save_sender(Sender::Chat(id), bounded_text(update.get("title"), 128));
                 }
             }
             "updateChatReadInbox" => {
                 if let Some(chat) = self.chat_mut(update) {
                     chat.unread = integer(update.get("unread_count"));
+                    let read_id = integer(update.get("last_read_inbox_message_id"));
+                    chat.read_inbox = read_id;
                 }
             }
             "updateChatReadOutbox" => {
@@ -535,17 +1155,35 @@ impl Store {
                     chat.read_outbox = integer(update.get("last_read_outbox_message_id"));
                 }
             }
+            "updateChatNotificationSettings" => {
+                if let Some(chat) = self.chat_mut(update) {
+                    chat.muted = integer(update.pointer("/notification_settings/mute_for")) > 0;
+                    chat.notifications =
+                        NotificationSettings::parse(&update["notification_settings"]);
+                }
+            }
+            "updateChatUnreadMentionCount" => {
+                if let Some(chat) = self.chat_mut(update) {
+                    chat.mention_count = integer(update.get("unread_mention_count"));
+                }
+            }
             "updateChatPosition" => {
                 if let Some(id) = update.get("chat_id").and_then(Value::as_i64)
                     && let Some(position) = update.get("position")
                     && let Some(list) = position.get("list").and_then(ChatList::from_json)
                 {
-                    self.set_order(id, list, integer(position.get("order")));
+                    self.set_position(id, list, position);
+                    self.track_unlisted_chat(id);
                 }
             }
             "updateChatLastMessage" => {
                 if let Some(chat) = self.chat_mut(update) {
                     chat.preview = preview(update.get("last_message"));
+                    chat.latest_message_id = integer(update.pointer("/last_message/id"));
+                    chat.last_stamp = update
+                        .pointer("/last_message/date")
+                        .map(|d| integer(Some(d)))
+                        .and_then(crate::calendar::local);
                 }
                 if let Some(id) = update.get("chat_id").and_then(Value::as_i64)
                     && let Some(positions) = update.get("positions").and_then(Value::as_array)
@@ -554,13 +1192,34 @@ impl Store {
                 }
             }
             "updateChatDraftMessage" => {
+                if let Some(chat) = self.chat_mut(update) {
+                    chat.draft_preview = bounded_text(
+                        update.pointer("/draft_message/input_message_text/text/text"),
+                        160,
+                    );
+                }
                 if let Some(id) = update.get("chat_id").and_then(Value::as_i64)
                     && let Some(positions) = update.get("positions").and_then(Value::as_array)
                 {
                     self.replace_positions(id, positions);
                 }
             }
-            "message" => self.add_message(update, false),
+            "updateChatAction" => return self.apply_chat_action(update, Instant::now()),
+            "updateMessageInteractionInfo" => {
+                if update["chat_id"].as_i64() == self.active_chat {
+                    let id = integer(update.get("message_id"));
+                    let reactions = parse_reactions(update.get("interaction_info"));
+                    for message in self
+                        .messages
+                        .iter_mut()
+                        .chain(&mut self.search_results)
+                        .filter(|m| m.id == id)
+                    {
+                        message.info.reactions = reactions.clone();
+                    }
+                }
+            }
+            "message" if !self.context_window => self.add_message(update, false),
             "updateNewMessage" | "updateMessageSendSucceeded" => {
                 if kind(update) == "updateMessageSendSucceeded"
                     && update["message"]["chat_id"].as_i64() == self.active_chat
@@ -570,7 +1229,28 @@ impl Store {
                     self.messages.retain(|message| message.id != old_id);
                 }
                 if let Some(message) = update.get("message") {
-                    self.add_message(message, false);
+                    if let Some(chat) = self.chat_mut(message) {
+                        chat.latest_message_id =
+                            chat.latest_message_id.max(integer(message.get("id")));
+                    }
+                    if update_kind == "updateNewMessage"
+                        && let (Some(chat), Some(sender)) = (
+                            message["chat_id"].as_i64(),
+                            Sender::parse(&message["sender_id"]),
+                        )
+                    {
+                        self.chat_actions
+                            .retain(|action| (action.chat, action.sender) != (chat, sender));
+                        self.refresh_typing(chat);
+                    }
+                    if !self.context_window
+                        || self.messages.iter().any(|current| {
+                            Some(current.id) == message["id"].as_i64()
+                                || Some(current.id) == update["old_message_id"].as_i64()
+                        })
+                    {
+                        self.add_message(message, false);
+                    }
                 }
             }
             "updateMessageSendFailed" => {
@@ -592,13 +1272,14 @@ impl Store {
                 }
             }
             "updateMessageEdited" | "updateMessageIsPinned" => {
-                if update["chat_id"].as_i64() == self.active_chat {
-                    let id = integer(update.get("message_id"));
+                let chat_id = integer(update.get("chat_id"));
+                let id = integer(update.get("message_id"));
+                if Some(chat_id) == self.active_chat {
                     for message in self
                         .messages
                         .iter_mut()
                         .chain(&mut self.search_results)
-                        .filter(|m| m.id == id)
+                        .filter(|message| message.id == id)
                     {
                         if update_kind == "updateMessageEdited" {
                             message.info.edited = integer(update.get("edit_date")) > 0;
@@ -607,9 +1288,43 @@ impl Store {
                         }
                     }
                 }
+                if update_kind == "updateMessageIsPinned"
+                    && let Some(chat) = self.chats.get_mut(&chat_id)
+                {
+                    if update["is_pinned"] == true
+                        && Some(chat_id) == self.active_chat
+                        && let Some(message) = self
+                            .messages
+                            .iter()
+                            .chain(&self.search_results)
+                            .find(|message| message.id == id)
+                    {
+                        chat.pinned_message = Some(PinnedBanner {
+                            id,
+                            excerpt: message.text.chars().take(120).collect(),
+                        });
+                    } else if update["is_pinned"] == false
+                        && chat
+                            .pinned_message
+                            .as_ref()
+                            .is_some_and(|banner| banner.id == id)
+                    {
+                        chat.pinned_message = None;
+                    }
+                }
             }
             "updateMessageContent" => {
                 let id = integer(update.get("message_id"));
+                if let Some(banner) = self
+                    .chat_mut(update)
+                    .and_then(|chat| chat.pinned_message.as_mut())
+                    && banner.id == id
+                {
+                    banner.excerpt = content_text(update.get("new_content"))
+                        .chars()
+                        .take(120)
+                        .collect();
+                }
                 if update.get("chat_id").and_then(Value::as_i64) == self.active_chat {
                     for message in self
                         .messages
@@ -617,15 +1332,28 @@ impl Store {
                         .chain(&mut self.search_results)
                         .filter(|message| message.id == id)
                     {
-                        message.text = content_text(update.get("new_content"));
+                        let new_content = update.get("new_content");
+                        message.text = content_text(new_content);
                         message.info.text_message = kind(&update["new_content"]) == "messageText";
-                        message.media = update.get("new_content").and_then(media_ref);
+                        message.info.entities = parse_entities(new_content, &message.text);
+                        message.info.media_meta = new_content.and_then(parse_media_meta);
+                        message.media = new_content.and_then(media_ref);
                     }
                     trim_messages(&mut self.messages, 6 * 1024 * 1024, false);
                     trim_messages(&mut self.search_results, 2 * 1024 * 1024, true);
                 }
             }
             "updateDeleteMessages" => {
+                if update["from_cache"] != true
+                    && let Some(chat) = self.chat_mut(update)
+                    && chat.pinned_message.as_ref().is_some_and(|pin| {
+                        update["message_ids"]
+                            .as_array()
+                            .is_some_and(|ids| ids.iter().any(|id| id.as_i64() == Some(pin.id)))
+                    })
+                {
+                    chat.pinned_message = None;
+                }
                 if update.get("chat_id").and_then(Value::as_i64) == self.active_chat
                     && let Some(ids) = update.get("message_ids").and_then(Value::as_array)
                 {
@@ -648,7 +1376,7 @@ impl Store {
                 }
                 if let Some(id) = extra
                     .strip_prefix("history:")
-                    .and_then(|s| s.parse::<i64>().ok())
+                    .and_then(|s| s.split(':').next()?.parse::<i64>().ok())
                     && Some(id) == self.active_chat
                     && let Some(messages) = update.get("messages").and_then(Value::as_array)
                 {
@@ -666,7 +1394,7 @@ impl Store {
                 let extra = update.get("@extra").and_then(Value::as_str).unwrap_or("");
                 if let Some(id) = extra
                     .strip_prefix("search:")
-                    .and_then(|value| value.parse::<i64>().ok())
+                    .and_then(|s| s.split(':').next()?.parse::<i64>().ok())
                     && Some(id) == self.active_chat
                 {
                     self.search_results = update
@@ -674,8 +1402,9 @@ impl Store {
                         .and_then(Value::as_array)
                         .into_iter()
                         .flatten()
+                        .filter(|message| message["chat_id"].as_i64() == self.active_chat)
+                        .take(50)
                         .filter_map(parse_message)
-                        .take(100)
                         .collect();
                     trim_messages(&mut self.search_results, 2 * 1024 * 1024, true);
                 }
@@ -753,29 +1482,73 @@ impl Store {
         self.chats.get_mut(&id)
     }
 
-    fn add_chat(&mut self, value: &Value) {
+    pub fn add_chat(&mut self, value: &Value) {
         let Some(id) = value.get("id").and_then(Value::as_i64) else {
             return;
         };
-        self.replace_positions(id, &[]);
+        self.clear_positions(id);
         self.chats.insert(
             id,
             Chat {
                 id,
-                title: string(value.get("title")),
+                title: bounded_text(value.get("title"), 128),
                 unread: integer(value.get("unread_count")),
                 preview: preview(value.get("last_message")),
                 read_outbox: integer(value.get("last_read_outbox_message_id")),
+                read_inbox: integer(value.get("last_read_inbox_message_id")),
+                latest_message_id: integer(value.pointer("/last_message/id")),
+                last_stamp: value
+                    .pointer("/last_message/date")
+                    .map(|d| integer(Some(d)))
+                    .and_then(crate::calendar::local),
+                pinned: false,
+                muted: integer(value.pointer("/notification_settings/mute_for")) > 0,
+                mention_count: integer(value.get("unread_mention_count")),
+                draft_preview: bounded_text(
+                    value.pointer("/draft_message/input_message_text/text/text"),
+                    160,
+                ),
+                typing: bounded_text(value.get("typing"), 64),
+                subtitle: bounded_text(value.get("subtitle"), 96),
+                username: bounded_text(value.get("username"), 64),
+                bio: bounded_text(value.get("bio"), 512),
+                pinned_message: value.get("pinned_message").and_then(parse_pin_banner),
+                notifications: NotificationSettings::parse(&value["notification_settings"]),
+                peer: parse_peer(value),
                 orders: HashMap::new(),
+                pinned_lists: HashSet::new(),
             },
         );
-        self.save_sender(Sender::Chat(id), string(value.get("title")));
+        self.save_sender(Sender::Chat(id), bounded_text(value.get("title"), 128));
         if let Some(positions) = value.get("positions").and_then(Value::as_array) {
             self.replace_positions(id, positions);
+        } else {
+            self.track_unlisted_chat(id);
         }
     }
 
-    fn replace_positions(&mut self, id: i64, positions: &[Value]) {
+    fn track_unlisted_chat(&mut self, id: i64) {
+        self.unlisted_chats.retain(|candidate| *candidate != id);
+        if self
+            .chats
+            .get(&id)
+            .is_none_or(|chat| !chat.orders.is_empty())
+        {
+            return;
+        }
+        self.unlisted_chats.push_back(id);
+        if self.unlisted_chats.len() > 64
+            && let Some(index) = self
+                .unlisted_chats
+                .iter()
+                .position(|old| Some(*old) != self.active_chat)
+            && let Some(old) = self.unlisted_chats.remove(index)
+        {
+            self.chats.remove(&old);
+        }
+    }
+
+    fn clear_positions(&mut self, id: i64) {
         let previous: Vec<_> = self
             .chats
             .get(&id)
@@ -784,9 +1557,42 @@ impl Store {
         for list in previous {
             self.set_order(id, list, 0);
         }
+        if let Some(chat) = self.chats.get_mut(&id) {
+            chat.pinned_lists.clear();
+            chat.pinned = false;
+        }
+    }
+
+    fn replace_positions(&mut self, id: i64, positions: &[Value]) {
+        self.clear_positions(id);
         for position in positions {
             if let Some(list) = position.get("list").and_then(ChatList::from_json) {
-                self.set_order(id, list, integer(position.get("order")));
+                self.set_position(id, list, position);
+            }
+        }
+        self.track_unlisted_chat(id);
+    }
+
+    fn set_position(&mut self, id: i64, list: ChatList, position: &Value) {
+        let order = integer(position.get("order"));
+        self.set_order(id, list, order);
+        self.set_chat_pinned(id, list, order > 0 && position["is_pinned"] == true);
+    }
+
+    pub fn chat_pinned(&self, id: i64, list: ChatList) -> bool {
+        self.chat(id)
+            .is_some_and(|chat| chat.pinned_lists.contains(&list))
+    }
+
+    pub fn set_chat_pinned(&mut self, id: i64, list: ChatList, pinned: bool) {
+        if let Some(chat) = self.chats.get_mut(&id) {
+            if pinned {
+                chat.pinned_lists.insert(list);
+            } else {
+                chat.pinned_lists.remove(&list);
+            }
+            if list == self.selected_list {
+                chat.pinned = pinned;
             }
         }
     }
@@ -829,9 +1635,29 @@ impl Store {
         trim_messages(&mut self.messages, 6 * 1024 * 1024, from_history);
     }
 
-    fn update_file(&mut self, file: &Value) -> bool {
+    pub fn set_downloading(&mut self, id: i32, downloading: bool) {
+        for message in self.messages.iter_mut().chain(&mut self.search_results) {
+            if message
+                .media
+                .as_ref()
+                .is_some_and(|media| media.file_id == id)
+                && let Some(meta) = &mut message.info.media_meta
+            {
+                meta.downloading = downloading;
+            }
+        }
+    }
+
+    pub fn update_file(&mut self, file: &Value) -> bool {
         let id = integer(file.get("id")) as i32;
         let path = local_path(file);
+        let size = file["size"]
+            .as_u64()
+            .filter(|size| *size > 0)
+            .or_else(|| file["expected_size"].as_u64())
+            .unwrap_or_default();
+        let downloaded = integer(file.pointer("/local/downloaded_size")).max(0) as u64;
+        let downloading = file.pointer("/local/is_downloading_active") == Some(&Value::Bool(true));
         let mut changed = false;
         for message in self
             .messages
@@ -839,9 +1665,23 @@ impl Store {
             .chain(self.search_results.iter_mut())
         {
             if let Some(media) = &mut message.media {
-                if media.file_id == id && media.path != path {
-                    media.path = path.clone();
-                    changed = true;
+                if media.file_id == id {
+                    if media.path != path {
+                        media.path = path.clone();
+                        changed = true;
+                    }
+                    if let Some(meta) = &mut message.info.media_meta
+                        && (meta.downloaded_bytes != downloaded
+                            || meta.downloading != downloading
+                            || (size > 0 && meta.size_bytes != size))
+                    {
+                        if size > 0 {
+                            meta.size_bytes = size;
+                        }
+                        meta.downloaded_bytes = downloaded;
+                        meta.downloading = downloading;
+                        changed = true;
+                    }
                 }
                 if let Some(detail) = &mut media.detail
                     && detail.file_id == id
@@ -868,17 +1708,64 @@ impl Store {
     }
 }
 
+fn parse_peer(value: &Value) -> Option<ChatPeer> {
+    let peer = &value["type"];
+    Some(match kind(peer) {
+        "chatTypePrivate" | "chatTypeSecret" => ChatPeer::Private(peer["user_id"].as_i64()?),
+        "chatTypeBasicGroup" => ChatPeer::BasicGroup(peer["basic_group_id"].as_i64()?),
+        "chatTypeSupergroup" => ChatPeer::Supergroup(peer["supergroup_id"].as_i64()?),
+        _ => return None,
+    })
+}
+
+fn parse_pin_banner(value: &Value) -> Option<PinnedBanner> {
+    Some(PinnedBanner {
+        id: value["id"].as_i64()?,
+        excerpt: if value.get("excerpt").is_some() {
+            bounded_text(value.get("excerpt"), 120)
+        } else {
+            preview(Some(value)).chars().take(120).collect()
+        },
+    })
+}
+
+fn parse_forward_origin(value: &Value) -> Option<ForwardOrigin> {
+    Some(match kind(value) {
+        "messageOriginUser" => {
+            ForwardOrigin::Sender(Sender::User(value["sender_user_id"].as_i64()?))
+        }
+        "messageOriginChat" => {
+            ForwardOrigin::Sender(Sender::Chat(value["sender_chat_id"].as_i64()?))
+        }
+        "messageOriginChannel" => ForwardOrigin::Sender(Sender::Chat(value["chat_id"].as_i64()?)),
+        "messageOriginHiddenUser" => {
+            ForwardOrigin::Hidden(bounded_text(value.get("sender_name"), 80))
+        }
+        _ => return None,
+    })
+}
+
+pub fn search_message_preview(value: &Value) -> String {
+    preview(Some(value)).chars().take(160).collect()
+}
+
 fn parse_message(value: &Value) -> Option<Message> {
+    let text = content_text(value.get("content"));
+    let content = value.get("content");
+    let entities = parse_entities(content, &text);
+    let media = content.and_then(media_ref);
+    let media_meta = content.and_then(parse_media_meta);
+    let reactions = parse_reactions(value.get("interaction_info"));
     Some(Message {
         id: value.get("id")?.as_i64()?,
-        text: content_text(value.get("content")),
+        text,
         outgoing: value
             .get("is_outgoing")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         sender: value.get("sender_id").and_then(Sender::parse),
         author_signature: bounded_text(value.get("author_signature"), 128),
-        media: value.get("content").and_then(media_ref),
+        media,
         info: MessageInfo {
             text_message: kind(&value["content"]) == "messageText",
             stamp: crate::calendar::local(integer(value.get("date"))),
@@ -897,6 +1784,7 @@ fn parse_message(value: &Value) -> Option<Message> {
                 },
                 _ => Sending::Sent,
             },
+            forwarded_from: parse_forward_origin(&value["forward_info"]["origin"]),
             reply: value
                 .get("reply_to")
                 .filter(|reply| kind(reply) == "messageReplyToMessage")
@@ -917,7 +1805,145 @@ fn parse_message(value: &Value) -> Option<Message> {
                                 .collect()
                         }),
                 }),
+            reactions,
+            entities,
+            media_meta,
         },
+    })
+}
+
+fn parse_reactions(interaction_info: Option<&Value>) -> Vec<Reaction> {
+    interaction_info
+        .and_then(|info| info.pointer("/reactions/reactions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let count = integer(item.get("total_count")).max(0) as u32;
+            if count == 0 {
+                return None;
+            }
+            let chosen = item["is_chosen"] == true;
+            match item.pointer("/type/@type").and_then(Value::as_str) {
+                Some("reactionTypeCustomEmoji") => {
+                    let custom_id = item
+                        .pointer("/type/custom_emoji_id")
+                        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))?;
+                    Some(Reaction {
+                        emoji: "✦".into(),
+                        custom_emoji_id: Some(custom_id),
+                        count,
+                        chosen,
+                    })
+                }
+                _ => {
+                    let emoji = item
+                        .pointer("/type/emoji")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())?;
+                    Some(Reaction {
+                        emoji: emoji.chars().take(8).collect(),
+                        custom_emoji_id: None,
+                        count,
+                        chosen,
+                    })
+                }
+            }
+        })
+        .take(8)
+        .collect()
+}
+
+fn utf16_to_byte(text: &str, utf16_offset: usize) -> usize {
+    let mut units = 0usize;
+    for (byte_idx, ch) in text.char_indices() {
+        if units >= utf16_offset {
+            return byte_idx;
+        }
+        units += ch.len_utf16();
+    }
+    text.len()
+}
+
+fn parse_entities(content: Option<&Value>, full_text: &str) -> Vec<TextEntity> {
+    let Some(content) = content else {
+        return Vec::new();
+    };
+    let (formatted, prefix_bytes) = match kind(content) {
+        "messageText" => (content.get("text"), 0usize),
+        "messagePhoto" => (content.get("caption"), "[图片] ".len()),
+        "messageVideo" => (content.get("caption"), "[视频] ".len()),
+        _ => return Vec::new(),
+    };
+    let Some(formatted) = formatted else {
+        return Vec::new();
+    };
+    let raw = formatted.get("text").and_then(Value::as_str).unwrap_or("");
+    let Some(list) = formatted.get("entities").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for item in list.iter().take(64) {
+        let offset = integer(item.get("offset")).max(0) as usize;
+        let length = integer(item.get("length")).max(0) as usize;
+        if length == 0 {
+            continue;
+        }
+        let start = prefix_bytes + utf16_to_byte(raw, offset);
+        let end = prefix_bytes + utf16_to_byte(raw, offset + length);
+        if start >= end || end > full_text.len() {
+            continue;
+        }
+        let Some(entity_type) = item.get("type") else {
+            continue;
+        };
+        let kind = match kind(entity_type) {
+            "textEntityTypeBold" => EntityKind::Bold,
+            "textEntityTypeItalic" => EntityKind::Italic,
+            "textEntityTypeCode" => EntityKind::Code,
+            "textEntityTypePre" | "textEntityTypePreCode" => EntityKind::Pre,
+            "textEntityTypeStrikethrough" => EntityKind::Strike,
+            "textEntityTypeSpoiler" => EntityKind::Spoiler,
+            "textEntityTypeUrl" => EntityKind::Url,
+            "textEntityTypeTextUrl" => {
+                EntityKind::TextUrl(bounded_text(entity_type.get("url"), 256))
+            }
+            "textEntityTypeMention" | "textEntityTypeMentionName" => EntityKind::Mention,
+            _ => continue,
+        };
+        result.push(TextEntity { start, end, kind });
+    }
+    result
+}
+
+fn parse_media_meta(content: &Value) -> Option<MediaMeta> {
+    let (file_name, file, duration_secs) = match kind(content) {
+        "messageDocument" => (
+            bounded_text(content.pointer("/document/file_name"), 128),
+            content.pointer("/document/document")?,
+            0u32,
+        ),
+        "messageVideo" => (
+            bounded_text(content.pointer("/video/file_name"), 128),
+            content.pointer("/video/video")?,
+            integer(content.pointer("/video/duration")).max(0) as u32,
+        ),
+        "messageVoiceNote" => (
+            String::new(),
+            content.pointer("/voice_note/voice")?,
+            integer(content.pointer("/voice_note/duration")).max(0) as u32,
+        ),
+        _ => return None,
+    };
+    let size_bytes = integer(file.get("size").or_else(|| file.get("expected_size"))).max(0) as u64;
+    let downloaded_bytes = integer(file.pointer("/local/downloaded_size")).max(0) as u64;
+    let downloading = file.pointer("/local/is_downloading_active") == Some(&Value::Bool(true));
+    Some(MediaMeta {
+        file_name,
+        size_bytes,
+        downloaded_bytes,
+        duration_secs,
+        downloading,
     })
 }
 
@@ -984,6 +2010,7 @@ fn media_ref(content: &Value) -> Option<MediaRef> {
         }
         "messageDocument" => (MediaKind::Document, content.pointer("/document/document")?),
         "messageVideo" => (MediaKind::Video, content.pointer("/video/video")?),
+        "messageVoiceNote" => (MediaKind::Voice, content.pointer("/voice_note/voice")?),
         _ => return None,
     };
     Some(MediaRef {
@@ -1052,7 +2079,12 @@ fn integer(value: Option<&Value>) -> i64 {
 
 fn preview(message: Option<&Value>) -> String {
     message
-        .map(|message| content_text(message.get("content")))
+        .map(|message| {
+            content_text(message.get("content"))
+                .chars()
+                .take(256)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1076,6 +2108,36 @@ fn content_text(content: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn forwarded_origins_use_bounded_names_or_existing_sender_lookup() {
+        let mut store = Store::default();
+        store.open(8);
+        let origins = [
+            json!({"@type":"messageOriginUser","sender_user_id":12}),
+            json!({"@type":"messageOriginChat","sender_chat_id":-10}),
+            json!({"@type":"messageOriginChannel","chat_id":-20}),
+            json!({"@type":"messageOriginHiddenUser","sender_name":"转".repeat(100)}),
+        ];
+        for (index, origin) in origins.into_iter().enumerate() {
+            store.apply(&json!({"@type":"message","chat_id":8,"id":index+1,"is_outgoing":true,
+                "forward_info":{"origin":origin},"content":{"@type":"messageText","text":{"text":"hello"}}}));
+        }
+        let requests = store.sender_requests();
+        for sender in [Sender::User(12), Sender::Chat(-10), Sender::Chat(-20)] {
+            assert!(requests.iter().any(|(key, _)| *key == sender));
+        }
+        store.apply(&json!({"@type":"updateUser","user":{"id":12,"first_name":"小林"}}));
+        let label = |index: usize| {
+            store.forward_label(store.messages[index].info.forwarded_from.as_ref().unwrap())
+        };
+        assert_eq!(label(0), "小林");
+        assert_eq!(label(3).chars().count(), 80);
+        let message = &store.messages[3];
+        let mut without_origin = message.clone();
+        without_origin.info.forwarded_from = None;
+        assert!(message.retained_bytes() >= without_origin.retained_bytes() + 80 * 3);
+    }
 
     #[test]
     fn content_changes_and_deletions_update_history_and_search() {

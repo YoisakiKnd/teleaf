@@ -40,7 +40,8 @@ try:
     settings = click(65,0)
     assert '设置与连接'.encode() in re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', settings)
     # Disable capture using the clickable preference; restore through F6.
-    off = click(30,20)
+    # macOS and Linux show the desktop notification control beneath the mouse row.
+    off = click(30,19)
     assert b'\x1b[?1000l' in off
     on = send(b'\x1b[17~')
     assert b'\x1b[?1000h' in on

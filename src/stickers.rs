@@ -220,7 +220,7 @@ pub fn download_visible(app: &mut App, worker: &TdWorker) {
         }
         if !send_request(app, worker, actions::download(id)) {
             app.requested_files.remove(&id);
-            app.failed_files.insert(id);
+            app.mark_file_failed(id);
         }
     }
 }

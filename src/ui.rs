@@ -31,6 +31,7 @@ pub(crate) enum Editor {
     AttachmentPath,
     AttachmentCaption,
     StickerSearch,
+    QuickSwitch,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,6 +70,24 @@ pub(crate) enum Action {
     Help,
     ToggleMouse,
     ToggleNotifications,
+    CycleTheme,
+    QuickSwitch,
+    ChatInfo,
+    ToggleMute,
+    TogglePin,
+    DismissPinBanner,
+    ToggleMultiSelect,
+    MultiCopy,
+    MultiForward,
+    MultiDelete,
+    MultiClear,
+    OpenMessageLink,
+    JumpToMessage,
+    QuickReact(usize),
+    CycleMediaFilter,
+    CleanStorage,
+    ConfirmStorage,
+    CancelStorage,
     NextField,
     NewLogin,
     Folders,
@@ -92,6 +111,11 @@ pub(crate) enum Target {
     MessageAction(i64, Action),
     Message(i64),
     ReferencedMessage(i64),
+    Quote(i64, i64),
+    PinnedBanner(i64),
+    Reaction(i64, usize),
+    QuickSwitchChat(i64),
+    GlobalSearchHit(i64, i64),
     Text(Point),
     Image(Rect),
     Composer,
@@ -131,6 +155,10 @@ pub fn action_for_key(key: char) -> Option<Action> {
         'm' => Action::MoreChats,
         'o' => Action::OpenExternal,
         'v' => Action::Preview,
+        'K' => Action::QuickSwitch,
+        'I' => Action::ChatInfo,
+        'V' => Action::ToggleMultiSelect,
+        'L' => Action::OpenMessageLink,
         _ => return None,
     })
 }
@@ -213,22 +241,62 @@ fn target_button(frame: &mut Frame, app: &mut App, area: Rect, label: &str, targ
 fn folder_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hit_targets.push((area, Target::Panel(Pane::Folders)));
     let lists = app.store.chat_lists();
-    let slots = usize::from(area.width.saturating_sub(6) / 8).max(1);
-    app.folder_offset = app.folder_offset.min(lists.len().saturating_sub(slots));
-    target_button(
-        frame,
-        app,
-        Rect::new(area.x, area.y, 2, 1),
-        "‹",
-        Target::FolderPage(-1),
+    let available = area.width.saturating_sub(6);
+    let tab_widths: Vec<u16> = lists
+        .iter()
+        .map(|(_, name)| {
+            ((UnicodeWidthStr::width(name.as_str()) as u16) + 3)
+                .clamp(7, 11)
+                .min(available.max(1))
+        })
+        .collect();
+    // Clamp folder_offset so the rightmost visible group still fills the bar.
+    let mut max_offset = lists.len().saturating_sub(1);
+    let mut tail_used = 0u16;
+    for (idx, &w) in tab_widths.iter().enumerate().rev() {
+        if tail_used + w <= available {
+            tail_used += w;
+            max_offset = idx;
+        } else {
+            break;
+        }
+    }
+    app.folder_offset = app.folder_offset.min(max_offset);
+    let can_prev = app.folder_offset > 0;
+    let prev_rect = Rect::new(area.x, area.y, 2.min(area.width), 1);
+    frame.render_widget(
+        Paragraph::new("‹")
+            .style(Style::default().fg(if can_prev {
+                palette().muted
+            } else {
+                palette().border
+            }))
+            .alignment(Alignment::Center),
+        prev_rect,
     );
-    for (index, (list, name)) in lists.iter().skip(app.folder_offset).take(slots).enumerate() {
-        let rect = Rect::new(
-            area.x + 2 + index as u16 * 8,
-            area.y,
-            8.min(area.width.saturating_sub(6)),
-            1,
-        );
+    app.hit_targets.push((prev_rect, Target::FolderPage(-1)));
+
+    let mut x = area.x.saturating_add(2);
+    let limit = area.right().saturating_sub(4);
+    let mut shown_end = app.folder_offset;
+    for (index, ((list, name), &width)) in lists
+        .iter()
+        .zip(&tab_widths)
+        .enumerate()
+        .skip(app.folder_offset)
+    {
+        let remaining = limit.saturating_sub(x);
+        if remaining == 0 {
+            break;
+        }
+        let rect_w = if shown_end == app.folder_offset {
+            width.min(remaining)
+        } else if width <= remaining {
+            width
+        } else {
+            break;
+        };
+        let rect = Rect::new(x, area.y, rect_w, 1);
         let label = crate::text::ellipsize(
             &format!(
                 "{}{}",
@@ -242,14 +310,23 @@ fn folder_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
             usize::from(rect.width),
         );
         target_button(frame, app, rect, &label, Target::Folder(*list));
+        x = x.saturating_add(rect_w);
+        shown_end = index + 1;
     }
-    target_button(
-        frame,
-        app,
-        Rect::new(area.right().saturating_sub(4), area.y, 2, 1),
-        "›",
-        Target::FolderPage(1),
+
+    let can_next = shown_end < lists.len();
+    let next_rect = Rect::new(area.right().saturating_sub(4), area.y, 2.min(area.width), 1);
+    frame.render_widget(
+        Paragraph::new("›")
+            .style(Style::default().fg(if can_next {
+                palette().muted
+            } else {
+                palette().border
+            }))
+            .alignment(Alignment::Center),
+        next_rect,
     );
+    app.hit_targets.push((next_rect, Target::FolderPage(1)));
     button(
         frame,
         app,
@@ -260,15 +337,12 @@ fn folder_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn modal(frame: &mut Frame, app: &mut App, area: Rect, title: &str) -> Rect {
-    let title = wrap_text(title, usize::from(area.width.saturating_sub(8)).max(1))
-        .into_iter()
-        .next()
-        .unwrap_or_default();
+    let title = crate::text::ellipsize(title, usize::from(area.width.saturating_sub(10)).max(1));
     let inner = dialog(frame, area, &title);
     app.hit_targets.push((area, Target::Modal));
     app.hit_targets.push((inner, Target::Panel(Pane::Modal)));
     let close = Rect::new(area.right().saturating_sub(5), area.y, 3.min(area.width), 1);
-    button(frame, app, close, "×", Action::Cancel);
+    button(frame, app, close, "[×]", Action::Cancel);
     inner
 }
 
@@ -339,8 +413,13 @@ fn anchor_at(app: &mut App, top: usize) {
     app.timeline_anchor = None;
 }
 
-fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
-    let title = title.into().style(
+fn panel_with_style(title: String, focused: bool, base: Style) -> Block<'static> {
+    let label = if focused {
+        format!("▸ {title}")
+    } else {
+        title
+    };
+    let title = Line::from(label).style(
         Style::default()
             .fg(if focused {
                 palette().accent
@@ -350,7 +429,7 @@ fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
             .add_modifier(Modifier::BOLD),
     );
     Block::default()
-        .style(palette().base())
+        .style(base)
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -369,8 +448,21 @@ fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
         )
 }
 
+fn panel(title: impl Into<String>, focused: bool) -> Block<'static> {
+    panel_with_style(title.into(), focused, palette().base())
+}
+
 fn muted(text: impl Into<String>) -> Line<'static> {
     Line::styled(text.into(), Style::default().fg(palette().muted))
+}
+
+fn is_error_notice(text: &str) -> bool {
+    text.contains("失败")
+        || text.starts_with("无法")
+        || text.starts_with("暂不能")
+        || text.starts_with("这条消息当前不允许")
+        || text.starts_with("选中文字超过")
+        || text.starts_with("本次运行的剪贴板")
 }
 
 // Flatten and truncate only the visible prefix. A long reply must not copy its
@@ -421,7 +513,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 fn dialog(frame: &mut Frame, area: Rect, title: &str) -> Rect {
     frame.render_widget(Clear, area);
-    let block = panel(title.to_owned(), true);
+    let block = panel_with_style(title.to_owned(), true, palette().surface_base());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     inner
@@ -478,6 +570,130 @@ fn auth_field(frame: &mut Frame, app: &mut App, area: Rect, index: usize, label:
         position,
         masked,
     );
+}
+
+fn styled_message_line(
+    value: &str,
+    row: crate::text::Row,
+    selection: Option<std::ops::Range<usize>>,
+    prefix: &str,
+    entities: &[crate::store::TextEntity],
+    reveal_spoiler: bool,
+    search_query: Option<&str>,
+) -> Line<'static> {
+    if entities.is_empty() && search_query.is_none() {
+        return selected_line(value, row, selection, prefix);
+    }
+    let slice = &value[row.start..row.end];
+    let mut search_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    if let Some(query) = search_query.filter(|q| !q.is_empty()) {
+        let lower_slice = slice.to_lowercase();
+        let lower_query = query.to_lowercase();
+        if lower_slice.len() == slice.len() {
+            let mut offset = 0;
+            while let Some(pos) = lower_slice[offset..].find(&lower_query) {
+                let abs_start = row.start + offset + pos;
+                let abs_end = abs_start + lower_query.len();
+                if value.is_char_boundary(abs_start) && value.is_char_boundary(abs_end) {
+                    search_ranges.push(abs_start..abs_end);
+                }
+                offset += pos + lower_query.len().max(1);
+            }
+        }
+    }
+    let mut cuts = vec![row.start, row.end];
+    if let Some(ref sel) = selection {
+        cuts.push(sel.start.clamp(row.start, row.end));
+        cuts.push(sel.end.clamp(row.start, row.end));
+    }
+    for entity in entities {
+        if entity.end > row.start && entity.start < row.end {
+            cuts.push(entity.start.clamp(row.start, row.end));
+            cuts.push(entity.end.clamp(row.start, row.end));
+        }
+    }
+    for range in &search_ranges {
+        cuts.push(range.start);
+        cuts.push(range.end);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut spans = vec![Span::raw(prefix.to_owned())];
+    for pair in cuts.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a >= b || !value.is_char_boundary(a) || !value.is_char_boundary(b) {
+            continue;
+        }
+        let in_selection = selection
+            .as_ref()
+            .is_some_and(|r| a >= r.start && b <= r.end);
+        let in_search = search_ranges.iter().any(|r| a >= r.start && b <= r.end);
+        let mut style = Style::default();
+        let mut hidden_spoiler = false;
+        for entity in entities {
+            if a >= entity.start && b <= entity.end {
+                match entity.kind {
+                    crate::store::EntityKind::Bold => style = style.add_modifier(Modifier::BOLD),
+                    crate::store::EntityKind::Italic => {
+                        style = style.add_modifier(Modifier::ITALIC)
+                    }
+                    crate::store::EntityKind::Code | crate::store::EntityKind::Pre => {
+                        style = style.fg(palette().incoming).bg(palette().surface);
+                    }
+                    crate::store::EntityKind::Strike => {
+                        style = style.add_modifier(Modifier::CROSSED_OUT)
+                    }
+                    crate::store::EntityKind::Spoiler => {
+                        if reveal_spoiler {
+                            style = style.bg(palette().surface);
+                        } else {
+                            hidden_spoiler = true;
+                            style = style.fg(palette().muted);
+                        }
+                    }
+                    crate::store::EntityKind::Url | crate::store::EntityKind::TextUrl(_) => {
+                        style = style
+                            .fg(palette().incoming)
+                            .add_modifier(Modifier::UNDERLINED);
+                    }
+                    crate::store::EntityKind::Mention => {
+                        style = style.fg(palette().accent);
+                    }
+                }
+            }
+        }
+        if in_search {
+            style = style
+                .fg(palette().accent)
+                .bg(palette().selected)
+                .add_modifier(Modifier::BOLD);
+        }
+        if in_selection {
+            style = palette().primary();
+        }
+        let text = if hidden_spoiler && !in_selection {
+            "░".repeat(UnicodeWidthStr::width(&value[a..b]).max(1))
+        } else {
+            value[a..b].to_owned()
+        };
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_duration(secs: u32) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 fn selected_line(
@@ -620,7 +836,10 @@ fn editor(
     }
     let overlay_editor = matches!(
         kind,
-        Editor::AttachmentPath | Editor::AttachmentCaption | Editor::StickerSearch
+        Editor::AttachmentPath
+            | Editor::AttachmentCaption
+            | Editor::StickerSearch
+            | Editor::QuickSwitch
     );
     let focused = match kind {
         Editor::AttachmentPath => app
@@ -632,6 +851,7 @@ fn editor(
             .as_ref()
             .is_some_and(|p| p.focus == crate::attachments::Focus::Caption),
         Editor::StickerSearch => app.sticker_panel.search_focus,
+        Editor::QuickSwitch => app.quick_switcher.is_some(),
         Editor::Composer => app.composer_focus && app.input_mode != InputMode::Off,
         Editor::Auth(index) => app
             .auth
@@ -657,6 +877,7 @@ fn editor(
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.media.begin_frame();
     app.visible_media.clear();
+    app.visible_read_ids.clear();
     app.hit_targets.clear();
     app.scrollbars.clear();
     let area = frame.area();
@@ -708,23 +929,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         16
     };
     let brand_x = if ready && back { area.x + 6 } else { area.x };
+    let mut header_spans = vec![
+        Span::styled(
+            " Teleaf ",
+            Style::default()
+                .fg(palette().accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if area.width < 60 {
+                String::new()
+            } else {
+                format!("· {connection}")
+            },
+            Style::default().fg(palette().muted),
+        ),
+    ];
+    if !app.mouse_enabled {
+        header_spans.push(Span::styled(
+            if area.width < 60 {
+                " [鼠标关]"
+            } else {
+                " · [鼠标关 · F6]"
+            },
+            Style::default()
+                .fg(palette().error)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " Teleaf ",
-                Style::default()
-                    .fg(palette().accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                if area.width < 60 {
-                    String::new()
-                } else {
-                    format!("· {connection}")
-                },
-                Style::default().fg(palette().muted),
-            ),
-        ])),
+        Paragraph::new(Line::from(header_spans)),
         Rect::new(
             brand_x,
             layout[0].y,
@@ -769,10 +1003,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         chat_page(frame, app, layout[1]);
     }
-    let hint = if app.show_settings {
-        "Tab 选择按钮 · Enter 操作 · ↑↓ 滚动 · F6 鼠标 · Esc 返回"
+    let hint = if app.quick_switcher.is_some() {
+        "输入关键词筛选 · ↑↓ 选择 · Enter 打开会话 · Esc 关闭"
+    } else if app.show_settings {
+        "Tab 选择 · Enter 操作 · t 配色 · ↑↓/jk 滚动 · F6 鼠标 · Esc 返回"
     } else if app.show_help {
-        "↑↓ 滚动 · Esc 返回"
+        "↑↓/jk 滚动 · PgUp/PgDn 翻页 · Esc 返回"
+    } else if app.show_folders {
+        "↑↓/jk 选择 · Enter 切换分组 · Esc 返回"
+    } else if app.show_chat_info && app.chat_info_modal {
+        "↑↓ 滚动 · 点击操作 · Esc 返回"
     } else if app.auth.is_new_login() {
         "Enter 确认重新登录 · Esc 返回 · Ctrl+C 退出"
     } else if app.auth.is_recovering() {
@@ -787,35 +1027,47 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         "方向键选择 · 点击/Enter 发送 · [ ] 切换贴纸包 · / 搜索"
     } else if app.action_menu.is_some() || app.forward_message.is_some() {
         "↑ ↓ 选择 · Enter 确认 · Esc 返回"
-    } else if app.show_help || app.show_settings {
-        "↑ ↓ 滚动 · Esc 返回"
     } else if app.confirm_delete.is_some() {
         "Enter / y 删除 · Esc / n 取消"
     } else if app.preview_message.is_some() {
         "滚轮缩放 · 拖动平移 · 0 复位 · Esc 返回"
+    } else if !app.multi_select.is_empty() {
+        "Space / 点击勾选消息 · 底部按钮批量操作 · Esc 退出多选"
     } else if app.input_mode != InputMode::Off {
-        "Enter 提交 · Alt+Enter 换行 · Esc 取消"
+        if matches!(app.input_mode, InputMode::React(_)) {
+            "按 1-8 快捷回应 · 或输入表情 Enter 提交 · Esc 取消"
+        } else {
+            "Enter 提交 · Alt+Enter 换行 · ↑↓ 移光标 · Ctrl+W 删词 · Esc 取消"
+        }
     } else if app.focus_messages {
-        "i 写消息 · Enter 操作/预览 · Space 更多 · Tab 会话 · ? 帮助"
+        "i 写消息 · Ctrl+K 找会话 · I 详情 · V 多选 · Space 更多 · ? 帮助"
     } else {
-        "↑ ↓ 选择 · Enter 打开 · Tab 消息 · s 设置 · ? 帮助"
+        "↑ ↓ 选择 · Enter 打开 · Ctrl+K 找会话 · Tab 消息 · s 设置 · ? 帮助"
     };
     let notice = app.notice.as_deref().or(app.media.last_error.as_deref());
     let hint = if area.width < 60 {
-        if app.show_settings {
-            "Tab 选择 · Enter 操作 · Esc 返回"
+        if app.quick_switcher.is_some() {
+            "输入筛选 · Enter 打开 · Esc 关"
+        } else if app.show_settings {
+            "Tab 选 · Enter 确认 · t 配色 · Esc 退"
         } else if app.show_help {
+            "↑↓/jk 滚动 · Esc 返回"
+        } else if app.show_folders {
+            "↑↓ 选择 · Enter 切换 · Esc 退"
+        } else if app.show_chat_info && app.chat_info_modal {
             "↑↓ 滚动 · Esc 返回"
         } else if app.attachments.is_some() {
-            "Space 选择 · Tab 切换 · F8 / Ctrl+Enter 发送 · Esc 返回"
+            "Space 选 · Tab · F8 发 · Esc"
         } else if app.sticker_picker {
-            "方向键选择 · 点击/Enter 发送 · [ ] 切换贴纸包 · / 搜索"
+            "方向选 · Enter 发 · [] · / 搜"
         } else if app.action_menu.is_some() || app.forward_message.is_some() {
             "↑↓选择 Enter 确认 Esc 返回"
         } else if app.confirm_delete.is_some() {
             "Enter/y 删除 · Esc/n 取消"
         } else if app.preview_message.is_some() {
             "滚轮缩放 · 拖动平移 · Esc 返回"
+        } else if !app.multi_select.is_empty() {
+            "Space 勾选 · Esc 退出多选"
         } else if app.auth.is_new_login() {
             "Enter 确认 · Esc 返回"
         } else if app.auth.is_recovering() {
@@ -827,21 +1079,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } else if app.input_mode != InputMode::Off {
             "Enter 提交 · Esc 取消"
         } else if app.focus_messages {
-            "i 输入 · Enter 操作 · Tab 会话"
+            "i 输入 · ^K 找会话 · Tab 会话"
         } else {
-            "↑↓ 选择 · Enter 打开 · ? 帮助"
+            "↑↓ 选择 · Enter 打开 · ^K 找会话"
         }
     } else {
         hint
     };
-    let footer = if app.auth.is_error && app.auth.state == "authorizationStateReady" {
+    let auth_footer_error = app.auth.is_error && app.auth.state == "authorizationStateReady";
+    let media_footer_error = app.notice.is_none() && app.media.last_error.is_some();
+    let notice_is_error = app
+        .notice
+        .as_deref()
+        .is_some_and(|text| app.notice_error || is_error_notice(text));
+    let footer = if auth_footer_error {
         app.auth.message.as_str()
     } else {
         notice.unwrap_or(hint)
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(
-            if app.auth.is_error || (app.notice.is_none() && app.media.last_error.is_some()) {
+            if auth_footer_error || media_footer_error || notice_is_error {
                 palette().error
             } else if notice.is_some() {
                 palette().text
@@ -855,6 +1113,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help
         || app.show_settings
         || app.show_folders
+        || app.quick_switcher.is_some()
+        || (app.show_chat_info && app.chat_info_modal)
         || app.action_menu.is_some()
         || app.forward_message.is_some()
         || app.sticker_picker
@@ -918,36 +1178,96 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.show_folders {
         let inner = modal(frame, app, centered(layout[1], 44, 20), "Telegram 分组");
-        app.modal_scroll = app.modal_scroll.min(
-            app.store
-                .chat_lists()
-                .len()
-                .saturating_sub(usize::from(inner.height)) as u16,
-        );
-        for (row, (list, name)) in app
-            .store
-            .chat_lists()
-            .into_iter()
-            .skip(usize::from(app.modal_scroll))
-            .take(usize::from(inner.height))
+        let lists = app.store.chat_lists();
+        let visible = usize::from(inner.height).max(1);
+        app.modal_visible = visible;
+        app.folder_cursor = app.folder_cursor.min(lists.len().saturating_sub(1));
+        let max_scroll = lists.len().saturating_sub(visible);
+        let mut scroll = usize::from(app.modal_scroll).min(max_scroll);
+        if app.folder_cursor < scroll {
+            scroll = app.folder_cursor;
+        } else if app.folder_cursor >= scroll + visible {
+            scroll = app.folder_cursor + 1 - visible;
+        }
+        app.modal_scroll = scroll as u16;
+        let has_scroll = max_scroll > 0 && inner.width >= 4;
+        let list_width = if has_scroll {
+            inner.width.saturating_sub(1)
+        } else {
+            inner.width
+        };
+        for (row, (abs_index, (list, name))) in lists
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible)
             .enumerate()
         {
-            let label = format!(
-                "{} {name}",
-                if list == app.store.selected_list {
-                    "●"
-                } else {
-                    "○"
-                }
-            );
-            target_button(
-                frame,
-                app,
-                Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
-                &label,
-                Target::Folder(list),
-            );
+            let focused = abs_index == app.folder_cursor;
+            let active = *list == app.store.selected_list;
+            let pressed = app
+                .mouse_press
+                .is_some_and(|(_, target)| target == Target::Folder(*list));
+            let row_rect = Rect::new(inner.x, inner.y + row as u16, list_width, 1);
+            let row_style = if focused || pressed {
+                palette().selection()
+            } else {
+                palette().surface_base()
+            };
+            let prefix = if focused { "› " } else { "  " };
+            let dot = if active { "● " } else { "○ " };
+            let name_text = crate::text::ellipsize(name, usize::from(list_width.saturating_sub(4)));
+            let line = Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if focused {
+                        palette().accent
+                    } else {
+                        palette().muted
+                    }),
+                ),
+                Span::styled(
+                    dot,
+                    Style::default()
+                        .fg(if active {
+                            palette().accent
+                        } else {
+                            palette().muted
+                        })
+                        .add_modifier(if active {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    name_text,
+                    if active {
+                        Style::default()
+                            .fg(palette().accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else if focused {
+                        Style::default()
+                            .fg(palette().text)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette().text)
+                    },
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line).style(row_style), row_rect);
+            app.hit_targets.push((row_rect, Target::Folder(*list)));
         }
+        if has_scroll {
+            scrollbar(frame, app, inner, Pane::Modal, scroll, max_scroll);
+        }
+    }
+    if app.quick_switcher.is_some() {
+        quick_switcher_dialog(frame, app, layout[1]);
+    }
+    if app.show_chat_info && app.chat_info_modal {
+        let inner = modal(frame, app, centered(layout[1], 56, 20), "会话详情");
+        chat_info_body(frame, app, inner);
     }
     if app.show_help {
         help_dialog(frame, app, layout[1]);
@@ -960,28 +1280,43 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.forward_message.is_some() {
         let area = centered(layout[1], 60, 22);
-        let inner = modal(frame, app, area, "转发到…");
+        let title = if app.forward_many && !app.multi_select.is_empty() {
+            format!("转发 {} 条消息到…", app.multi_select.len())
+        } else {
+            "转发到…".into()
+        };
+        let inner = modal(frame, app, area, &title);
         let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
         chat_list(frame, app, rows[0], true, false);
-        button(frame, app, rows[1], "[确认转发]", Action::Confirm);
+        let prompt = app.batch_prompt().unwrap_or_else(|| "[确认转发]".into());
+        button(frame, app, rows[1], &prompt, Action::Confirm);
     }
     if app.attachments.is_some() {
         attachment_dialog(frame, app, layout[1]);
     }
     if app.sticker_picker {
         sticker_dialog(frame, app, layout[1]);
-        let column = chat_column(layout[1]);
-        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(column);
+        let column = chat_column(app, layout[1]);
+        let ch = composer_height(app, column.width, column.height);
+        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(ch)]).split(column);
         frame.render_widget(Clear, rows[1]);
         composer(frame, app, rows[1]);
     }
     if app.confirm_delete.is_some() {
         let inner = modal(frame, app, centered(layout[1], 56, 9), "删除消息");
+        let prompt = if app.confirm_delete_many && !app.multi_select.is_empty() {
+            format!("确认删除选中的 {} 条消息？", app.multi_select.len())
+        } else {
+            "确认删除这条消息？".into()
+        };
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
-                Line::from("确认删除这条消息？"),
-                muted("将请求为双方删除，删除后无法撤销。"),
+                Line::from(prompt),
+                muted(
+                    app.batch_prompt()
+                        .unwrap_or_else(|| "将请求为双方删除，删除后无法撤销。".into()),
+                ),
                 Line::from(""),
                 Line::from(""),
             ])
@@ -1153,18 +1488,21 @@ fn auth_page(frame: &mut Frame, app: &mut App, area: Rect) {
         app.hit_targets
             .push((rows[1], Target::Command(Action::OpenLink)));
     }
-    let message = if !app.tdlib_connected && !app.status.starts_with("正在") && !setup {
+    let connection_error = !app.tdlib_connected && !app.status.starts_with("正在") && !setup;
+    let message = if connection_error {
         &app.status
     } else {
         &app.auth.message
     };
     frame.render_widget(
         Paragraph::new(message.to_owned())
-            .style(Style::default().fg(if app.auth.is_error {
-                palette().error
-            } else {
-                palette().accent
-            }))
+            .style(
+                Style::default().fg(if app.auth.is_error || connection_error {
+                    palette().error
+                } else {
+                    palette().accent
+                }),
+            )
             .wrap(Wrap { trim: true }),
         rows[3],
     );
@@ -1191,21 +1529,56 @@ fn auth_page(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn chat_column(area: Rect) -> Rect {
+fn chat_column(app: &App, area: Rect) -> Rect {
     if area.width < 78 {
         return area;
     }
-    Layout::horizontal([
-        Constraint::Length((area.width / 3).clamp(26, 36)),
-        Constraint::Min(1),
-    ])
-    .split(area)[1]
+    let chat_w = (area.width / 3).clamp(26, 36);
+    if app.show_chat_info && area.width >= 120 {
+        Layout::horizontal([
+            Constraint::Length(chat_w),
+            Constraint::Min(1),
+            Constraint::Length(32),
+        ])
+        .split(area)[1]
+    } else {
+        Layout::horizontal([Constraint::Length(chat_w), Constraint::Min(1)]).split(area)[1]
+    }
+}
+
+fn composer_height(app: &App, column_width: u16, column_height: u16) -> u16 {
+    if !app.multi_select.is_empty() {
+        return 3;
+    }
+    if matches!(app.input_mode, InputMode::React(_)) && column_height >= 10 {
+        return 5;
+    }
+    if app.draft.is_empty() || column_width < 6 {
+        return 4;
+    }
+    let edit_width = usize::from(column_width.saturating_sub(3)).max(1);
+    let rows = crate::text::row_count(&app.draft, edit_width);
+    if rows <= 2 {
+        4
+    } else {
+        let max_h = column_height.saturating_sub(4).clamp(4, 7);
+        ((rows as u16) + 2).clamp(4, max_h)
+    }
 }
 
 fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
     let wide = area.width >= 78;
+    let inline_info = app.show_chat_info && area.width >= 120 && app.store.active_chat.is_some();
+    app.chat_info_modal = !inline_info;
     let show_chat = wide || !app.focus_messages || app.store.active_chat.is_none();
-    let columns = if wide {
+    let columns = if inline_info {
+        Layout::horizontal([
+            Constraint::Length((area.width / 3).clamp(26, 36)),
+            Constraint::Min(1),
+            Constraint::Length(32),
+        ])
+        .split(area)
+    } else if wide {
         Layout::horizontal([
             Constraint::Length((area.width / 3).clamp(26, 36)),
             Constraint::Min(1),
@@ -1219,29 +1592,48 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if wide || !show_chat {
         let message_area = if wide { columns[1] } else { columns[0] };
+        let ch = composer_height(app, message_area.width, message_area.height);
         let rows =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(message_area);
-        let title = app
+            Layout::vertical([Constraint::Min(3), Constraint::Length(ch)]).split(message_area);
+        let base_title = app
             .store
             .active_chat
             .map(|id| app.store.chat_title(id))
             .unwrap_or_else(|| "消息".into());
+        let subtitle = app
+            .store
+            .active_chat
+            .and_then(|id| app.store.chat(id))
+            .map(|c| c.subtitle.as_str())
+            .unwrap_or("");
         let title = if app.show_search {
             format!(
-                "搜索「{}」· {} 条",
+                "搜索 · {}「{}」· {} 条",
+                app.parity.filter.label(),
                 app.search_query,
                 app.store.search_results.len()
             )
+        } else if app.history_loading && rows[0].width >= 32 {
+            format!("{base_title} · 加载中…")
+        } else if !subtitle.is_empty() && rows[0].width >= 52 {
+            format!("{base_title} · {subtitle}")
         } else {
-            title
+            base_title
         };
-        let control_width = if rows[0].width >= 26 { 12 } else { 6 };
+        let show_info_btn = rows[0].width >= 38 && app.store.active_chat.is_some();
+        let show_search_btn = rows[0].width >= 26;
+        let control_width = 6 + u16::from(show_search_btn) * 6 + u16::from(show_info_btn) * 6;
+        let focused_timeline = app.focus_messages && app.input_mode == InputMode::Off;
         let block = panel(
             crate::text::ellipsize(
                 &title,
-                usize::from(rows[0].width.saturating_sub(control_width + 3)),
+                usize::from(
+                    rows[0]
+                        .width
+                        .saturating_sub(control_width + 3 + u16::from(focused_timeline) * 2),
+                ),
             ),
-            app.focus_messages && app.input_mode == InputMode::Off,
+            focused_timeline,
         );
         let inner = block.inner(rows[0]);
         frame.render_widget(block, rows[0]);
@@ -1250,12 +1642,15 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
 
         let controls = Layout::horizontal([
             Constraint::Min(0),
-            Constraint::Length(if control_width >= 12 { 6 } else { 0 }),
+            Constraint::Length(if show_search_btn { 6 } else { 0 }),
+            Constraint::Length(if show_info_btn { 6 } else { 0 }),
             Constraint::Length(6),
         ])
         .split(Rect::new(inner.x, rows[0].y, inner.width, 1));
-        for (rect, label, action) in [
-            (
+        if show_search_btn {
+            button(
+                frame,
+                app,
                 controls[1],
                 if app.show_search {
                     "[返回]"
@@ -1267,17 +1662,35 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     Action::Search
                 },
-            ),
-            (controls[2], "[更多]", Action::ChatMenu),
-        ] {
-            button(frame, app, rect, label, action);
+            );
         }
+        if show_info_btn {
+            button(frame, app, controls[2], "[详情]", Action::ChatInfo);
+        }
+        button(frame, app, controls[3], "[更多]", Action::ChatMenu);
         if app.store.active_chat.is_none() {
             empty(frame, inner, "选择一个会话", "在左侧选择后按 Enter 打开");
         } else {
             message_list(frame, app, inner);
         }
-        composer(frame, app, rows[1]);
+        if !app.multi_select.is_empty() {
+            multi_select_bar(frame, app, rows[1]);
+        } else {
+            composer(frame, app, rows[1]);
+        }
+    }
+    if inline_info {
+        let block = panel("会话详情", false);
+        let inner = block.inner(columns[2]);
+        frame.render_widget(block, columns[2]);
+        button(
+            frame,
+            app,
+            Rect::new(columns[2].right().saturating_sub(5), columns[2].y, 3, 1),
+            "[×]",
+            Action::ChatInfo,
+        );
+        chat_info_body(frame, app, inner);
     }
 }
 
@@ -1295,6 +1708,7 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
         frame.render_widget(block, area);
     }
     app.hit_targets.push((area, Target::Panel(Pane::Chats)));
+    let ids: Vec<_> = app.store.chat_ids().collect();
     let inner = if bordered {
         let parts = Layout::vertical([
             Constraint::Length(1),
@@ -1303,12 +1717,20 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
         ])
         .split(inner);
         folder_tabs(frame, app, parts[0]);
-        button(frame, app, parts[2], "[更多会话]", Action::MoreChats);
+        if !ids.is_empty() && app.store.exhausted_lists.contains(&app.store.selected_list) {
+            frame.render_widget(
+                Paragraph::new(format!("已加载全部 · {} 个会话", ids.len()))
+                    .style(Style::default().fg(palette().muted))
+                    .alignment(Alignment::Center),
+                parts[2],
+            );
+        } else {
+            button(frame, app, parts[2], "[更多会话]", Action::MoreChats);
+        }
         parts[1]
     } else {
         inner
     };
-    let ids: Vec<_> = app.store.chat_ids().collect();
     if ids.is_empty() {
         empty(
             frame,
@@ -1346,6 +1768,8 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
         .map(|chat| {
             // Reserve two columns for the selection marker and one for scrolling.
             let width = usize::from(inner.width.saturating_sub(3));
+            let is_selected = ids.get(selected) == Some(&chat.id);
+            let is_active = Some(chat.id) == app.store.active_chat;
             let unread = if chat.unread > 0 {
                 if chat.unread > 999 {
                     " 999+ ".to_owned()
@@ -1356,34 +1780,107 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
                 String::new()
             };
             let badge_width = UnicodeWidthStr::width(unread.as_str()).min(width);
-            let title = crate::text::ellipsize(
-                &format!(
-                    "{}{}",
-                    if Some(chat.id) == app.store.active_chat {
-                        "· "
-                    } else {
-                        ""
-                    },
-                    chat.title
-                ),
-                width.saturating_sub(badge_width + usize::from(badge_width > 0)),
-            );
-            let padding =
-                width.saturating_sub(UnicodeWidthStr::width(title.as_str()) + badge_width);
-            let preview = if chat.preview.is_empty() {
-                "暂无消息".to_owned()
+            let mention = if chat.mention_count > 0 && width >= badge_width + 10 {
+                "@ "
             } else {
-                excerpt(&chat.preview, width)
+                ""
             };
-            ListItem::new(vec![
+            let pin_tag = if chat.pinned && width >= badge_width + 12 {
+                "★ "
+            } else {
+                ""
+            };
+            let time_tag = if let Some(stamp) = chat.last_stamp
+                && width >= badge_width + 18
+            {
+                format!("{} ", stamp.time())
+            } else {
+                String::new()
+            };
+            let meta_width = UnicodeWidthStr::width(time_tag.as_str())
+                + UnicodeWidthStr::width(pin_tag)
+                + UnicodeWidthStr::width(mention);
+            let right_width = meta_width + badge_width;
+            let active_prefix = if is_active { "· " } else { "" };
+            let title_text = crate::text::ellipsize(
+                &chat.title,
+                width.saturating_sub(
+                    right_width
+                        + usize::from(right_width > 0)
+                        + UnicodeWidthStr::width(active_prefix),
+                ),
+            );
+            let title_width =
+                UnicodeWidthStr::width(active_prefix) + UnicodeWidthStr::width(title_text.as_str());
+            let padding = width.saturating_sub(title_width + right_width);
+            let title_style = if is_active {
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            let meta_style = if is_selected {
+                palette().muted_on_selection()
+            } else {
+                Style::default().fg(palette().muted)
+            };
+            let badge_style = if chat.muted {
+                Style::default().fg(palette().muted).bg(palette().surface)
+            } else {
+                palette().primary()
+            };
+            let mut title_spans = Vec::with_capacity(7);
+            if !active_prefix.is_empty() {
+                title_spans.push(Span::styled(active_prefix, title_style));
+            }
+            title_spans.push(Span::styled(title_text, title_style));
+            title_spans.push(Span::raw(" ".repeat(padding)));
+            if !time_tag.is_empty() {
+                title_spans.push(Span::styled(time_tag, meta_style));
+            }
+            if !pin_tag.is_empty() {
+                title_spans.push(Span::styled(pin_tag, Style::default().fg(palette().accent)));
+            }
+            if !mention.is_empty() {
+                title_spans.push(Span::styled(
+                    mention,
+                    Style::default()
+                        .fg(palette().accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            title_spans.push(Span::styled(unread, badge_style));
+            let preview_style = if is_selected {
+                palette().muted_on_selection()
+            } else {
+                Style::default().fg(palette().muted)
+            };
+            let local_draft = app.local_draft_preview(chat.id);
+            let draft_text = local_draft.or_else(|| {
+                (!chat.draft_preview.is_empty()).then_some(chat.draft_preview.as_str())
+            });
+            let preview_line = if !chat.typing.is_empty() {
+                Line::styled(
+                    excerpt(&chat.typing, width),
+                    Style::default().fg(palette().accent),
+                )
+            } else if let Some(draft) = draft_text {
+                let tag = "[草稿] ";
+                let tag_w = UnicodeWidthStr::width(tag);
                 Line::from(vec![
-                    Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(" ".repeat(padding)),
-                    Span::styled(unread, palette().primary()),
-                ]),
-                muted(preview),
-            ])
-            .style(if ids.get(selected) == Some(&chat.id) {
+                    Span::styled(tag, Style::default().fg(palette().error)),
+                    Span::styled(excerpt(draft, width.saturating_sub(tag_w)), preview_style),
+                ])
+            } else {
+                let preview = if chat.preview.is_empty() {
+                    "暂无消息".to_owned()
+                } else {
+                    excerpt(&chat.preview, width)
+                };
+                Line::styled(preview, preview_style)
+            };
+            ListItem::new(vec![Line::from(title_spans), preview_line]).style(if is_selected {
                 palette().selection()
             } else {
                 Style::default()
@@ -1442,6 +1939,66 @@ fn message_body(message: &crate::store::Message) -> &str {
 
 fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
     app.visible_media.clear();
+    let pinned_banner =
+        (!app.show_search && app.collapsed_pin_chat != app.store.active_chat && area.height >= 7)
+            .then(|| {
+                app.store
+                    .active_chat
+                    .and_then(|id| app.store.chat(id))
+                    .and_then(|chat| chat.pinned_message.clone())
+            })
+            .flatten();
+    let area = if let Some(pin) = pinned_banner {
+        let banner_rect = Rect::new(area.x, area.y, area.width, 1);
+        frame
+            .buffer_mut()
+            .set_style(banner_rect, palette().surface_base());
+        let dismiss_w = 3u16.min(banner_rect.width);
+        let text_w = banner_rect.width.saturating_sub(dismiss_w + 1);
+        let prefix = "│ 置顶：";
+        let prefix_w = UnicodeWidthStr::width(prefix);
+        let body = crate::text::ellipsize(
+            &excerpt(&pin.excerpt, usize::from(text_w).saturating_sub(prefix_w)),
+            usize::from(text_w).saturating_sub(prefix_w),
+        );
+        let click_rect = Rect::new(banner_rect.x, banner_rect.y, text_w, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "│ ",
+                    Style::default()
+                        .fg(palette().accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "置顶：",
+                    Style::default()
+                        .fg(palette().accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(body, Style::default().fg(palette().text)),
+            ]))
+            .style(palette().surface_base()),
+            click_rect,
+        );
+        app.hit_targets
+            .push((click_rect, Target::PinnedBanner(pin.id)));
+        button(
+            frame,
+            app,
+            Rect::new(
+                banner_rect.right().saturating_sub(dismiss_w),
+                banner_rect.y,
+                dismiss_w,
+                1,
+            ),
+            "[×]",
+            Action::DismissPinBanner,
+        );
+        Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+    } else {
+        area
+    };
     if app.active_messages().is_empty() {
         empty(
             frame,
@@ -1467,10 +2024,29 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
         app.timeline_heights.clear();
     }
     let media_height = (width / 5).clamp(3, 8) as usize;
+    let unread_count = app
+        .store
+        .active_chat
+        .and_then(|id| app.store.chat(id))
+        .map_or(0, |chat| chat.unread);
+    let read_inbox = app
+        .store
+        .active_chat
+        .and_then(|id| app.store.chat(id))
+        .map_or(0, |chat| chat.read_inbox);
     let source = if app.show_search {
         &app.store.search_results
     } else {
         &app.store.messages
+    };
+    let unread_divider_id = if !app.show_search && unread_count > 0 && (read_inbox > 0 || !app.demo)
+    {
+        source
+            .iter()
+            .find(|message| !message.outgoing && message.id > read_inbox)
+            .map(|message| message.id)
+    } else {
+        None
     };
     app.timeline_rows.clear();
     let mut date_headers = std::collections::HashSet::new();
@@ -1482,6 +2058,14 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             previous_date = Some(stamp);
         }
+        let has_media_card = message.info.media_meta.is_some()
+            && message.media.as_ref().is_some_and(|media| {
+                matches!(
+                    media.kind,
+                    MediaKind::Document | MediaKind::Video | MediaKind::Voice
+                )
+            });
+        let has_reactions = !message.info.reactions.is_empty();
         let height = *app.timeline_heights.entry(message.id).or_insert_with(|| {
             let body = message_body(message);
             (if body.is_empty() {
@@ -1490,6 +2074,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 crate::text::row_count(body, usize::from(width))
             }) + 2
                 + usize::from(message.info.reply.is_some())
+                + usize::from(message.info.forwarded_from.is_some())
                 + if message.media.as_ref().is_some_and(|media| {
                     matches!(media.kind, MediaKind::Photo | MediaKind::Sticker)
                 }) {
@@ -1497,11 +2082,12 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     0
                 }
-        });
-        app.timeline_rows.push((
-            message.id,
-            height + usize::from(date_headers.contains(&message.id)),
-        ));
+        }) + usize::from(has_media_card)
+            + usize::from(has_reactions);
+        let extra_dividers = usize::from(date_headers.contains(&message.id))
+            + usize::from(unread_divider_id == Some(message.id));
+        app.timeline_rows
+            .push((message.id, height + extra_dividers));
     }
     let total: usize = app.timeline_rows.iter().map(|(_, height)| height).sum();
     app.timeline_max = total.saturating_sub(usize::from(area.height));
@@ -1543,6 +2129,11 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut before = 0;
     let mut visible = Vec::new();
     let mut text_targets = Vec::new();
+    let mut read_ids = Vec::new();
+    let measure_reads = !app.demo && !app.show_search && !app.has_overlay();
+    let navigation_bar =
+        app.quote_back.is_some() || top < app.timeline_max || app.store.context_window;
+    let readable_end = top + usize::from(area.height).saturating_sub(usize::from(navigation_bar));
     for (message, &(_, height)) in source.iter().zip(&app.timeline_rows) {
         if before + height > top && before < top + usize::from(area.height) {
             let label = app.store.sender_label(message);
@@ -1554,19 +2145,25 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     MediaKind::Sticker => " · 贴纸",
                     MediaKind::Document => " · 文件",
                     MediaKind::Video => " · 视频",
+                    MediaKind::Voice => " · 语音",
                 })
                 .unwrap_or("");
-            let divider = usize::from(date_headers.contains(&message.id));
-            let status = message.status(
-                app.store
-                    .active_chat
-                    .and_then(|id| app.store.chat(id))
-                    .map_or(0, |chat| chat.read_outbox),
-            );
-            let status = crate::text::ellipsize(&status, usize::from(width.saturating_sub(16)));
-            let status_width =
-                UnicodeWidthStr::width(status.as_str()) + usize::from(!status.is_empty()) * 3;
-            let controls_width = if Some(message.id) == app.selected_message {
+            let date_div = usize::from(date_headers.contains(&message.id));
+            let unread_div = usize::from(unread_divider_id == Some(message.id));
+            let divider = date_div + unread_div;
+            if measure_reads
+                && !message.outgoing
+                && message.id > read_inbox
+                && before + divider < readable_end
+                && before + height - 1 > top
+            {
+                read_ids.push(message.id);
+            }
+            let is_selected = Some(message.id) == app.selected_message;
+            let multi_active = !app.multi_select.is_empty();
+            let multi_checked = multi_active && app.multi_select.contains(&message.id);
+            let failed = matches!(message.info.sending, crate::store::Sending::Failed { .. });
+            let controls_width = if is_selected {
                 if width >= 32 || message.retryable() {
                     12
                 } else {
@@ -1577,87 +2174,186 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 0
             };
+            let compact_status = width < 36;
+            let raw_status = message.status_formatted(
+                app.store
+                    .active_chat
+                    .and_then(|id| app.store.chat(id))
+                    .map_or(0, |chat| chat.read_outbox),
+                compact_status,
+            );
+            let max_status = usize::from(width.saturating_sub(controls_width + 10));
+            let status = crate::text::ellipsize(&raw_status, max_status);
+            let status_width =
+                UnicodeWidthStr::width(status.as_str()) + usize::from(!status.is_empty()) * 3;
             let mut lines = Vec::new();
-            if divider > 0 {
+            if date_div > 0 {
+                let date = message.info.stamp.expect("date header").date();
+                let date_line = if width >= 18 {
+                    Line::from(vec![
+                        Span::styled("── ", Style::default().fg(palette().border)),
+                        Span::styled(date, Style::default().fg(palette().muted)),
+                        Span::styled(" ──", Style::default().fg(palette().border)),
+                    ])
+                } else {
+                    Line::styled(date, Style::default().fg(palette().muted))
+                };
+                lines.push(date_line.alignment(Alignment::Center));
+            }
+            if unread_div > 0 {
+                let unread_label = format!("── {unread_count} 条未读消息 ──");
                 lines.push(
                     Line::styled(
-                        message.info.stamp.expect("date header").date(),
-                        Style::default().fg(palette().muted),
+                        crate::text::ellipsize(&unread_label, usize::from(width)),
+                        Style::default()
+                            .fg(palette().accent)
+                            .add_modifier(Modifier::BOLD),
                     )
                     .alignment(Alignment::Center),
                 );
             }
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{}{}",
-                        if Some(message.id) == app.selected_message {
-                            "› "
-                        } else {
-                            "  "
-                        },
-                        crate::text::ellipsize(
-                            &format!("{label}{tag}"),
-                            usize::from(width.saturating_sub(controls_width))
-                                .saturating_sub(status_width)
-                        )
-                    ),
+            let status_style = if failed {
+                Style::default().fg(palette().error)
+            } else if is_selected {
+                palette().muted_on_selection()
+            } else {
+                Style::default().fg(palette().muted)
+            };
+            let check_width = usize::from(multi_active) * 4;
+            let mut header_spans = Vec::with_capacity(4);
+            if multi_active {
+                header_spans.push(Span::styled(
+                    if multi_checked { "[✓] " } else { "[ ] " },
                     Style::default()
-                        .fg(if message.outgoing {
+                        .fg(if multi_checked {
                             palette().accent
                         } else {
-                            palette().incoming
+                            palette().muted
                         })
-                        .add_modifier(Modifier::BOLD),
+                        .add_modifier(if multi_checked {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ));
+            }
+            header_spans.push(Span::styled(
+                format!(
+                    "{}{}",
+                    if is_selected { "› " } else { "  " },
+                    crate::text::ellipsize(
+                        &format!("{label}{tag}"),
+                        usize::from(width.saturating_sub(controls_width))
+                            .saturating_sub(status_width + check_width)
+                    )
                 ),
-                Span::styled(
-                    if status.is_empty() {
-                        String::new()
+                Style::default()
+                    .fg(if message.outgoing {
+                        palette().accent
                     } else {
-                        format!(" · {status}")
+                        palette().incoming
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+            header_spans.push(Span::styled(
+                if status.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {status}")
+                },
+                status_style,
+            ));
+            lines.push(Line::from(header_spans));
+            let forward_rows = usize::from(message.info.forwarded_from.is_some());
+            if let Some(origin) = &message.info.forwarded_from {
+                let name = app.store.forward_label(origin);
+                let label = format!("  ↳ 转发自 {}", name.replace(['\r', '\n'], " "));
+                lines.push(Line::styled(
+                    crate::text::ellipsize(&label, usize::from(width)),
+                    if is_selected {
+                        palette().muted_on_selection()
+                    } else {
+                        Style::default().fg(palette().muted)
                     },
-                    Style::default().fg(if message.retryable() {
-                        palette().error
-                    } else {
-                        palette().muted
-                    }),
-                ),
-            ]));
+                ));
+            }
             if let Some(reply) = &message.info.reply {
                 let referenced = (Some(reply.chat_id) == app.store.active_chat)
                     .then(|| app.store.messages.iter().find(|m| m.id == reply.message_id))
                     .flatten();
-                let excerpt = if !reply.excerpt.is_empty() {
+                let excerpt_text = if !reply.excerpt.is_empty() {
                     reply.excerpt.as_str()
                 } else {
                     referenced.map_or("原消息未加载", |m| m.text.as_str())
                 };
-                let label = referenced
+                let reply_label = referenced
                     .map(|m| app.store.sender_label(m))
                     .unwrap_or_else(|| "引用".into());
-                lines.push(Line::styled(
-                    format!(
-                        "  ↪ {}",
-                        crate::text::ellipsize(
-                            &format!("{label}：{}", excerpt.replace(['\n', '\r'], " ")),
-                            usize::from(width)
-                        )
-                    ),
-                    Style::default().fg(palette().muted),
-                ));
-                let quote_row = before + divider + 1;
-                if referenced.is_some()
+                // "  │ " uses 4 columns while `width` only subtracts 2 left + 1 scrollbar.
+                let quote_width = usize::from(width).saturating_sub(2);
+                let label_prefix = format!("{reply_label}：");
+                let label_w = UnicodeWidthStr::width(label_prefix.as_str());
+                let quote_muted = if is_selected {
+                    palette().muted_on_selection()
+                } else {
+                    Style::default().fg(palette().muted)
+                };
+                let bar_color = if referenced.is_some() && !app.show_search {
+                    palette().accent
+                } else {
+                    palette().border
+                };
+                let quote_line = if label_w + 2 <= quote_width {
+                    Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(bar_color)),
+                        Span::styled(
+                            label_prefix,
+                            Style::default()
+                                .fg(palette().text)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            crate::text::ellipsize(
+                                &excerpt_text.replace(['\n', '\r'], " "),
+                                quote_width.saturating_sub(label_w),
+                            ),
+                            quote_muted,
+                        ),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(bar_color)),
+                        Span::styled(
+                            crate::text::ellipsize(
+                                &format!(
+                                    "{label_prefix}{}",
+                                    excerpt_text.replace(['\n', '\r'], " ")
+                                ),
+                                quote_width,
+                            ),
+                            quote_muted,
+                        ),
+                    ])
+                };
+                lines.push(quote_line);
+                let quote_row = before + divider + 1 + forward_rows;
+                if Some(reply.chat_id) == app.store.active_chat
+                    && reply.message_id != 0
                     && !app.show_search
                     && quote_row >= top
                     && quote_row < top + usize::from(area.height)
                 {
                     text_targets.push((
                         Rect::new(area.x + 2, area.y + (quote_row - top) as u16, width, 1),
-                        Target::ReferencedMessage(reply.message_id),
+                        if app.multi_select.is_empty() {
+                            Target::ReferencedMessage(reply.message_id)
+                        } else {
+                            Target::Quote(message.id, reply.message_id)
+                        },
                     ));
                 }
             }
-            let prefix = divider + 1 + usize::from(message.info.reply.is_some());
+            let prefix = divider + 1 + forward_rows + usize::from(message.info.reply.is_some());
             let body = message_body(message);
             let body_offset = message.text.len() - body.len();
             let body_rows = if body.is_empty() {
@@ -1673,11 +2369,19 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let source = Source::Message(message.id);
             let selected_range = selection::range(app, source);
-            lines.extend(
-                body_rows
-                    .iter()
-                    .map(|row| selected_line(&message.text, *row, selected_range.clone(), "  ")),
-            );
+            let search_highlight = (app.show_search && !app.search_query.is_empty())
+                .then_some(app.search_query.as_str());
+            lines.extend(body_rows.iter().map(|row| {
+                styled_message_line(
+                    &message.text,
+                    *row,
+                    selected_range.clone(),
+                    "  ",
+                    &message.info.entities,
+                    is_selected,
+                    search_highlight,
+                )
+            }));
             let inline = message
                 .media
                 .as_ref()
@@ -1685,6 +2389,96 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let media_start = before + prefix + body_rows.len();
             if inline.is_some() {
                 lines.extend((0..media_height).map(|_| Line::from("")));
+            }
+            let mut extra_rows = if inline.is_some() { media_height } else { 0 };
+            if let (Some(media), Some(meta)) = (&message.media, &message.info.media_meta)
+                && matches!(
+                    media.kind,
+                    MediaKind::Document | MediaKind::Video | MediaKind::Voice
+                )
+            {
+                let icon = match media.kind {
+                    MediaKind::Voice => "▸ 语音",
+                    MediaKind::Video => "▸ 视频",
+                    _ => "▸ 文件",
+                };
+                let mut detail_parts = Vec::new();
+                if !meta.file_name.is_empty() {
+                    detail_parts.push(meta.file_name.clone());
+                }
+                if meta.duration_secs > 0 {
+                    detail_parts.push(format_duration(meta.duration_secs));
+                }
+                if meta.size_bytes > 0 {
+                    detail_parts.push(format_bytes(meta.size_bytes));
+                }
+                let progress = if media.path.is_some() {
+                    "已下载 · o 打开".into()
+                } else if app.cancelling_large_file(media.file_id) {
+                    "正在取消下载…".into()
+                } else if app.failed_files.contains(&media.file_id) {
+                    "下载失败 · 按 v 重试".into()
+                } else if meta.downloading && meta.size_bytes > 0 {
+                    let pct =
+                        ((meta.downloaded_bytes.saturating_mul(100)) / meta.size_bytes).min(100);
+                    let filled = (pct as usize * 8 / 100).min(8);
+                    format!(
+                        "{}{} {pct}% · v 取消",
+                        "█".repeat(filled),
+                        "░".repeat(8 - filled)
+                    )
+                } else if meta.downloading {
+                    "正在下载… · v 取消".into()
+                } else {
+                    "按 v 下载".into()
+                };
+                detail_parts.push(progress);
+                let card = format!("  {icon} · {}", detail_parts.join(" · "));
+                let row = before + lines.len();
+                if row >= top && row < readable_end {
+                    text_targets.push((
+                        Rect::new(area.x, area.y + (row - top) as u16, width, 1),
+                        Target::Media(message.id),
+                    ));
+                }
+                lines.push(Line::styled(
+                    crate::text::ellipsize(&card, usize::from(width) + 2),
+                    Style::default()
+                        .fg(palette().incoming)
+                        .bg(palette().surface),
+                ));
+                extra_rows += 1;
+            }
+            if !message.info.reactions.is_empty() {
+                let react_row = before + prefix + body_rows.len() + extra_rows;
+                let mut r_spans = vec![Span::raw("  ")];
+                let mut rx = area.x + 2;
+                let max_x = area.x + 2 + width;
+                for (idx, r) in message.info.reactions.iter().enumerate() {
+                    let pill = format!(" {} {} ", r.emoji, r.count);
+                    let pw = UnicodeWidthStr::width(pill.as_str()) as u16;
+                    if rx + pw > max_x {
+                        break;
+                    }
+                    let style = if r.chosen {
+                        palette()
+                            .selection()
+                            .fg(palette().accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette().muted).bg(palette().surface)
+                    };
+                    r_spans.push(Span::styled(pill, style));
+                    if react_row >= top && react_row < top + usize::from(area.height) {
+                        text_targets.push((
+                            Rect::new(rx, area.y + (react_row - top) as u16, pw, 1),
+                            Target::Reaction(message.id, idx),
+                        ));
+                    }
+                    rx = rx.saturating_add(pw + 1);
+                    r_spans.push(Span::raw(" "));
+                }
+                lines.push(Line::from(r_spans));
             }
             lines.push(Line::from(""));
             let skip = top.saturating_sub(before);
@@ -1702,6 +2496,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     text_targets.extend(point_targets(&message.text, *row, source, row_area));
                 }
             }
+            let has_trailing_blank = skip + usize::from(h) == height;
             visible.push((
                 message.id,
                 Rect::new(area.x, y, area.width.saturating_sub(1), h),
@@ -1729,17 +2524,27 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 (before + divider >= top && before + divider < top + usize::from(area.height))
                     .then(|| area.y + (before + divider - top) as u16),
                 message.retryable(),
+                has_trailing_blank,
             ));
         }
         before += height;
     }
-    for (id, rect, lines, inline, header, retryable) in visible {
-        let style = if Some(id) == app.selected_message {
-            palette().selection()
+    for (id, rect, mut lines, inline, header, retryable, has_trailing_blank) in visible {
+        if Some(id) == app.selected_message {
+            // Keep the trailing blank separator row unhighlighted for a crisp selection block.
+            let content_height = if has_trailing_blank && rect.height > 1 {
+                lines.pop();
+                rect.height - 1
+            } else {
+                rect.height
+            };
+            frame.render_widget(
+                Paragraph::new(lines).style(palette().selection()),
+                Rect::new(rect.x, rect.y, rect.width, content_height),
+            );
         } else {
-            Style::default()
-        };
-        frame.render_widget(Paragraph::new(lines).style(style), rect);
+            frame.render_widget(Paragraph::new(lines), rect);
+        }
         app.hit_targets.push((rect, Target::Message(id)));
         if let Some((media, area, skip)) = inline {
             if media.path.is_none() && !app.visible_media.contains(&media.file_id) {
@@ -1788,30 +2593,78 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             }
         }
     }
+    app.visible_read_ids = read_ids;
     app.hit_targets.extend(text_targets);
     scrollbar(frame, app, area, Pane::Timeline, top, app.timeline_max);
     if app.quote_back.is_some() && area.height > 0 {
-        button(
-            frame,
-            app,
-            Rect::new(area.x, area.bottom() - 1, area.width.saturating_sub(1), 1),
-            "[返回引用前位置 · b]",
-            Action::QuoteBack,
-        );
-    } else if top < app.timeline_max && area.height > 0 {
-        let button_area = Rect::new(area.x, area.bottom() - 1, area.width.saturating_sub(1), 1);
-        button(
-            frame,
-            app,
-            button_area,
-            &if app.pending_messages > 0 {
-                format!("[↓ {} 条新消息 · 回到底部]", app.pending_messages)
+        let bar = Rect::new(area.x, area.bottom() - 1, area.width.saturating_sub(1), 1);
+        let style = Style::default()
+            .fg(palette().accent)
+            .bg(palette().surface)
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(if palette().is_monochrome() {
+                Modifier::REVERSED
             } else {
-                "[↓ 回到底部]".into()
-            },
-            Action::Bottom,
+                Modifier::empty()
+            });
+        frame.render_widget(
+            Paragraph::new(" 返回引用前位置 · b ")
+                .style(style)
+                .alignment(Alignment::Center),
+            bar,
         );
+        app.hit_targets
+            .push((bar, Target::Command(Action::QuoteBack)));
+    } else if (top < app.timeline_max || app.store.context_window) && area.height > 0 {
+        let button_area = Rect::new(area.x, area.bottom() - 1, area.width.saturating_sub(1), 1);
+        let label = if app.pending_messages > 0 {
+            format!(" ↓ {} 条新消息 · 回到底部 ", app.pending_messages)
+        } else {
+            " ↓ 回到底部 ".into()
+        };
+        let style = if app.pending_messages > 0 {
+            palette().primary()
+        } else {
+            Style::default()
+                .fg(palette().accent)
+                .bg(palette().surface)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(if palette().is_monochrome() {
+                    Modifier::REVERSED
+                } else {
+                    Modifier::empty()
+                })
+        };
+        frame.render_widget(
+            Paragraph::new(label)
+                .style(style)
+                .alignment(Alignment::Center),
+            button_area,
+        );
+        app.hit_targets
+            .push((button_area, Target::Command(Action::Bottom)));
     }
+}
+
+fn multi_select_bar(frame: &mut Frame, app: &mut App, area: Rect) {
+    let title = format!("多选模式 · 已选 {} 条消息", app.multi_select.len());
+    let block = panel(title, true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let cols = Layout::horizontal([
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+    ])
+    .split(Rect::new(inner.x, inner.y, inner.width, 1));
+    button(frame, app, cols[0], "[转发]", Action::MultiForward);
+    button(frame, app, cols[1], "[复制]", Action::MultiCopy);
+    button(frame, app, cols[2], "[删除]", Action::MultiDelete);
+    button(frame, app, cols[3], "[取消]", Action::MultiClear);
 }
 
 fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1822,6 +2675,24 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
         InputMode::Search => "搜索",
         InputMode::React(_) => "表情回应",
     };
+    let focused = app.composer_focus && app.input_mode != InputMode::Off;
+    let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2);
+    app.composer_width = usize::from(inner_width.saturating_sub(1)).max(1);
+    let row_hint = if !app.draft.is_empty() && inner_width > 1 && inner_height > 0 {
+        let edit_width = app.composer_width;
+        let rows = crate::text::rows(&app.draft, edit_width);
+        if rows.len() > usize::from(inner_height) {
+            let pos = crate::text::cursor(&app.draft, app.draft_cursor);
+            let current = rows.iter().rposition(|row| row.start <= pos).unwrap_or(0) + 1;
+            format!(" · 第 {current}/{} 行", rows.len())
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    let max_title = usize::from(area.width.saturating_sub(8 + u16::from(focused) * 2));
     let title = if let InputMode::Reply(id) | InputMode::Edit(id) = app.input_mode {
         app.store
             .messages
@@ -1830,21 +2701,20 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|message| {
                 crate::text::ellipsize(
                     &format!(
-                        "{title} · {}：{}",
+                        "{title} · {}：{}{row_hint}",
                         app.store.sender_label(message),
-                        excerpt(&message.text, usize::from(area.width.saturating_sub(8)))
+                        excerpt(&message.text, max_title)
                     ),
-                    usize::from(area.width.saturating_sub(8)),
+                    max_title,
                 )
             })
-            .unwrap_or_else(|| title.to_owned())
+            .unwrap_or_else(|| crate::text::ellipsize(&format!("{title}{row_hint}"), max_title))
+    } else if !row_hint.is_empty() {
+        crate::text::ellipsize(&format!("{title}{row_hint}"), max_title)
     } else {
         title.to_owned()
     };
-    let block = panel(
-        title,
-        app.composer_focus && app.input_mode != InputMode::Off,
-    );
+    let block = panel(title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.hit_targets.push((area, Target::Composer));
@@ -1853,7 +2723,7 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
             frame,
             app,
             Rect::new(area.right().saturating_sub(5), area.y, 3, 1),
-            "×",
+            "[×]",
             Action::Cancel,
         );
     }
@@ -1863,44 +2733,115 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
         area.width.saturating_sub(2),
         1,
     );
-    let cols = Layout::horizontal([
-        Constraint::Percentage(33),
-        Constraint::Percentage(33),
-        Constraint::Percentage(34),
-    ])
-    .split(tools);
-    for (rect, label, action) in [
-        (cols[0], "[附件]", Action::File),
-        (cols[1], "[贴纸]", Action::Stickers),
-        (
-            cols[2],
-            if matches!(app.input_mode, InputMode::Search) {
-                "[查找]"
-            } else if matches!(app.input_mode, InputMode::Edit(_)) {
-                "[保存]"
-            } else {
-                "[发送]"
-            },
-            Action::Submit,
-        ),
-    ] {
-        button(frame, app, rect, label, action);
+    let submit_label = if matches!(app.input_mode, InputMode::Search) {
+        "[查找]"
+    } else if matches!(app.input_mode, InputMode::Edit(_)) {
+        "[保存]"
+    } else if matches!(app.input_mode, InputMode::React(_)) {
+        "[回应]"
+    } else {
+        "[发送]"
+    };
+    if tools.width >= 36 {
+        let cols = Layout::horizontal([
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(1),
+            Constraint::Length(14),
+        ])
+        .split(tools);
+        button(frame, app, cols[0], "[附件]", Action::File);
+        button(frame, app, cols[1], "[贴纸]", Action::Stickers);
+        if app.input_mode == InputMode::Search {
+            let label = format!("[{} ↻]", app.parity.filter.label());
+            button(frame, app, cols[2], &label, Action::CycleMediaFilter);
+        }
+        button(frame, app, cols[3], submit_label, Action::Submit);
+    } else {
+        let cols = Layout::horizontal([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(tools);
+        button(frame, app, cols[0], "[附件]", Action::File);
+        button(frame, app, cols[1], "[贴纸]", Action::Stickers);
+        button(frame, app, cols[2], submit_label, Action::Submit);
     }
+    let editor_area = if matches!(app.input_mode, InputMode::React(_)) && inner.height >= 3 {
+        let strip = Rect::new(inner.x, inner.y, inner.width, 1);
+        let mut x = strip.x;
+        for (idx, reaction) in app
+            .reaction_choices()
+            .iter()
+            .skip(app.parity.reaction_page * 8)
+            .take(8)
+            .enumerate()
+        {
+            let label = format!("{}{}", idx + 1, reaction.label());
+            let w = (UnicodeWidthStr::width(label.as_str()) as u16) + 2;
+            if x + w > strip.right() {
+                break;
+            }
+            let cell = Rect::new(x, strip.y, w, 1);
+            frame.render_widget(
+                Paragraph::new(label)
+                    .style(Style::default().fg(palette().text).bg(palette().surface))
+                    .alignment(Alignment::Center),
+                cell,
+            );
+            app.hit_targets
+                .push((cell, Target::Command(Action::QuickReact(idx))));
+            x = x.saturating_add(w + 1);
+        }
+        Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1)
+    } else {
+        inner
+    };
     let value = app.draft.clone();
     editor(
         frame,
         app,
-        inner,
+        editor_area,
         Editor::Composer,
         &value,
         app.draft_cursor,
         false,
     );
-    if value.is_empty() && app.input_mode == InputMode::Off {
-        frame.render_widget(
-            Paragraph::new("点击写消息").style(Style::default().fg(palette().muted)),
-            inner,
+    if value.is_empty() {
+        let media_hint = format!(
+            "{} · Ctrl+F 切换类型 · 可留空查找",
+            app.parity.filter.label()
         );
+        let reaction_count = if matches!(app.input_mode, InputMode::React(_)) {
+            app.reaction_choices().len()
+        } else {
+            0
+        };
+        let reaction_hint = if reaction_count > 8 {
+            "1-8 回应 · PgUp/PgDn 翻页"
+        } else if reaction_count == 0 {
+            "此消息没有可用回应"
+        } else {
+            "按 1-8 快捷回应，或输入表情"
+        };
+        let placeholder = match app.input_mode {
+            InputMode::Off => Some(if editor_area.width >= 22 {
+                "点击写消息（或按 i）"
+            } else {
+                "点击写消息"
+            }),
+            InputMode::React(_) => Some(reaction_hint),
+            InputMode::Search => Some(media_hint.as_str()),
+            _ => None,
+        };
+        if let Some(text) = placeholder {
+            frame.render_widget(
+                Paragraph::new(crate::text::ellipsize(text, usize::from(editor_area.width)))
+                    .style(Style::default().fg(palette().muted)),
+                editor_area,
+            );
+        }
     }
 }
 
@@ -1912,8 +2853,13 @@ fn inline_media_view(
     full_height: u16,
     skip: u16,
 ) {
-    // The fullscreen preview covers the timeline. Do not prepare hidden images.
-    if app.preview_message.is_some() || app.sticker_picker || app.attachments.is_some() {
+    // Pause hidden inline images behind media overlays, and skip native terminal
+    // graphics protocols behind any modal so placements cannot bleed over borders.
+    if app.preview_message.is_some()
+        || app.sticker_picker
+        || app.attachments.is_some()
+        || (app.has_overlay() && app.media.protocol_name != "Halfblocks")
+    {
         return;
     }
     let Some(path) = &media.path else {
@@ -2072,19 +3018,40 @@ fn action_dialog(frame: &mut Frame, app: &mut App, area: Rect, selected: usize) 
     let height = (entries.len() as u16 + 3).max(5);
     let inner = modal(frame, app, centered(area, 40, height), title);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let has_scroll = entries.len() > usize::from(rows[0].height) && rows[0].width >= 4;
+    let list_area = if has_scroll {
+        Rect::new(
+            rows[0].x,
+            rows[0].y,
+            rows[0].width.saturating_sub(1),
+            rows[0].height,
+        )
+    } else {
+        rows[0]
+    };
     let items: Vec<_> = entries
         .iter()
         .enumerate()
         .map(|(index, item)| {
+            let label_style = if item.action == Action::Delete {
+                Style::default().fg(palette().error)
+            } else {
+                Style::default()
+            };
+            let key_style = if index == selected {
+                palette().muted_on_selection()
+            } else {
+                Style::default().fg(palette().muted)
+            };
             ListItem::new(Line::from(vec![
-                Span::raw(item.label),
+                Span::styled(item.label, label_style),
                 Span::styled(
                     if item.key == '\0' {
                         String::new()
                     } else {
                         format!("  {}", item.key)
                     },
-                    Style::default().fg(palette().muted),
+                    key_style,
                 ),
             ]))
             .style(if index == selected {
@@ -2099,19 +3066,29 @@ fn action_dialog(frame: &mut Frame, app: &mut App, area: Rect, selected: usize) 
         List::new(items)
             .highlight_symbol("› ")
             .highlight_style(Style::default()),
-        rows[0],
+        list_area,
         &mut state,
     );
     for (row, item) in entries
         .iter()
         .skip(state.offset())
-        .take(usize::from(rows[0].height))
+        .take(usize::from(list_area.height))
         .enumerate()
     {
         app.hit_targets.push((
-            Rect::new(rows[0].x, rows[0].y + row as u16, rows[0].width, 1),
+            Rect::new(list_area.x, list_area.y + row as u16, list_area.width, 1),
             Target::Action(item.action),
         ));
+    }
+    if has_scroll {
+        scrollbar(
+            frame,
+            app,
+            rows[0],
+            Pane::Modal,
+            selected,
+            entries.len().saturating_sub(1),
+        );
     }
     let checking = matches!(app.menu_scope, crate::menu::Scope::Message { .. })
         && crate::menu::permissions(app).is_none();
@@ -2128,8 +3105,9 @@ fn action_dialog(frame: &mut Frame, app: &mut App, area: Rect, selected: usize) 
 
 fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     // Telegram-like tray anchored above the composer, with tabs and a thumbnail grid.
-    let column = chat_column(area);
-    let composer_y = column.bottom().saturating_sub(4);
+    let column = chat_column(app, area);
+    let ch = composer_height(app, column.width, column.height);
+    let composer_y = column.bottom().saturating_sub(ch);
     let space = composer_y.saturating_sub(column.y);
     let context = if space >= 10 { 3 } else { 0 };
     let height = space.saturating_sub(context).min(14);
@@ -2206,10 +3184,6 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
             .unwrap_or("贴纸包".into()),
         crate::stickers::Tab::Search => format!("搜索：{}", app.sticker_panel.submitted),
     };
-    frame.render_widget(
-        Paragraph::new(title).style(Style::default().fg(palette().muted)),
-        parts[1],
-    );
     let grid = parts[2];
     let columns = usize::from((grid.width / 12).max(1)).min(6);
     let tile_height = if grid.height >= 8 {
@@ -2229,6 +3203,22 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if selected_row >= app.sticker_panel.top + rows {
         app.sticker_panel.top = selected_row + 1 - rows;
+    }
+    let total_rows = total.div_ceil(columns).max(1);
+    if parts[1].height > 0 {
+        let progress = if total_rows > rows {
+            format!(" · 第 {}/{} 行", selected_row + 1, total_rows)
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(crate::text::ellipsize(
+                &format!("{title}{progress}"),
+                usize::from(parts[1].width),
+            ))
+            .style(Style::default().fg(palette().muted)),
+            parts[1],
+        );
     }
     if total == 0 {
         let loading = app.sticker_panel.loading
@@ -2261,9 +3251,16 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
             tile_height,
         )
         .intersection(grid);
+        let tile_selected = index == app.sticker_cursor && !app.sticker_panel.search_focus;
         if tile.height < 3 {
             frame.render_widget(
-                Paragraph::new(sticker.emoji).alignment(Alignment::Center),
+                Paragraph::new(sticker.emoji)
+                    .style(if tile_selected {
+                        palette().selection().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    })
+                    .alignment(Alignment::Center),
                 tile,
             );
             app.hit_targets.push((tile, Target::Sticker(index)));
@@ -2271,8 +3268,10 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(if index == app.sticker_cursor {
+            .border_style(Style::default().fg(if tile_selected {
                 palette().accent
+            } else if index == app.sticker_cursor {
+                palette().border
             } else {
                 palette().muted
             }));
@@ -2305,12 +3304,44 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         app.hit_targets.push((tile, Target::Sticker(index)));
     }
-    let search = Layout::horizontal([Constraint::Min(1), Constraint::Length(8)]).split(parts[3]);
+    let search = Layout::horizontal([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(8),
+    ])
+    .split(parts[3]);
+    let search_focused = app.sticker_panel.search_focus;
+    if search_focused {
+        frame.buffer_mut().set_style(
+            Rect::new(parts[3].x, parts[3].y, search[0].width + search[1].width, 1),
+            palette().base(),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("/ ").style(
+            Style::default()
+                .fg(if search_focused {
+                    palette().accent
+                } else {
+                    palette().muted
+                })
+                .add_modifier(if search_focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        search[0],
+    );
+    app.hit_targets.push((
+        search[0],
+        Target::Cursor(Editor::StickerSearch, app.sticker_panel.query_cursor),
+    ));
     let value = app.sticker_panel.query.clone();
     editor(
         frame,
         app,
-        search[0],
+        search[1],
         Editor::StickerSearch,
         &value,
         app.sticker_panel.query_cursor,
@@ -2319,14 +3350,22 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     if value.is_empty() {
         frame.render_widget(
             Paragraph::new("搜索贴纸 / 表情…").style(Style::default().fg(palette().muted)),
-            search[0],
+            search[1],
         );
     }
-    button(frame, app, search[1], "[搜索]", Action::StickerSearch);
+    button(frame, app, search[2], "[搜索]", Action::StickerSearch);
     let footer = Layout::horizontal([Constraint::Min(1), Constraint::Length(12)]).split(parts[4]);
+    let summary = if total_rows > rows && parts[1].height == 0 {
+        format!("{total} 张 · {}/{}行", selected_row + 1, total_rows)
+    } else {
+        format!("{total} 张 · Enter 发送 · Tab 搜索")
+    };
     frame.render_widget(
-        Paragraph::new(format!("{total} 张 · Enter 发送 · Tab 搜索"))
-            .style(Style::default().fg(palette().muted)),
+        Paragraph::new(crate::text::ellipsize(
+            &summary,
+            usize::from(footer[0].width),
+        ))
+        .style(Style::default().fg(palette().muted)),
         footer[0],
     );
     let favorite = app
@@ -2352,28 +3391,60 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
-    let inner = modal(frame, app, centered(area, 86, 25), "发送附件");
+    let title = if app
+        .attachments
+        .as_ref()
+        .is_some_and(|picker| picker.reply_to.is_some())
+    {
+        "发送附件 · 回复"
+    } else {
+        "发送附件"
+    };
+    let inner = modal(frame, app, centered(area, 86, 25), title);
+    let compact_tools = inner.width < 34;
+    let wide = inner.width >= 48;
     let parts = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(2),
-        Constraint::Length(2),
+        Constraint::Length(if inner.height >= 10 { 2 } else { 1 }),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(inner);
-    let tools = Layout::horizontal([
-        Constraint::Length(12),
-        Constraint::Min(1),
-        Constraint::Length(8),
-    ])
-    .split(parts[0]);
-    let picker = app.attachments.as_mut().unwrap();
-    let mode = if picker.photos {
-        "[图片 F5]"
+    let tools = if compact_tools {
+        Layout::horizontal([
+            Constraint::Percentage(35),
+            Constraint::Percentage(35),
+            Constraint::Percentage(30),
+        ])
+        .split(parts[0])
     } else {
-        "[原文件 F5]"
+        Layout::horizontal([
+            Constraint::Length(12),
+            Constraint::Min(1),
+            Constraint::Length(8),
+        ])
+        .split(parts[0])
+    };
+    let picker = app.attachments.as_mut().unwrap();
+    let focus = picker.focus;
+    let mode = match (picker.photos, compact_tools) {
+        (true, true) => "[图片]",
+        (false, true) => "[文件]",
+        (true, false) => "[图片 F5]",
+        (false, false) => "[原文件 F5]",
+    };
+    let paste_label = if compact_tools {
+        "[粘贴]"
+    } else {
+        "[粘贴 F7]"
+    };
+    let parent_label = if compact_tools {
+        "[上级]"
+    } else {
+        "[上一级]"
     };
     let directory = crate::text::ellipsize(
         &picker.directory.to_string_lossy(),
@@ -2384,21 +3455,51 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let caption = picker.caption.clone();
     let caption_cursor = picker.caption_cursor;
     let error = picker.error.clone();
-    picker.visible = usize::from(parts[3].height).max(1);
+    let browser_rows = if wide {
+        parts[3].height
+    } else {
+        parts[3].height.saturating_sub(1).max(1)
+    };
+    picker.visible = usize::from(browser_rows).max(1);
     picker.offset = picker
         .offset
         .min(picker.entries.len().saturating_sub(picker.visible));
     button(frame, app, tools[0], mode, Action::AttachmentMode);
-    button(frame, app, tools[1], "[粘贴 F7]", Action::PasteClipboard);
-    button(frame, app, tools[2], "[上一级]", Action::AttachmentParent);
+    button(frame, app, tools[1], paste_label, Action::PasteClipboard);
+    button(frame, app, tools[2], parent_label, Action::AttachmentParent);
     frame.render_widget(
         Paragraph::new(directory).style(Style::default().fg(palette().muted)),
         parts[1],
     );
+    let path_focused = focus == crate::attachments::Focus::Path;
+    if path_focused {
+        frame.buffer_mut().set_style(parts[2], palette().base());
+    }
+    let path_cols = Layout::horizontal([Constraint::Length(6), Constraint::Min(1)]).split(parts[2]);
+    frame.render_widget(
+        Paragraph::new("路径: ").style(
+            Style::default()
+                .fg(if path_focused {
+                    palette().accent
+                } else {
+                    palette().muted
+                })
+                .add_modifier(if path_focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        path_cols[0],
+    );
+    app.hit_targets.push((
+        path_cols[0],
+        Target::Cursor(Editor::AttachmentPath, path_cursor),
+    ));
     editor(
         frame,
         app,
-        parts[2],
+        path_cols[1],
         Editor::AttachmentPath,
         &path,
         path_cursor,
@@ -2406,20 +3507,56 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     if path.is_empty() {
         frame.render_widget(
-            Paragraph::new("粘贴/拖入路径，或点击下方文件（Tab 编辑路径）")
-                .style(Style::default().fg(palette().muted)),
-            parts[2],
+            Paragraph::new(crate::text::ellipsize(
+                "粘贴/拖入路径，或点击下方文件（Tab 切换）",
+                usize::from(path_cols[1].width),
+            ))
+            .style(Style::default().fg(palette().muted)),
+            path_cols[1],
         );
     }
-    let columns = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+
+    let (browser_area, queue_area) = if wide {
+        let cols = Layout::horizontal([
+            Constraint::Percentage(60),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
         .split(parts[3]);
+        (cols[0], Some((cols[1], cols[2])))
+    } else {
+        let stack = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(parts[3]);
+        (stack[0], Some((Rect::default(), stack[1])))
+    };
+
+    let browser_focused = focus == crate::attachments::Focus::Browser;
     let picker = app.attachments.as_ref().unwrap();
+    let total_entries = picker.entries.len();
+    let offset = picker.offset;
+    let visible = picker.visible;
+    let has_browser_scroll = total_entries > visible && browser_area.width >= 4;
+    if let Some((divider, _)) = queue_area
+        && wide
+        && !has_browser_scroll
+    {
+        for row in 0..divider.height {
+            frame.render_widget(
+                Paragraph::new("│").style(Style::default().fg(palette().border)),
+                Rect::new(divider.x, divider.y + row, 1, 1),
+            );
+        }
+    }
+    let entry_width = if has_browser_scroll {
+        browser_area.width.saturating_sub(1)
+    } else {
+        browser_area.width
+    };
     let entries: Vec<_> = picker
         .entries
         .iter()
         .enumerate()
-        .skip(picker.offset)
-        .take(picker.visible)
+        .skip(offset)
+        .take(visible)
         .map(|(i, e)| {
             let parent = i == 0
                 && e.directory
@@ -2444,99 +3581,179 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     for (row, (index, label, selected)) in entries.into_iter().enumerate() {
-        let rect = Rect::new(columns[0].x, columns[0].y + row as u16, columns[0].width, 1);
+        let rect = Rect::new(browser_area.x, browser_area.y + row as u16, entry_width, 1);
+        let style = if selected && browser_focused {
+            palette()
+                .selection()
+                .fg(palette().accent)
+                .add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default()
+                .fg(palette().muted)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
         frame.render_widget(
-            Paragraph::new(crate::text::ellipsize(&label, usize::from(rect.width))).style(
-                if selected {
-                    palette().selection().fg(palette().accent)
-                } else {
-                    Style::default()
-                },
-            ),
+            Paragraph::new(crate::text::ellipsize(&label, usize::from(rect.width))).style(style),
             rect,
         );
         app.hit_targets.push((rect, Target::AttachmentEntry(index)));
     }
-    let picker = app.attachments.as_mut().unwrap();
-    picker.queue_visible = picker
-        .selected
-        .len()
-        .min(6)
-        .min(usize::from(columns[1].height.saturating_sub(1)))
-        .max(1);
-    picker.queue_offset = picker
-        .queue_offset
-        .min(picker.selected.len().saturating_sub(picker.queue_visible));
-    let queue_offset = picker.queue_offset;
-    let queue_visible = picker.queue_visible;
-    let preview_path = picker
-        .selected
-        .get(queue_offset)
-        .filter(|p| crate::attachments::photo_paths(&[(*p).clone()]))
-        .cloned();
-    let selected: Vec<_> = picker
-        .selected
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            (
-                i,
-                p.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(format!("已选 {}/10 · 滚动/移除", selected.len()))
-            .style(Style::default().fg(palette().accent)),
-        Rect::new(columns[1].x, columns[1].y, columns[1].width, 1),
-    );
-    app.hit_targets.push((columns[1], Target::AttachmentQueue));
-    let queue_rows = selected.len().min(queue_visible);
-    for (row, (index, name)) in selected
-        .into_iter()
-        .skip(queue_offset)
-        .take(queue_rows)
-        .enumerate()
-    {
-        let rect = Rect::new(
-            columns[1].x,
-            columns[1].y + 1 + row as u16,
-            columns[1].width,
-            1,
+    if has_browser_scroll {
+        scrollbar(
+            frame,
+            app,
+            browser_area,
+            Pane::Modal,
+            offset,
+            total_entries.saturating_sub(visible),
         );
-        frame.render_widget(
-            Paragraph::new(crate::text::ellipsize(
-                &format!("× {name}"),
-                usize::from(rect.width),
-            )),
-            rect,
-        );
-        app.hit_targets
-            .push((rect, Target::AttachmentRemove(index)));
     }
-    if let Some(path) = preview_path {
-        let preview = Rect::new(
-            columns[1].x,
-            columns[1].y + 1 + queue_rows as u16,
-            columns[1].width,
-            columns[1].height.saturating_sub(1 + queue_rows as u16),
-        );
-        let size = Size::new(preview.width, preview.height);
-        let id = crate::attachments::preview_id(&path);
-        app.media.request(id, &path.to_string_lossy(), size);
-        if let Some(image) = app.media.get(id, size) {
-            let image_area = centered(preview, image.size().width, image.size().height);
-            frame.render_widget(Image::new(image).allow_clipping(true), image_area);
-            finish_sixel(frame, image_area, &app.media.protocol_name);
+
+    if let Some((_, queue_col)) = queue_area {
+        let picker = app.attachments.as_mut().unwrap();
+        picker.queue_visible = picker
+            .selected
+            .len()
+            .min(6)
+            .min(usize::from(queue_col.height.saturating_sub(1)))
+            .max(1);
+        picker.queue_offset = picker
+            .queue_offset
+            .min(picker.selected.len().saturating_sub(picker.queue_visible));
+        let queue_offset = picker.queue_offset;
+        let queue_visible = picker.queue_visible;
+        let preview_path = wide
+            .then(|| {
+                picker
+                    .selected
+                    .get(queue_offset)
+                    .filter(|p| crate::attachments::photo_paths(&[(*p).clone()]))
+                    .cloned()
+            })
+            .flatten();
+        let selected: Vec<_> = picker
+            .selected
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                (
+                    i,
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .collect();
+        if wide {
+            frame.render_widget(
+                Paragraph::new(format!("已选 {}/10 · 滚动/移除", selected.len()))
+                    .style(Style::default().fg(palette().accent)),
+                Rect::new(queue_col.x, queue_col.y, queue_col.width, 1),
+            );
+            app.hit_targets.push((queue_col, Target::AttachmentQueue));
+            let queue_rows = selected.len().min(queue_visible);
+            for (row, (index, name)) in selected
+                .into_iter()
+                .skip(queue_offset)
+                .take(queue_rows)
+                .enumerate()
+            {
+                let rect = Rect::new(
+                    queue_col.x,
+                    queue_col.y + 1 + row as u16,
+                    queue_col.width,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new(crate::text::ellipsize(
+                        &format!("× {name}"),
+                        usize::from(rect.width),
+                    )),
+                    rect,
+                );
+                app.hit_targets
+                    .push((rect, Target::AttachmentRemove(index)));
+            }
+            if let Some(path) = preview_path {
+                let preview = Rect::new(
+                    queue_col.x,
+                    queue_col.y + 1 + queue_rows as u16,
+                    queue_col.width,
+                    queue_col.height.saturating_sub(1 + queue_rows as u16),
+                );
+                let size = Size::new(preview.width, preview.height);
+                let id = crate::attachments::preview_id(&path);
+                app.media.request(id, &path.to_string_lossy(), size);
+                if let Some(image) = app.media.get(id, size) {
+                    let image_area = centered(preview, image.size().width, image.size().height);
+                    frame.render_widget(Image::new(image).allow_clipping(true), image_area);
+                    finish_sixel(frame, image_area, &app.media.protocol_name);
+                }
+            }
+        } else {
+            let summary = if let Some((_, first)) = selected.first() {
+                if selected.len() > 1 {
+                    format!("已选 {}/10 · × {first} 等", selected.len())
+                } else {
+                    format!("已选 1/10 · × {first}")
+                }
+            } else {
+                "已选 0/10 · 点击文件选择".into()
+            };
+            frame.render_widget(
+                Paragraph::new(crate::text::ellipsize(
+                    &summary,
+                    usize::from(queue_col.width),
+                ))
+                .style(Style::default().fg(if selected.is_empty() {
+                    palette().muted
+                } else {
+                    palette().accent
+                })),
+                queue_col,
+            );
+            if !selected.is_empty() {
+                app.hit_targets
+                    .push((queue_col, Target::AttachmentRemove(0)));
+            } else {
+                app.hit_targets.push((queue_col, Target::AttachmentQueue));
+            }
         }
     }
+
+    let caption_focused = focus == crate::attachments::Focus::Caption;
+    if caption_focused {
+        frame.buffer_mut().set_style(parts[4], palette().base());
+    }
+    let caption_cols =
+        Layout::horizontal([Constraint::Length(6), Constraint::Min(1)]).split(parts[4]);
+    frame.render_widget(
+        Paragraph::new("说明: ").style(
+            Style::default()
+                .fg(if caption_focused {
+                    palette().accent
+                } else {
+                    palette().muted
+                })
+                .add_modifier(if caption_focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        caption_cols[0],
+    );
+    app.hit_targets.push((
+        caption_cols[0],
+        Target::Cursor(Editor::AttachmentCaption, caption_cursor),
+    ));
     editor(
         frame,
         app,
-        parts[4],
+        caption_cols[1],
         Editor::AttachmentCaption,
         &caption,
         caption_cursor,
@@ -2544,20 +3761,28 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     if caption.is_empty() {
         frame.render_widget(
-            Paragraph::new("添加说明（可选，Tab 或点击输入）")
-                .style(Style::default().fg(palette().muted)),
-            parts[4],
+            Paragraph::new(crate::text::ellipsize(
+                "添加说明（可选，Tab 或点击输入）",
+                usize::from(caption_cols[1].width),
+            ))
+            .style(Style::default().fg(palette().muted)),
+            caption_cols[1],
         );
     }
     frame.render_widget(
-        Paragraph::new(error.unwrap_or("Enter 选择 · Space 多选 · F5 切换模式 · F8 发送".into()))
-            .style(
-                Style::default().fg(if app.attachments.as_ref().unwrap().error.is_some() {
-                    palette().error
-                } else {
-                    palette().muted
-                }),
-            ),
+        Paragraph::new(crate::text::ellipsize(
+            error
+                .as_deref()
+                .unwrap_or("Enter 选择 · Space 多选 · F5 切换模式 · F8 发送"),
+            usize::from(parts[5].width),
+        ))
+        .style(Style::default().fg(
+            if app.attachments.as_ref().unwrap().error.is_some() {
+                palette().error
+            } else {
+                palette().muted
+            },
+        )),
         parts[5],
     );
     let footer = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2566,18 +3791,315 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     button(frame, app, footer[1], "[取消]", Action::Cancel);
 }
 
+fn quick_switcher_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
+    let global = app.global_message_mode();
+    let title = if global {
+        "全局消息搜索 · Tab 切换"
+    } else {
+        "快速切换会话 · Ctrl+K"
+    };
+    let inner = modal(frame, app, centered(area, 58, 20), title);
+    let parts = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    let query = app
+        .quick_switcher
+        .as_ref()
+        .map(|sw| sw.query.clone())
+        .unwrap_or_default();
+    let cursor = app.quick_switcher.as_ref().map_or(0, |sw| sw.cursor);
+    frame.buffer_mut().set_style(parts[0], palette().base());
+    let search_cols =
+        Layout::horizontal([Constraint::Length(3), Constraint::Min(1)]).split(parts[0]);
+    frame.render_widget(
+        Paragraph::new(" ⌕ ").style(
+            Style::default()
+                .fg(palette().accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        search_cols[0],
+    );
+    app.hit_targets
+        .push((search_cols[0], Target::Cursor(Editor::QuickSwitch, cursor)));
+    editor(
+        frame,
+        app,
+        search_cols[1],
+        Editor::QuickSwitch,
+        &query,
+        cursor,
+        false,
+    );
+    if query.is_empty() {
+        frame.render_widget(
+            Paragraph::new(crate::text::ellipsize(
+                if global {
+                    "输入关键词搜索所有会话…"
+                } else {
+                    "输入会话名、@用户名或最近消息…"
+                },
+                usize::from(search_cols[1].width),
+            ))
+            .style(Style::default().fg(palette().muted)),
+            search_cols[1],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("─".repeat(usize::from(parts[1].width)))
+            .style(Style::default().fg(palette().border)),
+        parts[1],
+    );
+    let entries = app.quick_entries();
+    let list_area = parts[2];
+    let visible = usize::from(list_area.height / 2).max(1);
+    app.modal_visible = visible;
+    let selected = {
+        let sw = app.quick_switcher.as_mut().unwrap();
+        sw.selected = sw.selected.min(entries.len().saturating_sub(1));
+        if sw.selected < sw.scroll {
+            sw.scroll = sw.selected;
+        } else if sw.selected >= sw.scroll + visible {
+            sw.scroll = sw.selected + 1 - visible;
+        }
+        sw.selected
+    };
+    let scroll = app.quick_switcher.as_ref().unwrap().scroll;
+    if entries.is_empty() {
+        empty(
+            frame,
+            list_area,
+            if global {
+                "没有匹配的消息"
+            } else {
+                "没有匹配的会话"
+            },
+            "尝试其他关键词，或按 Esc 关闭",
+        );
+    } else {
+        let has_scroll = entries.len() > visible && list_area.width >= 6;
+        let row_w = if has_scroll {
+            list_area.width.saturating_sub(1)
+        } else {
+            list_area.width
+        };
+        for (i, (id, title, sub, remote)) in entries.iter().skip(scroll).take(visible).enumerate() {
+            let abs = scroll + i;
+            let is_sel = abs == selected;
+            let y = list_area.y + (i * 2) as u16;
+            let h = 2u16.min(list_area.bottom().saturating_sub(y));
+            if h == 0 {
+                break;
+            }
+            let rect = Rect::new(list_area.x, y, row_w, h);
+            let chat = (!global).then(|| app.store.chat(*id)).flatten();
+            let badge = if *remote {
+                " 全局 ".to_owned()
+            } else if let Some(c) = chat
+                && c.unread > 0
+            {
+                if c.unread > 999 {
+                    " 999+ ".to_owned()
+                } else {
+                    format!(" {} ", c.unread)
+                }
+            } else {
+                String::new()
+            };
+            let badge_w = UnicodeWidthStr::width(badge.as_str());
+            let prefix = if is_sel { "› " } else { "  " };
+            let text_w = usize::from(row_w).saturating_sub(2);
+            let title_str = crate::text::ellipsize(
+                title,
+                text_w.saturating_sub(badge_w + usize::from(badge_w > 0)),
+            );
+            let pad = text_w.saturating_sub(UnicodeWidthStr::width(title_str.as_str()) + badge_w);
+            let badge_style = if *remote || chat.is_some_and(|c| c.muted) {
+                Style::default().fg(palette().muted).bg(palette().surface)
+            } else {
+                palette().primary()
+            };
+            let mut row_lines = vec![Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if is_sel {
+                        palette().accent
+                    } else {
+                        palette().muted
+                    }),
+                ),
+                Span::styled(title_str, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(badge, badge_style),
+            ])];
+            if h >= 2 {
+                let sub_style = if is_sel {
+                    palette().muted_on_selection()
+                } else {
+                    Style::default().fg(palette().muted)
+                };
+                row_lines.push(Line::styled(
+                    format!("  {}", excerpt(sub, text_w)),
+                    sub_style,
+                ));
+            }
+            frame.render_widget(
+                Paragraph::new(row_lines).style(if is_sel {
+                    palette().selection()
+                } else {
+                    palette().surface_base()
+                }),
+                rect,
+            );
+            if global {
+                if let Some((chat, message)) = app.global_hit_key(*id as usize) {
+                    app.hit_targets
+                        .push((rect, Target::GlobalSearchHit(chat, message)));
+                }
+            } else {
+                app.hit_targets.push((rect, Target::QuickSwitchChat(*id)));
+            }
+        }
+        if has_scroll {
+            scrollbar(
+                frame,
+                app,
+                list_area,
+                Pane::Modal,
+                scroll,
+                entries.len().saturating_sub(visible),
+            );
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(crate::text::ellipsize(
+            &format!(
+                "{} 个匹配 · Tab 切换会话 / 全局消息 · Enter 打开",
+                entries.len()
+            ),
+            usize::from(parts[3].width),
+        ))
+        .style(Style::default().fg(palette().muted)),
+        parts[3],
+    );
+}
+
+fn chat_info_body(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(chat_id) = app.store.active_chat else {
+        empty(frame, area, "未选择会话", "先打开一个会话查看详情");
+        return;
+    };
+    let Some(chat) = app.store.chat(chat_id).cloned() else {
+        empty(frame, area, "暂无会话详情", "等待同步会话信息…");
+        return;
+    };
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+    ])
+    .split(area);
+    let mut lines = vec![Line::styled(
+        chat.title.clone(),
+        Style::default()
+            .fg(palette().accent)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if !chat.subtitle.is_empty() {
+        lines.push(muted(chat.subtitle.clone()));
+    }
+    if !chat.username.is_empty() {
+        lines.push(Line::styled(
+            format!("@{}", chat.username.trim_start_matches('@')),
+            Style::default().fg(palette().incoming),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "简介 / 信息",
+        Style::default().fg(palette().accent),
+    ));
+    if chat.bio.is_empty() {
+        lines.push(muted("暂无简介（后端接入 FullInfo 后展示）"));
+    } else {
+        lines.push(Line::from(chat.bio.clone()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled("状态", Style::default().fg(palette().accent)));
+    lines.push(Line::from(format!("会话 ID   {}", chat.id)));
+    lines.push(Line::from(format!(
+        "通知      {}",
+        if chat.muted { "已静音" } else { "已开启" }
+    )));
+    lines.push(Line::from(format!(
+        "置顶      {}",
+        if chat.pinned {
+            "已置顶"
+        } else {
+            "未置顶"
+        }
+    )));
+    lines.push(Line::from(format!("未读消息  {}", chat.unread)));
+    if let Some(pin) = &chat.pinned_message {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "置顶消息",
+            Style::default().fg(palette().accent),
+        ));
+        lines.push(muted(excerpt(&pin.excerpt, 120)));
+    }
+    scrolling_text(frame, app, lines, rows[0]);
+    frame.render_widget(
+        Paragraph::new("─".repeat(usize::from(rows[1].width)))
+            .style(Style::default().fg(palette().border)),
+        rows[1],
+    );
+    let row0 = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(Rect::new(rows[2].x, rows[2].y, rows[2].width, 1));
+    button(
+        frame,
+        app,
+        row0[0],
+        if chat.muted {
+            "[取消静音]"
+        } else {
+            "[静音通知]"
+        },
+        Action::ToggleMute,
+    );
+    button(
+        frame,
+        app,
+        row0[1],
+        if chat.pinned {
+            "[取消置顶]"
+        } else {
+            "[置顶会话]"
+        },
+        Action::TogglePin,
+    );
+    let row1 = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(Rect::new(rows[2].x, rows[2].y + 1, rows[2].width, 1));
+    button(frame, app, row1[0], "[搜索消息]", Action::Search);
+    button(frame, app, row1[1], "[发送附件]", Action::File);
+}
+
 fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = modal(frame, app, centered(area, 64, 24), "使用帮助");
     let lines = vec![
         Line::styled("浏览会话", Style::default().fg(palette().accent)),
         muted("单击选择 · 右键操作 · 滚轮滚动所在面板"),
-        Line::from("↑ ↓ / j k 选择    Enter 打开    Tab 切换会话与消息"),
+        Line::from("Ctrl+K / K 快速切换会话    I 会话详情    Tab 切换面板"),
+        Line::from("↑ ↓ / j k 选择    Enter 打开    [ ] 切换分组"),
         Line::from("g 加载更早消息    m 更多会话    PgUp/PgDn 滚动消息"),
         Line::from(""),
         Line::styled("聊天与附件", Style::default().fg(palette().accent)),
         Line::from("i 写消息    Enter 消息操作/媒体预览    Space 更多操作"),
-        Line::from("r 回复    e 编辑    f 转发    x 回应    d 删除"),
-        Line::from("S 快速收藏到收藏夹    D 复读到当前会话"),
+        Line::from("r 回复    e 编辑    f 转发    x 回应（1-8 快捷）    d 删除"),
+        Line::from("V 多选批量操作    L 打开消息链接    S 收藏    D 复读"),
         Line::from("p 图片 / a 文件 / Ctrl+O 附件 · t 贴纸 · / 搜索"),
         Line::from("F7 / Ctrl+V 读取剪贴板图片、文件或文字；F8 确认发送"),
         Line::from("附件：点击多选 / 拖入路径 · Tab 说明 · F8 / Ctrl+Enter 发送"),
@@ -2585,12 +4107,12 @@ fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("v 预览媒体    o 用系统程序打开"),
         Line::from(""),
         Line::styled("输入与导航", Style::default().fg(palette().accent)),
-        Line::from("支持直接粘贴    Alt+Enter 换行    Ctrl+U 清空输入"),
-        Line::from("Enter 提交    Esc 取消当前操作    s 设置    q 退出"),
-        Line::from("c 复制消息 · F6 鼠标开关 · Ctrl+Q 随时退出"),
+        Line::from("↑ ↓ 多行移光标    Alt+Enter 换行    Ctrl+W / Alt+BS 删词"),
+        Line::from("Alt+←/→ 按词跳转    Ctrl+U 清空    Ctrl+A 全选"),
+        Line::from("Enter 提交    Esc 取消当前操作    s 设置（t 切换配色）"),
+        Line::from("c 复制消息 · F6 鼠标开关 · q / Ctrl+Q 退出"),
         Line::from("拖选文字 · 双击选词 / 打开媒体 · 拖动滚动条"),
         Line::from("图片：滚轮或 +/- 缩放 · 拖动或方向键平移 · 0 复位"),
-        Line::from("选中文字后 Ctrl+C 复制 · 输入区 Ctrl+A 全选"),
         muted("终端自带的选字修饰键因终端而异，可用 F6 暂停鼠标。"),
         Line::from(""),
         Line::styled("API 凭据与官网注册", Style::default().fg(palette().accent)),
@@ -2600,13 +4122,14 @@ fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from("联系发布者提供含 Teleaf 项目凭据的安装包，可免手动注册。"),
         muted("二维码登录也需要应用凭据；官方示例 ID 不适合发行。"),
     ];
-    scrolling_text(frame, lines, inner, &mut app.modal_scroll);
+    scrolling_text(frame, app, lines, inner);
 }
 
 fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = modal(frame, app, centered(area, 70, 21), "设置与连接");
     let rows = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(if crate::notifications::supported() {
             3
         } else {
@@ -2614,14 +4137,31 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         }),
     ])
     .split(inner);
+    let theme_label = format!("[配色：{} · t]", palette().name);
+    let theme_w = (UnicodeWidthStr::width(theme_label.as_str()) as u16 + 2).min(rows[1].width);
+    let sep_w = rows[1].width.saturating_sub(theme_w);
+    if sep_w > 0 {
+        frame.render_widget(
+            Paragraph::new("─".repeat(usize::from(sep_w)))
+                .style(Style::default().fg(palette().border)),
+            Rect::new(rows[1].x, rows[1].y, sep_w, 1),
+        );
+    }
+    button(
+        frame,
+        app,
+        Rect::new(rows[1].x + sep_w, rows[1].y, theme_w, 1),
+        &theme_label,
+        Action::CycleTheme,
+    );
     let tools = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(Rect::new(rows[1].x, rows[1].y, rows[1].width, 1));
+        .split(Rect::new(rows[2].x, rows[2].y, rows[2].width, 1));
     button(frame, app, tools[0], "[修改 API]", Action::ApiSetup);
     button(frame, app, tools[1], "[官网]", Action::OpenLink);
     button(
         frame,
         app,
-        Rect::new(rows[1].x, rows[1].y + 1, rows[1].width, 1),
+        Rect::new(rows[2].x, rows[2].y + 1, rows[2].width, 1),
         if app.mouse_enabled {
             "[鼠标：开 · F6 切换]"
         } else {
@@ -2633,7 +4173,7 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         button(
             frame,
             app,
-            Rect::new(rows[1].x, rows[1].y + 2, rows[1].width, 1),
+            Rect::new(rows[2].x, rows[2].y + 2, rows[2].width, 1),
             if app.notifications.enabled {
                 "[桌面通知：开]"
             } else {
@@ -2655,12 +4195,49 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(""),
         Line::styled("终端与诊断", Style::default().fg(palette().accent)),
         Line::from(format!("图片显示   {}", app.media.protocol_name)),
-        Line::from(format!("界面配色   {} · TG_THEME 可切换", palette().name)),
+        Line::from(format!(
+            "界面配色   {} · 按 t 或 TG_THEME 切换",
+            palette().name
+        )),
         Line::from(crate::terminal::summary()),
         Line::from(app.status.clone()),
         muted(app.tdlib_path.as_deref().unwrap_or("TDLib 尚未加载")),
     ];
-    scrolling_text(frame, lines, rows[0], &mut app.modal_scroll);
+    let body = if app.auth.state == "authorizationStateReady" && rows[0].height >= 2 {
+        let footer = Rect::new(rows[0].x, rows[0].bottom() - 1, rows[0].width, 1);
+        let columns = Layout::horizontal([
+            Constraint::Min(1),
+            Constraint::Length(13),
+            Constraint::Length(10),
+        ])
+        .split(footer);
+        if app.parity.storage_confirmation {
+            frame.render_widget(
+                Paragraph::new("清理本机缓存？").style(Style::default().fg(palette().accent)),
+                columns[0],
+            );
+            button(frame, app, columns[1], "[确认清理]", Action::ConfirmStorage);
+            button(frame, app, columns[2], "[取消]", Action::CancelStorage);
+        } else {
+            let size = app.parity.storage_size.map_or("—".into(), format_bytes);
+            frame.render_widget(
+                Paragraph::new(format!("TDLib 缓存 {size}"))
+                    .style(Style::default().fg(palette().muted)),
+                columns[0],
+            );
+            let clean = Rect::new(
+                columns[1].x,
+                footer.y,
+                columns[1].width + columns[2].width,
+                1,
+            );
+            button(frame, app, clean, "[清理缓存 · c]", Action::CleanStorage);
+        }
+        Rect::new(rows[0].x, rows[0].y, rows[0].width, rows[0].height - 1)
+    } else {
+        rows[0]
+    };
+    scrolling_text(frame, app, lines, body);
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -2670,18 +4247,45 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn scrolling_text(frame: &mut Frame, lines: Vec<Line<'static>>, area: Rect, scroll: &mut u16) {
-    let total: usize = lines
+fn scrolling_text(frame: &mut Frame, app: &mut App, lines: Vec<Line<'static>>, area: Rect) {
+    app.modal_visible = usize::from(area.height).max(1);
+    let initial_width = usize::from(area.width).max(1);
+    let initial_total: usize = lines
         .iter()
-        .map(|line| wrap_text(&line.to_string(), usize::from(area.width).max(1)).len())
+        .map(|line| wrap_text(&line.to_string(), initial_width).len())
         .sum();
-    *scroll = (*scroll).min(total.saturating_sub(usize::from(area.height)) as u16);
+    let has_scroll = initial_total > usize::from(area.height) && area.width >= 4;
+    let text_area = if has_scroll {
+        Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height)
+    } else {
+        area
+    };
+    let total: usize = if has_scroll {
+        lines
+            .iter()
+            .map(|line| wrap_text(&line.to_string(), usize::from(text_area.width).max(1)).len())
+            .sum()
+    } else {
+        initial_total
+    };
+    let max_scroll = total.saturating_sub(usize::from(area.height));
+    app.modal_scroll = app.modal_scroll.min(max_scroll as u16);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .scroll((*scroll, 0)),
-        area,
+            .scroll((app.modal_scroll, 0)),
+        text_area,
     );
+    if has_scroll {
+        scrollbar(
+            frame,
+            app,
+            area,
+            Pane::Modal,
+            usize::from(app.modal_scroll),
+            max_scroll,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2857,7 +4461,7 @@ pub(crate) mod tests {
                 },
             });
             let output = snapshot(&mut app, width, height);
-            let column = chat_column(Rect::new(0, 1, width, height - 2));
+            let column = chat_column(&app, Rect::new(0, 1, width, height - 2));
             let tray = app
                 .hit_targets
                 .iter()
@@ -3288,6 +4892,10 @@ pub(crate) mod tests {
                 "help",
                 "settings",
                 "folders",
+                "quick-switch",
+                "chat-info",
+                "multi-select",
+                "rich-chat",
                 "inline-images",
                 "selection",
                 "zoom",
@@ -3412,6 +5020,59 @@ pub(crate) mod tests {
                         app.store.apply(&json!({"@type":"updateChatFolders","chat_folders":[{"id":7,"name":{"text":{"text":"工作"}}}]}));
                         app.show_folders = true;
                     }
+                    "quick-switch" => {
+                        app.quick_switcher = Some(crate::QuickSwitcher {
+                            global_messages: false,
+                            query: "产品".into(),
+                            cursor: "产品".len(),
+                            selected: 0,
+                            scroll: 0,
+                        });
+                    }
+                    "chat-info" => {
+                        if let Some(chat) = app.store.chat_mut_by_id(1) {
+                            chat.subtitle = "12 位成员 · 3 人在线".into();
+                            chat.username = "teleaf_dev".into();
+                            chat.bio = "Teleaf 终端客户端产品与设计讨论群。".into();
+                            chat.pinned = true;
+                        }
+                        app.show_chat_info = true;
+                    }
+                    "multi-select" => {
+                        app.multi_select = vec![1, 2];
+                    }
+                    "rich-chat" => {
+                        if let Some(chat) = app.store.chat_mut_by_id(1) {
+                            chat.pinned_message = Some(crate::store::PinnedBanner {
+                                id: 1,
+                                excerpt: "周五前完成桌面端对齐评审".into(),
+                            });
+                            chat.unread = 2;
+                            chat.read_inbox = 1;
+                            chat.pinned = true;
+                            chat.mention_count = 1;
+                            chat.last_stamp = crate::calendar::local(1700000060);
+                        }
+                        app.store.messages[0].info.reactions = vec![
+                            crate::store::Reaction {
+                                emoji: "👍".into(),
+                                custom_emoji_id: None,
+                                count: 3,
+                                chosen: true,
+                            },
+                            crate::store::Reaction {
+                                emoji: "🔥".into(),
+                                custom_emoji_id: None,
+                                count: 1,
+                                chosen: false,
+                            },
+                        ];
+                        app.store.messages[0].info.entities = vec![crate::store::TextEntity {
+                            start: 0,
+                            end: "我们".len(),
+                            kind: crate::store::EntityKind::Bold,
+                        }];
+                    }
                     "inline-images" => {
                         for (index, message) in app.store.messages.iter_mut().enumerate() {
                             message.media = Some(MediaRef {
@@ -3506,6 +5167,257 @@ pub(crate) mod tests {
             app.hit_targets
                 .iter()
                 .all(|(_, target)| !matches!(target, Target::Chat(_) | Target::Message(_)))
+        );
+    }
+
+    #[test]
+    fn folder_modal_renders_distinct_keyboard_cursor_and_keeps_tab_offset() {
+        let mut app = fixture();
+        app.store.apply(&json!({
+            "@type": "updateChatFolders",
+            "chat_folders": [
+                {"id": 7, "name": {"text": {"text": "工作"}}},
+                {"id": 8, "name": {"text": {"text": "朋友"}}}
+            ]
+        }));
+        app.folder_offset = 1;
+        app.show_folders = true;
+        app.folder_cursor = 2;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rect = app
+            .hit_targets
+            .iter()
+            .find(|(_, target)| *target == Target::Folder(crate::store::ChatList::Folder(8)))
+            .unwrap()
+            .0;
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(rect.x, rect.y)].symbol(), "›");
+        assert_eq!(buffer[(rect.x, rect.y)].bg, palette().selected);
+        assert_eq!(app.folder_offset, 1);
+    }
+
+    #[test]
+    fn error_states_use_error_color_without_tinting_login_hints() {
+        let mut app = fixture();
+        app.auth.state.clear();
+        app.tdlib_connected = false;
+        app.status = "无法连接，请在设置中查看 TDLib 状态".into();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut found_error_text = false;
+        for y in 1..23 {
+            for x in 0..80 {
+                if buffer[(x, y)].symbol() == "无" {
+                    assert_eq!(buffer[(x, y)].fg, palette().error);
+                    found_error_text = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_error_text, "connection error text not rendered");
+
+        // Login form validation error must not tint the bottom keyboard hint red.
+        app.auth.begin_setup();
+        app.auth.message = "API ID 应为大于零的数字".into();
+        app.auth.is_error = true;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 23)].fg, palette().muted);
+
+        // Non-retryable failed message must still display its failure status in error color.
+        let mut app = fixture();
+        app.store.messages[1].info.sending = crate::store::Sending::Failed {
+            can_retry: false,
+            reason: "禁止发送".into(),
+        };
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut found_failed_status = false;
+        for y in 1..20 {
+            let mut x = 0u16;
+            while x < 80 {
+                if buffer[(x, y)].symbol() == "发"
+                    && x + 6 < 80
+                    && buffer[(x + 2, y)].symbol() == "送"
+                    && buffer[(x + 4, y)].symbol() == "失"
+                    && buffer[(x + 6, y)].symbol() == "败"
+                {
+                    assert_eq!(buffer[(x, y)].fg, palette().error);
+                    found_failed_status = true;
+                    break;
+                }
+                x += (UnicodeWidthStr::width(buffer[(x, y)].symbol()) as u16).max(1);
+            }
+            if found_failed_status {
+                break;
+            }
+        }
+        assert!(found_failed_status, "non-retryable failed status missing");
+    }
+
+    #[test]
+    fn small_sticker_cursor_quote_ellipsis_and_mouse_off_badge_render() {
+        let mut app = fixture();
+        app.mouse_enabled = false;
+        app.store.messages[1].info.reply = Some(crate::store::Reply {
+            chat_id: 1,
+            message_id: 1,
+            excerpt: "这是一段非常非常长的被引用消息内容用于验证末尾省略号不会被裁切掉".into(),
+        });
+        let output = snapshot(&mut app, 45, 18);
+        assert!(output.contains("[鼠标关]"));
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains('│') && line.contains('…')),
+            "reply quote ellipsis clipped: {output}"
+        );
+
+        app.sticker_picker = true;
+        app.sticker_cursor = 0;
+        app.store.recent_stickers.push(Sticker {
+            file_id: 10,
+            emoji: "👋".into(),
+            width: 100,
+            height: 100,
+            preview: MediaRef {
+                file_id: 10,
+                path: None,
+                kind: MediaKind::Sticker,
+                detail: None,
+            },
+        });
+        let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let tile = app
+            .hit_targets
+            .iter()
+            .find(|(_, t)| *t == Target::Sticker(0))
+            .unwrap()
+            .0;
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(tile.x, tile.y)].bg, palette().selected);
+    }
+
+    #[test]
+    fn help_and_settings_scrollbars_and_theme_toggle_render() {
+        let mut app = fixture();
+        app.show_help = true;
+        snapshot(&mut app, 45, 18);
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| matches!(t, Target::Scroll(Pane::Modal, _)))
+        );
+        app.close_overlays();
+        app.show_settings = true;
+        let output = snapshot(&mut app, 80, 24);
+        assert!(output.contains("配色："));
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| *t == Target::Command(Action::CycleTheme))
+        );
+    }
+
+    #[test]
+    fn desktop_parity_quick_switcher_chat_info_multiselect_and_rich_timeline_render() {
+        let mut app = fixture();
+        // Quick switcher filters loaded chats and exposes clickable jump targets.
+        app.quick_switcher = Some(crate::QuickSwitcher {
+            global_messages: false,
+            query: "小林".into(),
+            cursor: "小林".len(),
+            selected: 0,
+            scroll: 0,
+        });
+        let output = snapshot(&mut app, 80, 24);
+        assert!(output.contains("快速切换会话") && output.contains("小林"));
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| *t == Target::QuickSwitchChat(2))
+        );
+        app.quick_switcher = None;
+
+        // Chat info is an inline sidebar at >= 120 cols and a modal below 120 cols.
+        if let Some(chat) = app.store.chat_mut_by_id(1) {
+            chat.subtitle = "12 位成员".into();
+            chat.username = "teleaf_dev".into();
+            chat.bio = "终端客户端讨论组".into();
+            chat.pinned_message = Some(crate::store::PinnedBanner {
+                id: 1,
+                excerpt: "置顶公告".into(),
+            });
+            chat.unread = 2;
+            chat.read_inbox = 1;
+        }
+        app.show_chat_info = true;
+        let wide = snapshot(&mut app, 130, 32);
+        assert!(!app.chat_info_modal);
+        assert!(wide.contains("@teleaf_dev") && wide.contains("终端客户端讨论组"));
+        let narrow = snapshot(&mut app, 80, 24);
+        assert!(app.chat_info_modal);
+        assert!(narrow.contains("会话详情") && narrow.contains("@teleaf_dev"));
+        app.show_chat_info = false;
+
+        // Pinned banner, unread divider, reactions, media progress card, spoiler & dynamic composer.
+        app.store.messages[0].info.reactions = vec![crate::store::Reaction {
+            emoji: "👍".into(),
+            custom_emoji_id: None,
+            count: 4,
+            chosen: true,
+        }];
+        app.store.messages[0].info.entities = vec![crate::store::TextEntity {
+            start: 0,
+            end: "我们".len(),
+            kind: crate::store::EntityKind::Spoiler,
+        }];
+        app.store.messages[1].outgoing = false;
+        app.store.messages[1].media = Some(MediaRef {
+            file_id: 90,
+            path: None,
+            kind: MediaKind::Document,
+            detail: None,
+        });
+        app.store.messages[1].info.media_meta = Some(crate::store::MediaMeta {
+            file_name: "design.pdf".into(),
+            size_bytes: 2 * 1024 * 1024,
+            downloaded_bytes: 1024 * 1024,
+            duration_secs: 0,
+            downloading: true,
+        });
+        app.input_mode = InputMode::Send;
+        app.draft = "第一行\n第二行\n第三行\n第四行".into();
+        let rich = snapshot(&mut app, 110, 32);
+        assert!(rich.contains("置顶：置顶公告"));
+        assert!(rich.contains("2 条未读消息"));
+        assert!(rich.contains("👍 4"));
+        assert!(rich.contains("design.pdf") && rich.contains("50%"));
+        assert!(rich.contains('░'));
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| *t == Target::PinnedBanner(1))
+        );
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| *t == Target::Reaction(1, 0))
+        );
+        assert!(composer_height(&app, 70, 30) > 4);
+
+        // Multi-select replaces composer with batch action bar.
+        app.multi_select = vec![1, 2];
+        let multi = snapshot(&mut app, 110, 32);
+        assert!(multi.contains("多选模式 · 已选 2 条消息"));
+        assert!(multi.contains("[✓]"));
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| *t == Target::Command(Action::MultiForward))
         );
     }
 }

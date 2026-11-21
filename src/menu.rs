@@ -55,6 +55,16 @@ const CHAT: &[Item] = &[
         action: Action::Search,
     },
     Item {
+        label: "快速切换会话",
+        key: 'K',
+        action: Action::QuickSwitch,
+    },
+    Item {
+        label: "会话详情",
+        key: 'I',
+        action: Action::ChatInfo,
+    },
+    Item {
         label: "加载更早消息",
         key: 'g',
         action: Action::History,
@@ -80,6 +90,21 @@ const MESSAGE: &[Item] = &[
         label: "回复消息",
         key: 'r',
         action: Action::Reply,
+    },
+    Item {
+        label: "在聊天中定位",
+        key: '\0',
+        action: Action::JumpToMessage,
+    },
+    Item {
+        label: "打开消息链接",
+        key: 'L',
+        action: Action::OpenMessageLink,
+    },
+    Item {
+        label: "多选消息",
+        key: 'V',
+        action: Action::ToggleMultiSelect,
     },
     Item {
         label: "快速收藏到收藏夹",
@@ -185,9 +210,14 @@ pub fn items(app: &App) -> impl Iterator<Item = Item> + '_ {
             Action::Repeat => {
                 crate::quick_message::eligible(app) && permissions(app).is_some_and(|p| p.copy)
             }
-            Action::Reply | Action::React => message.is_some(),
+            Action::Reply | Action::React | Action::ToggleMultiSelect => message.is_some(),
+            Action::JumpToMessage => app.show_search && message.is_some(),
+            Action::OpenMessageLink => message
+                .and_then(crate::store::Message::first_link)
+                .is_some(),
             Action::QuoteBack => app.quote_back.is_some(),
             Action::ClearSearch => app.show_search,
+            Action::QuickSwitch => true,
             _ => app.store.active_chat.is_some(),
         }
     })
