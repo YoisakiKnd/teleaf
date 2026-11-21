@@ -38,9 +38,13 @@ fn macos_notifications() {
         return;
     }
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    let profile = out.ancestors().nth(3).unwrap();
+    let profile = out
+        .ancestors()
+        .find_map(|dir| (dir.file_name()? == "build").then(|| dir.parent())?)
+        .unwrap_or_else(|| out.ancestors().nth(3).unwrap());
     let bundle = profile.join("Teleaf Notifications.app");
     let contents = bundle.join("Contents");
+    let helper_bin = contents.join("MacOS/teleaf-notifications");
     std::fs::create_dir_all(contents.join("MacOS")).unwrap();
     let arch = if std::env::var("TARGET").unwrap().starts_with("aarch64") {
         "arm64"
@@ -54,7 +58,7 @@ fn macos_notifications() {
         .arg(out.join("swift-cache"))
         .arg("packaging/macos-notifications/main.swift")
         .arg("-o")
-        .arg(contents.join("MacOS/teleaf-notifications"))
+        .arg(&helper_bin)
         .status()
         .expect("macOS builds require Xcode Command Line Tools (swiftc)");
     assert!(
@@ -84,5 +88,9 @@ fn macos_notifications() {
             .expect("codesign is required")
             .success(),
         "Failed to sign macOS notification helper"
+    );
+    println!(
+        "cargo:rustc-env=TELEAF_MACOS_HELPER={}",
+        helper_bin.display()
     );
 }

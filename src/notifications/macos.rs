@@ -125,14 +125,19 @@ mod tests {
 
     #[test]
     fn bundled_helper_accepts_native_text_without_permission_or_notifications() {
-        // Test executables live in deps/, while the helper is beside the main binary.
-        let path = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("Teleaf Notifications.app/Contents/MacOS/teleaf-notifications");
+        let path = option_env!("TELEAF_MACOS_HELPER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let exe = std::env::current_exe().unwrap();
+                let profile = exe
+                    .ancestors()
+                    .find_map(|dir| {
+                        let name = dir.file_name()?;
+                        (name == "deps" || name == "build").then(|| dir.parent())?
+                    })
+                    .unwrap_or_else(|| exe.parent().unwrap().parent().unwrap());
+                profile.join("Teleaf Notifications.app/Contents/MacOS/teleaf-notifications")
+            });
         let result = Process::new(path).arg("--self-test").output().unwrap();
         assert!(
             result.status.success(),
