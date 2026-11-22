@@ -103,9 +103,23 @@ Windows CI 在一次性桌面写入合成剪贴板，ConPTY 验证 CF_DIB 截图
 
 用户报告的环境为 Windows 11、Teleaf 0.1.5；升级后可重新运行 `teleaf --test-notification`。CI 验证原生 API，不代替用户桌面的实际横幅、声音、通知权限和勿扰模式验收。本轮没有重新测量真实账号内存。
 
+## 0.2.0 发布验证
+
+2026-11-21（北京时间）已发布 [v0.2.0](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.2.0)，最终标签对应 `5a8e3182cac14fb9a12a9f8e951e2bfb65a0e97c`。本版完成面向 Telegram Desktop 日常使用基准的 UI 升级与 TDLib 后端接入：涵盖 `Ctrl+K` 快速切换与 `Tab` 全局跨会话消息搜索（含未加载会话标题补查）、会话列表丰富元数据与正在输入状态、富文本/剧透/链接与自定义 emoji 回应回显、置顶横幅、转发来源、未读分隔线与双向有界上下文翻页、延迟视口已读上报、大文件独立配额下载控制、会话详情侧栏/弹窗与静音/置顶回滚、多选批量操作权限预检、`/` 共享媒体筛选以及设置页缓存统计与清理，详见 `CHANGELOG.md` 与 `DESKTOP_PARITY_PLAN.md`。
+
+首次五平台构建（`44920184594`）中 Linux x64 / ARM64 和 Windows x64 均通过，但两个 macOS 构建器因新版 Cargo 的 `target/<profile>/build/teleaf/<hash>/out` 路径层级变化导致 `Teleaf Notifications.app` 路径失配，未生成 Release。修复 `build.rs` 与 `src/notifications/macos.rs` 并更新尚未发布的 `v0.2.0` 标签后，[分支 CI 44924374554](https://github.com/YoisakiKnd/teleaf/actions/runs/44924374554)、[标签 CI 44924383404](https://github.com/YoisakiKnd/teleaf/actions/runs/44924383404) 与 [正式发布 44924383416](https://github.com/YoisakiKnd/teleaf/actions/runs/44924383416) 五个平台全部通过（`cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、168–169 项单元测试、7 项打包测试、TDLib 1.8.61 加载及发布前内置凭据登录验证；Windows CI 通过 ConPTY 键鼠/剪贴板与原生通知回归）。
+
+已核对 `v0.2.0` Release 的五个平台归档、GitHub 资产摘要、`SHA256SUMS`、`teleaf.rb`、`teleaf.json` 及 MIT 元数据。Homebrew 分发在 `YoisakiKnd/homebrew-tap` 通过 [同步任务 44926891936](https://github.com/YoisakiKnd/homebrew-tap/actions/runs/44926891936) 更新 `Formula/teleaf.rb`（提交 `e0a6a324c1bdced49bd10d1d56a951881f117b42`）并通过 [配方安装测试 44926914034](https://github.com/YoisakiKnd/homebrew-tap/actions/runs/44926914034)；自有 Scoop 在 `YoisakiKnd/scoop-bucket` 通过 [同步任务 44926919749](https://github.com/YoisakiKnd/scoop-bucket/actions/runs/44926919749) 更新 `bucket/teleaf.json`（提交 `6281df52e5eff3d048d2a5ed5ae6ea4969dce5fe`）。两份清单与 Release 附带文件逐字节一致，许可证均为 `MIT`。主仓库继续不保存有效 `Formula/teleaf.rb` 并保留 `tap_migrations.json`，未在 `Mythos-404/eimer` 创建或更新 PR。
+
+- `teleaf-0.2.0-macos-aarch64.tar.gz` SHA-256：`b1a7f242f174dd0fb698f78ba609eb2d4c58d51585c122dc68a37fd004460a1f`
+- `teleaf-0.2.0-macos-x86_64.tar.gz` SHA-256：`f2eb9f6eafbdf7917ea336e2a723290365a2013ec27ef726b92f7212dd897b92`
+- `teleaf-0.2.0-linux-aarch64.tar.gz` SHA-256：`9fb874b6bcf75ed1f4ed72f58976478de9846ea87623bac13c5db056aecd081b`
+- `teleaf-0.2.0-linux-x86_64.tar.gz` SHA-256：`57d8692eb6bc824ebe76987ebba840f088c80dc23f312859f4de8e98f8951d2c`
+- `teleaf-0.2.0-windows-x86_64.zip` SHA-256：`7557b0e5e3ea32adf33ecf505e3303a6c02f4724c23579e33100d88c040f8cdf`
+
 ## 用户安装
 
-[v0.1.6](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.1.6)及安装清单已发布：
+[v0.2.0](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.2.0) 及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/tap
