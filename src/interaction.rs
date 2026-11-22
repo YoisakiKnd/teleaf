@@ -360,11 +360,16 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
             }
         }
         Action::OpenMessageLink => {
-            if let Some(url) = app
+            let items = app
                 .selected_message()
-                .and_then(crate::store::Message::first_link)
+                .map(crate::store::Message::links_and_mentions)
+                .unwrap_or_default();
+            if items.is_empty() {
+                app.notice = Some("当前消息没有链接或提及".into());
+            } else if items.len() == 1
+                && let crate::store::LinkItem::Url(url) = &items[0]
             {
-                match crate::open_url(&url) {
+                match crate::open_url(url) {
                     Ok(()) => app.notice = Some(format!("已打开链接：{url}")),
                     Err(error) => {
                         app.notice = Some(error);
@@ -372,9 +377,60 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                     }
                 }
             } else {
-                app.notice = Some("当前消息没有可打开的链接".into());
+                app.close_overlays();
+                app.link_picker = Some(crate::LinkPicker { items, selected: 0 });
             }
         }
+        Action::SaveFileAs => app.save_selected_file(),
+        Action::PreviewPrev => {
+            if let Some(req) = app.step_preview(-1) {
+                send_request(app, worker, req);
+            }
+        }
+        Action::PreviewNext => {
+            if let Some(req) = app.step_preview(1) {
+                send_request(app, worker, req);
+            }
+        }
+        Action::ProxySettings => app.open_proxy_modal(worker),
+        Action::ProxyAdd => app.start_add_proxy(false),
+        Action::ProxyImportEnv => app.start_add_proxy(true),
+        Action::ProxyToggle => app.toggle_selected_proxy(worker),
+        Action::ProxyPing => app.ping_selected_proxy(worker),
+        Action::ProxyDelete => app.remove_selected_proxy(worker),
+        Action::ProxyDisableAll => app.disable_all_proxies(worker),
+        Action::ProxySubmit => {
+            app.submit_proxy_form(worker);
+        }
+        Action::ProxyCancelForm => {
+            app.proxy.form = None;
+        }
+        Action::ProxyKindPrev => {
+            if let Some(form) = &mut app.proxy.form {
+                form.kind = form.kind.prev();
+                form.field = form.field.min(form.field_count() - 1);
+            }
+        }
+        Action::ProxyKindNext => {
+            if let Some(form) = &mut app.proxy.form {
+                form.kind = form.kind.next();
+                form.field = form.field.min(form.field_count() - 1);
+            }
+        }
+        Action::Topics => {
+            if let Some(chat_id) = app.store.active_chat
+                && app.store.chat(chat_id).is_some_and(|chat| chat.is_forum)
+            {
+                app.close_overlays();
+                app.show_topics = true;
+                app.topic_cursor = 0;
+                app.request_forum_topics(worker, chat_id);
+            } else {
+                app.notice = Some("当前会话不是话题群".into());
+            }
+        }
+        Action::ExitTopic => app.exit_forum_topic(worker),
+        Action::ExitThread => app.exit_discussion(worker),
         Action::JumpToMessage => {
             if let Some(target) = app.selected_message {
                 app.jump_to(worker, target);
@@ -1267,6 +1323,8 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
         | Target::MessageAction(id, Action::Preview)
         | Target::Reaction(id, _)
         | Target::Quote(id, _)
+        | Target::InlineButton(id, _, _)
+        | Target::CommentThread(id)
             if !app.multi_select.is_empty() =>
         {
             activate(app, worker, Target::Message(id))
@@ -1442,6 +1500,109 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                 changed
             }
         }
+        Target::ProxyEntry(index) => {
+            if index < app.proxy.entries.len() {
+                let same = app.proxy.selected == index;
+                app.proxy.selected = index;
+                if same {
+                    app.toggle_selected_proxy(worker);
+                }
+                true
+            } else {
+                false
+            }
+        }
+        Target::ProxyField(index) => {
+            if let Some(form) = &mut app.proxy.form {
+                form.field = index.min(form.field_count() - 1);
+                true
+            } else {
+                false
+            }
+        }
+        Target::Cursor(Editor::Proxy(field), position) => {
+            if let Some(form) = &mut app.proxy.form {
+                form.field = field.min(form.field_count() - 1);
+                if let Some((buf, cursor, _)) = form.active_text_mut() {
+                    *cursor = text::cursor(buf, position);
+                }
+                true
+            } else {
+                false
+            }
+        }
+        Target::LinkEntry(index) => {
+            let item = app
+                .link_picker
+                .as_ref()
+                .and_then(|picker| picker.items.get(index))
+                .cloned();
+            app.link_picker = None;
+            match item {
+                Some(crate::store::LinkItem::Url(url)) => {
+                    match crate::open_url(&url) {
+                        Ok(()) => app.notice = Some(format!("已打开链接：{url}")),
+                        Err(error) => {
+                            app.notice = Some(error);
+                            app.notice_error = true;
+                        }
+                    }
+                    true
+                }
+                Some(crate::store::LinkItem::Mention(handle)) => {
+                    app.search_mention(worker, &handle);
+                    true
+                }
+                None => false,
+            }
+        }
+        Target::TopicEntry(index) => {
+            let selected = app.store.active_chat.and_then(|chat_id| {
+                app.store
+                    .chat(chat_id)
+                    .and_then(|chat| chat.topics.get(index))
+                    .map(|t| (chat_id, t.thread_id, t.title.clone()))
+            });
+            app.show_topics = false;
+            if let Some((chat_id, thread_id, title)) = selected {
+                app.open_forum_topic(worker, chat_id, thread_id, title);
+                true
+            } else {
+                false
+            }
+        }
+        Target::InlineButton(message_id, row, col) => {
+            let button = app
+                .active_messages()
+                .iter()
+                .find(|m| m.id == message_id)
+                .and_then(|m| m.info.inline_keyboard.get(row))
+                .and_then(|r| r.get(col))
+                .cloned();
+            let Some(button) = button else {
+                return false;
+            };
+            match button.kind {
+                crate::store::InlineButtonKind::Url(url) if !url.is_empty() => {
+                    match crate::open_url(&url) {
+                        Ok(()) => app.notice = Some(format!("已打开按钮链接：{url}")),
+                        Err(error) => {
+                            app.notice = Some(error);
+                            app.notice_error = true;
+                        }
+                    }
+                    true
+                }
+                crate::store::InlineButtonKind::Callback(data) => {
+                    app.request_callback(worker, message_id, &data)
+                }
+                _ => {
+                    app.notice = Some(format!("暂不支持按钮「{}」的类型", button.text));
+                    true
+                }
+            }
+        }
+        Target::CommentThread(message_id) => app.open_discussion(worker, message_id),
         Target::Action(action) => crate::menu::execute(app, worker, action),
         Target::Sticker(index) => {
             app.sticker_cursor = index;

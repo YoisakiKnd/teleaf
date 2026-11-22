@@ -11,6 +11,7 @@ mod media;
 mod menu;
 mod notifications;
 mod parity;
+mod proxy;
 mod quick_message;
 mod resample;
 mod selection;
@@ -150,6 +151,20 @@ impl Drop for TerminalGuard {
     }
 }
 
+struct LinkPicker {
+    items: Vec<store::LinkItem>,
+    selected: usize,
+}
+
+#[derive(Clone)]
+struct ThreadView {
+    source_chat: i64,
+    post_id: i64,
+    thread_id: i64,
+    discussion_chat: Option<i64>,
+    title: String,
+}
+
 struct App {
     demo: bool,
     status: String,
@@ -162,6 +177,11 @@ struct App {
     store: Store,
     sync: sync::Sync,
     parity: parity::Parity,
+    proxy: proxy::ProxyState,
+    link_picker: Option<LinkPicker>,
+    show_topics: bool,
+    topic_cursor: usize,
+    active_thread: Option<ThreadView>,
     media: MediaManager,
     selected_chat: Option<i64>,
     selected_message: Option<i64>,
@@ -251,6 +271,11 @@ impl App {
             store: Store::default(),
             sync: sync::Sync::default(),
             parity: parity::Parity::default(),
+            proxy: proxy::ProxyState::default(),
+            link_picker: None,
+            show_topics: false,
+            topic_cursor: 0,
+            active_thread: None,
             media,
             selected_chat: None,
             selected_message: None,
@@ -345,6 +370,9 @@ impl App {
                     return (None, changed);
                 }
                 let menu_changed = menu::invalidate(self, &value);
+                if let Some((request, changed)) = self.receive_proxy(&value) {
+                    return (request, changed || menu_changed);
+                }
                 if let Some(changed) = self.receive_parity(&value) {
                     return (None, changed || menu_changed);
                 }
@@ -364,15 +392,16 @@ impl App {
                     self.auth.state == "authorizationStateReady" && !self.demo,
                 );
                 if self.last_update == "updateConnectionState" {
-                    self.connection_label =
-                        match value.pointer("/state/@type").and_then(Value::as_str) {
-                            Some("connectionStateReady") => "在线",
-                            Some("connectionStateUpdating") => "同步中",
-                            Some("connectionStateWaitingForNetwork") => "等待网络",
-                            Some("connectionStateConnectingToProxy") => "连接代理",
-                            _ => "连接中",
-                        }
-                        .into();
+                    let connection = value.pointer("/state/@type").and_then(Value::as_str);
+                    self.proxy_connection_state(connection.unwrap_or_default(), Instant::now());
+                    self.connection_label = match connection {
+                        Some("connectionStateReady") => "在线",
+                        Some("connectionStateUpdating") => "同步中",
+                        Some("connectionStateWaitingForNetwork") => "等待网络",
+                        Some("connectionStateConnectingToProxy") => "连接代理",
+                        _ => "连接中",
+                    }
+                    .into();
                     return (None, true);
                 }
                 let media_changed =
@@ -425,7 +454,7 @@ impl App {
                         }
                         if self.timeline_anchor.is_some()
                             && !self.show_search
-                            && value["message"]["chat_id"].as_i64() == self.store.active_chat
+                            && self.store.message_in_window(&value["message"])
                             && self.last_update == "updateNewMessage"
                         {
                             self.pending_messages = self.pending_messages.saturating_add(1);
@@ -569,7 +598,10 @@ impl App {
     }
 
     fn has_overlay(&self) -> bool {
-        self.show_help
+        self.proxy.open
+            || self.link_picker.is_some()
+            || self.show_topics
+            || self.show_help
             || self.show_settings
             || self.show_folders
             || self.quick_switcher.is_some()
@@ -594,6 +626,10 @@ impl App {
         self.mouse_press = None;
         self.drag = None;
         self.hit_targets.clear();
+        self.proxy.open = false;
+        self.proxy.form = None;
+        self.link_picker = None;
+        self.show_topics = false;
         self.show_folders = false;
         self.show_help = false;
         self.show_settings = false;
@@ -647,7 +683,10 @@ impl App {
             return Vec::new();
         };
         let previous = self.store.active_chat;
-        if previous == Some(id) {
+        if previous == Some(id)
+            && self.active_thread.is_none()
+            && self.store.message_scope.is_none()
+        {
             self.focus_messages = true;
             return Vec::new();
         }
@@ -656,9 +695,13 @@ impl App {
         self.last_click = None;
         self.media.last_error = None;
         let mut requests: Vec<_> = self.flush_draft(Instant::now(), true).into_iter().collect();
-        self.save_draft();
+        self.park_composer();
         self.clipboard.cancel();
-        self.store.open(id);
+        if previous == Some(id) {
+            self.store.set_message_scope(None);
+        } else {
+            self.store.open(id);
+        }
         self.cancel_batch();
         self.clear_reactions();
         self.parity.filter = parity::MediaFilter::All;
@@ -668,6 +711,10 @@ impl App {
         self.selected_message = None;
         self.preview_message = None;
         self.show_search = false;
+        self.show_topics = false;
+        self.active_thread = None;
+        self.reset_chat_requests();
+        self.link_picker = None;
         self.multi_select.clear();
         self.confirm_delete_many = false;
         self.forward_many = false;
@@ -777,7 +824,14 @@ impl App {
         {
             return None;
         }
-        let request = match self.input_mode {
+        if self
+            .active_thread
+            .as_ref()
+            .is_some_and(|thread| thread.discussion_chat.is_none() || thread.thread_id <= 0)
+        {
+            return None;
+        }
+        let mut request = match self.input_mode {
             InputMode::Off => return None,
             InputMode::Send => actions::send_text(chat_id, text, None),
             InputMode::Reply(message_id) => actions::send_text(chat_id, text, Some(message_id)),
@@ -789,6 +843,7 @@ impl App {
             }
             InputMode::React(message_id) => actions::react(chat_id, message_id, text),
         };
+        self.scope_outgoing_request(&mut request);
         Some(request)
     }
 
@@ -796,7 +851,13 @@ impl App {
         if self.store.history_exhausted || self.history_loading {
             return None;
         }
-        Some(self.history_request(self.store.active_chat?, self.store.oldest_message_id()?))
+        let chat = self.store.active_chat?;
+        let from = self.store.oldest_message_id()?;
+        Some(if self.store.message_scope.is_some() {
+            self.scoped_history_request(chat, from)
+        } else {
+            self.history_request(chat, from)
+        })
     }
 
     fn preview_selected(&mut self) -> Option<Value> {
@@ -859,6 +920,143 @@ impl App {
             Err(error) => self.notice = Some(format!("无法打开文件：{error}")),
         }
     }
+
+    fn save_selected_file(&mut self) {
+        let Some(message) = self.selected_message() else {
+            self.notice = Some("未选中含媒体的消息".into());
+            return;
+        };
+        let Some(path) = message
+            .media
+            .as_ref()
+            .and_then(|media| media.detail_file().1)
+            .map(str::to_owned)
+        else {
+            self.notice = Some("文件尚未下载；先按 v 下载".into());
+            return;
+        };
+        let suggested = message
+            .info
+            .media_meta
+            .as_ref()
+            .map(|meta| meta.file_name.as_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        match export_file_to_downloads(&path, suggested.as_deref()) {
+            Ok(dest) => {
+                self.notice = Some(format!("已保存到 {}", dest.display()));
+                self.notice_error = false;
+            }
+            Err(error) => {
+                self.notice = Some(error);
+                self.notice_error = true;
+            }
+        }
+    }
+
+    fn step_preview(&mut self, delta: isize) -> Option<Value> {
+        let current = self.preview_message?;
+        let media_ids: Vec<i64> = self
+            .active_messages()
+            .iter()
+            .filter(|m| {
+                m.media.as_ref().is_some_and(|media| {
+                    matches!(
+                        media.kind,
+                        store::MediaKind::Photo | store::MediaKind::Sticker
+                    )
+                })
+            })
+            .map(|m| m.id)
+            .collect();
+        let pos = media_ids.iter().position(|id| *id == current)?;
+        let next = pos.checked_add_signed(delta)?;
+        let target = *media_ids.get(next)?;
+        self.selected_message = Some(target);
+        self.reveal_message = true;
+        self.preview_selected()
+    }
+}
+
+fn export_file_to_downloads(
+    source: &str,
+    suggested_name: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
+    let source_path = std::path::Path::new(source);
+    if !source_path.is_file() {
+        return Err("源文件不存在或已被清理".into());
+    }
+    let downloads = directories::UserDirs::new()
+        .and_then(|dirs| dirs.download_dir().map(std::path::Path::to_path_buf))
+        .or_else(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().join("Downloads")))
+        .ok_or_else(|| "无法确定下载目录".to_owned())?;
+    export_file(source_path, suggested_name, &downloads)
+}
+
+fn export_file(
+    source: &std::path::Path,
+    suggested_name: Option<&str>,
+    downloads: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(downloads).map_err(|e| format!("无法创建下载目录：{e}"))?;
+    let mut input = std::fs::File::open(source).map_err(|e| format!("无法读取源文件：{e}"))?;
+    let raw_name = suggested_name
+        .and_then(|name| std::path::Path::new(name).file_name())
+        .or_else(|| source.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("teleaf-file");
+    let mut safe_name = String::new();
+    for ch in raw_name.chars() {
+        let ch = if ch.is_control()
+            || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        {
+            '_'
+        } else {
+            ch
+        };
+        if safe_name.len() + ch.len_utf8() > 180 {
+            break;
+        }
+        safe_name.push(ch);
+    }
+    let safe_name = safe_name.trim_end_matches(['.', ' ']);
+    let safe_name = if safe_name.is_empty() {
+        "teleaf-file"
+    } else {
+        safe_name
+    };
+    let path = std::path::Path::new(safe_name);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("teleaf-file");
+    let extension = path.extension().and_then(|ext| ext.to_str());
+    for suffix in 0..=999 {
+        let candidate = if suffix == 0 {
+            safe_name.to_owned()
+        } else if let Some(ext) = extension {
+            format!("{stem} ({suffix}).{ext}")
+        } else {
+            format!("{stem} ({suffix})")
+        };
+        let target = downloads.join(candidate);
+        let mut output = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("无法创建目标文件：{error}")),
+        };
+        if let Err(error) = io::copy(&mut input, &mut output) {
+            drop(output);
+            let _ = std::fs::remove_file(&target);
+            return Err(format!("保存文件失败：{error}"));
+        }
+        return Ok(target);
+    }
+    Err("目标目录中同名文件过多".into())
 }
 
 fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
@@ -883,8 +1081,13 @@ fn drain_events(receiver: &Receiver<TdEvent>, app: &mut App, worker: &TdWorker) 
     for _ in 0..256 {
         match receiver.try_recv() {
             Ok(event) => {
+                let was_connected = app.tdlib_connected;
                 let was_ready = app.auth.state == "authorizationStateReady";
                 let (request, redraw) = app.apply(event);
+                if !was_connected && app.tdlib_connected && !app.demo {
+                    app.bootstrap_env_proxy(worker);
+                }
+                app.initialize_proxy_list(worker);
                 if !was_ready && app.auth.state == "authorizationStateReady" && !app.demo {
                     for request in app.notifications.requests() {
                         changed |= !send_request(app, worker, request);
@@ -894,6 +1097,7 @@ fn drain_events(receiver: &Receiver<TdEvent>, app: &mut App, worker: &TdWorker) 
                     changed |= !send_request(app, worker, request);
                 }
                 changed |= redraw;
+                changed |= app.service_navigation(worker);
                 app.refresh_visible_chat_info(worker);
                 changed |= app.service_batch(worker);
                 changed |= menu::complete_pending(app, worker);
@@ -905,12 +1109,31 @@ fn drain_events(receiver: &Receiver<TdEvent>, app: &mut App, worker: &TdWorker) 
     changed
 }
 
-fn send_request(app: &mut App, worker: &TdWorker, request: Value) -> bool {
+fn send_request(app: &mut App, worker: &TdWorker, mut request: Value) -> bool {
+    if matches!(
+        request["@type"].as_str(),
+        Some("sendMessage" | "sendMessageAlbum")
+    ) && request["chat_id"].as_i64() == app.store.active_chat
+    {
+        if app
+            .active_thread
+            .as_ref()
+            .is_some_and(|thread| thread.discussion_chat.is_none())
+        {
+            app.notice = Some("评论串仍在加载，请稍后发送".into());
+            app.notice_error = true;
+            return false;
+        }
+        app.scope_outgoing_request(&mut request);
+    }
     let extra = &request["@extra"];
     let quick = extra["kind"] == "quick-message";
     let tag = extra.as_str().unwrap_or_default().to_owned();
     if let Err(error) = worker.request(request) {
         app.request_queue_failed(&tag);
+        if tag.starts_with("proxy-") {
+            app.receive_proxy(&json!({"@type":"error","@extra":tag}));
+        }
         if quick {
             app.quick_message.request_failed();
         }
@@ -1002,6 +1225,36 @@ fn accept_clipboard(
 }
 
 fn paste_text(app: &mut App, text: &str) {
+    if app.proxy.open {
+        if let Some(form) = &mut app.proxy.form {
+            let trimmed = text.trim();
+            if let Some(parsed) = proxy::parse_proxy_url(trimmed) {
+                *form = proxy::ProxyForm::from_parsed(parsed);
+                return;
+            }
+            let field = form.field;
+            if let Some((buf, cursor, max_chars)) = form.active_text_mut() {
+                let mut clean: String = text
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(max_chars)
+                    .collect();
+                if field == 2 {
+                    clean.retain(|c| c.is_ascii_digit());
+                }
+                text::insert(buf, cursor, &clean, max_chars * 4);
+                if buf.chars().count() > max_chars {
+                    let cut = buf
+                        .char_indices()
+                        .nth(max_chars)
+                        .map_or(buf.len(), |(idx, _)| idx);
+                    buf.truncate(cut);
+                }
+                *cursor = (*cursor).min(buf.len());
+            }
+        }
+        return;
+    }
     if app.show_settings || app.show_help {
         return;
     }
@@ -1141,6 +1394,9 @@ fn handle_settings_key(app: &mut App, worker: &TdWorker, code: KeyCode) {
         }
         KeyCode::Char('c') => {
             interaction::perform(app, worker, ui::Action::CleanStorage);
+        }
+        KeyCode::Char('p') => {
+            interaction::perform(app, worker, ui::Action::ProxySettings);
         }
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
             let previous = app
@@ -1358,6 +1614,46 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         }
         return false;
     }
+    if let Some(picker) = &mut app.link_picker {
+        let len = picker.items.len();
+        match code {
+            KeyCode::Esc => app.link_picker = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if len > 0 => {
+                picker.selected = (picker.selected + 1).min(len - 1);
+            }
+            KeyCode::Enter => {
+                let idx = picker.selected;
+                interaction::perform_target(app, worker, ui::Target::LinkEntry(idx));
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if app.show_topics {
+        let count = app
+            .store
+            .active_chat
+            .and_then(|id| app.store.chat(id))
+            .map_or(0, |chat| chat.topics.len());
+        match code {
+            KeyCode::Esc => app.show_topics = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.topic_cursor = app.topic_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+                app.topic_cursor = (app.topic_cursor + 1).min(count - 1);
+            }
+            KeyCode::Enter => {
+                let idx = app.topic_cursor;
+                interaction::perform_target(app, worker, ui::Target::TopicEntry(idx));
+            }
+            _ => {}
+        }
+        return false;
+    }
     if app.confirm_delete.is_some() {
         if matches!(code, KeyCode::Char('y') | KeyCode::Enter) {
             interaction::perform(app, worker, ui::Action::Confirm);
@@ -1398,6 +1694,15 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         match code {
             KeyCode::Esc | KeyCode::Char('v') => app.preview_message = None,
             KeyCode::Char('o') => app.open_selected_external(),
+            KeyCode::Char('E') => {
+                interaction::perform(app, worker, ui::Action::SaveFileAs);
+            }
+            KeyCode::Char('[') => {
+                interaction::perform(app, worker, ui::Action::PreviewPrev);
+            }
+            KeyCode::Char(']') => {
+                interaction::perform(app, worker, ui::Action::PreviewNext);
+            }
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 interaction::perform(app, worker, ui::Action::ZoomIn);
             }
@@ -1499,6 +1804,10 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
             app.timeline_anchor = None;
             app.timeline_heights.clear();
         }
+        KeyCode::Esc if app.active_thread.is_some() => app.exit_discussion(worker),
+        KeyCode::Esc if matches!(app.store.message_scope, Some(store::MessageScope::Forum(_))) => {
+            app.exit_forum_topic(worker);
+        }
         KeyCode::Esc => {
             if app.focus_messages {
                 app.focus_messages = false;
@@ -1588,6 +1897,7 @@ fn run(demo: bool) -> io::Result<()> {
         dirty |= app.service_global_search(&worker, Instant::now());
         dirty |= app.service_storage(&worker);
         dirty |= app.store.expire_typing(Instant::now());
+        dirty |= app.expire_proxy_connection(Instant::now());
         dirty |= drain_events(&worker.events, &mut app, &worker);
         for (sender, request) in app.store.sender_requests() {
             if !send_request(&mut app, &worker, request) {
@@ -1704,6 +2014,15 @@ fn run(demo: bool) -> io::Result<()> {
                             app.auth.begin_setup();
                             app.show_settings = false;
                             app.show_help = false;
+                        } else if key.code == KeyCode::F(9) {
+                            if app.proxy.open {
+                                app.proxy.open = false;
+                                app.proxy.form = None;
+                            } else {
+                                app.open_proxy_modal(&worker);
+                            }
+                        } else if app.proxy.open {
+                            app.handle_proxy_key(&worker, key.code);
                         } else if key.code == KeyCode::F(4) {
                             let was_open = app.show_settings;
                             app.close_overlays();
@@ -1984,6 +2303,25 @@ fn main() {
 
 #[cfg(test)]
 mod interaction_tests {
+    #[test]
+    fn export_file_uses_distinct_names_without_overwriting() {
+        let directory =
+            std::env::temp_dir().join(format!("teleaf-export-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source");
+        let downloads = directory.join("downloads");
+        std::fs::write(&source, b"first").unwrap();
+        let first = super::export_file(&source, Some("report.pdf"), &downloads).unwrap();
+        std::fs::write(&source, b"second").unwrap();
+        let second = super::export_file(&source, Some("report.pdf"), &downloads).unwrap();
+        assert_eq!(first.file_name().unwrap(), "report.pdf");
+        assert_eq!(second.file_name().unwrap(), "report (1).pdf");
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        assert_eq!(std::fs::read(second).unwrap(), b"second");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     #[test]
     fn sending_and_replying_keep_composer_focused_for_the_next_message() {
         for reply in [false, true] {

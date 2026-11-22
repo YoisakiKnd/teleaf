@@ -113,6 +113,12 @@ impl State {
             self.displayed.retain(|(id, _)| *id != group);
             commands.push(Command::Remove(group));
         }
+        let is_mention = update["type"]["@type"].as_str() == Some("notificationGroupTypeMentions");
+        let total_count = update["total_count"].as_i64().unwrap_or(0).max(0);
+        let sound_id = update["notification_sound_id"]
+            .as_i64()
+            .or_else(|| update["notification_sound_id"].as_str()?.parse().ok())
+            .unwrap_or(0);
         let mut latest = None;
         for notification in update["added_notifications"]
             .as_array()
@@ -132,31 +138,81 @@ impl State {
                 self.seen.pop_front();
             }
             let date = notification["date"].as_i64().unwrap_or(0);
-            let message = &notification["type"]["message"];
-            if latest.is_some()
-                || date < self.started
-                || now.saturating_sub(date) > 120
-                || notification["type"]["@type"] != "notificationTypeNewMessage"
-                || message["is_outgoing"].as_bool() != Some(false)
-            {
+            if latest.is_some() || date < self.started || now.saturating_sub(date) > 120 {
                 continue;
             }
-            latest = Some((id, message));
+            let notif_type = &notification["type"];
+            let is_silent = notification["is_silent"] == true;
+            match notif_type["@type"].as_str() {
+                Some("notificationTypeNewMessage") => {
+                    let message = &notif_type["message"];
+                    if message["is_outgoing"].as_bool() != Some(false) {
+                        continue;
+                    }
+                    latest = Some((id, is_silent, NotificationPayload::Message(message)));
+                }
+                Some("notificationTypeNewPushMessage") => {
+                    if notif_type["is_outgoing"] == true {
+                        continue;
+                    }
+                    latest = Some((id, is_silent, NotificationPayload::Push(notif_type)));
+                }
+                _ => continue,
+            }
         }
-        if let Some((id, message)) = latest {
+        if let Some((id, is_silent, payload)) = latest {
             self.displayed.retain(|(existing, _)| *existing != group);
             self.displayed.push_back((group, id));
             while self.displayed.len() > 128 {
                 self.displayed.pop_front();
             }
-            let title = store
-                .chat(chat)
-                .map_or("Telegram", |chat| chat.title.as_str());
+            let chat_info = store.chat(chat);
+            let base_title = store.notification_chat_title(chat).unwrap_or("Telegram");
+            let topic_title = match payload {
+                NotificationPayload::Message(message) => {
+                    chat_info.filter(|c| c.is_forum).and_then(|c| {
+                        let topic_id = message
+                            .pointer("/topic_id/forum_topic_id")
+                            .and_then(Value::as_i64)?;
+                        c.topics
+                            .iter()
+                            .find(|topic| topic.thread_id == topic_id)
+                            .map(|topic| topic.title.as_str())
+                            .filter(|title| !title.is_empty())
+                    })
+                }
+                NotificationPayload::Push(_) => None,
+            };
+            let title = format_title(base_title, topic_title, is_mention, total_count);
+            let preview_hidden = chat_info.is_some_and(|c| c.notifications.preview_hidden());
+            let body = if preview_hidden {
+                if total_count > 1 {
+                    format!("收到 {total_count} 条新消息")
+                } else {
+                    "收到一条新消息".into()
+                }
+            } else {
+                match payload {
+                    NotificationPayload::Message(message) => {
+                        let content = message_body(message);
+                        let sender = store.notification_sender(chat, message);
+                        format_body(sender.as_deref(), &content)
+                    }
+                    NotificationPayload::Push(push) => {
+                        let content = push_message_body(&push["content"]);
+                        let sender = push["sender_name"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty() && *s != base_title);
+                        format_body(sender, &content)
+                    }
+                }
+            };
             commands.push(Command::Show {
                 group,
-                title: clean(title, 80),
-                body: clean(&message_body(message), 200),
-                silent: update["notification_sound_id"].as_i64().unwrap_or(0) == 0,
+                title: clean(&title, 80),
+                body: clean(&body, 200),
+                silent: sound_id == 0 || is_silent,
             });
         }
         commands
@@ -257,36 +313,298 @@ pub fn test_notification() -> Result<(), String> {
     native::run(receiver, "teleaf-test")
 }
 
+enum NotificationPayload<'a> {
+    Message(&'a Value),
+    Push(&'a Value),
+}
+
+fn format_title(base: &str, topic: Option<&str>, is_mention: bool, total_count: i64) -> String {
+    let mut title = clean(base, 48);
+    if title.is_empty() {
+        title = "Telegram".into();
+    }
+    if let Some(topic) = topic {
+        let topic = clean(topic, 24);
+        if !topic.is_empty() {
+            title.push_str(" · #");
+            title.push_str(&topic);
+        }
+    }
+    if is_mention {
+        title.push_str(" · @提及");
+    }
+    if total_count > 1 {
+        title.push_str(&format!("（{total_count} 条新消息）"));
+    }
+    title
+}
+
+fn format_body(sender: Option<&str>, content: &str) -> String {
+    let content = clean(content, 200);
+    let content = if content.is_empty() {
+        "新消息".to_owned()
+    } else {
+        content
+    };
+    if let Some(sender) = sender {
+        let sender = clean(sender, 40);
+        if !sender.is_empty() {
+            return format!("{sender}：{content}");
+        }
+    }
+    content
+}
+
 fn clean(text: &str, limit: usize) -> String {
     use unicode_segmentation::UnicodeSegmentation;
     // Bound the input before scanning graphemes, including pathological combining sequences.
-    let text: String = text
-        .chars()
-        .take(2048)
-        .filter(|c| !c.is_control())
-        .collect();
-    text.graphemes(true).take(limit).collect()
+    // Convert newlines/tabs to spaces so multi-line messages remain readable.
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    for ch in text.chars().take(2048) {
+        if matches!(ch, '\n' | '\r' | '\t' | ' ') {
+            if !normalized.is_empty() {
+                pending_space = true;
+            }
+        } else if !ch.is_control() {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(ch);
+        }
+    }
+    normalized.graphemes(true).take(limit).collect()
+}
+
+fn masked_formatted_text(value: &Value, limit: usize) -> String {
+    let raw = value["text"].as_str().unwrap_or_default();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let Some(entities) = value["entities"].as_array() else {
+        return clean(raw, limit);
+    };
+    let mut spoiler_ranges: Vec<(usize, usize)> = Vec::new();
+    for entity in entities.iter().take(64) {
+        if entity.pointer("/type/@type").and_then(Value::as_str) != Some("textEntityTypeSpoiler") {
+            continue;
+        }
+        let offset = entity["offset"].as_u64().unwrap_or(0) as usize;
+        let len = entity["length"].as_u64().unwrap_or(0) as usize;
+        if len > 0 {
+            spoiler_ranges.push((offset, offset.saturating_add(len)));
+        }
+    }
+    if spoiler_ranges.is_empty() {
+        return clean(raw, limit);
+    }
+    spoiler_ranges.sort_unstable();
+    let mut out = String::with_capacity(raw.len().min(512));
+    let mut utf16_pos = 0usize;
+    let mut in_spoiler = false;
+    for ch in raw.chars().take(2048) {
+        let next_pos = utf16_pos + ch.len_utf16();
+        let covered = spoiler_ranges
+            .iter()
+            .any(|&(start, end)| utf16_pos < end && next_pos > start);
+        if covered {
+            if !in_spoiler {
+                out.push_str("██");
+                in_spoiler = true;
+            }
+        } else {
+            in_spoiler = false;
+            out.push(ch);
+        }
+        utf16_pos = next_pos;
+    }
+    clean(&out, limit)
+}
+
+fn format_duration(seconds: i64) -> String {
+    let s = seconds.max(0);
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+fn join_label(label: &str, detail: &str) -> String {
+    let detail = clean(detail, 160);
+    if detail.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label} {detail}")
+    }
 }
 
 fn message_body(message: &Value) -> String {
     let content = &message["content"];
-    match content["@type"].as_str() {
-        Some("messageText") => clean(content["text"]["text"].as_str().unwrap_or("新消息"), 200),
-        Some("messagePhoto") => format!(
-            "图片 {}",
-            clean(content["caption"]["text"].as_str().unwrap_or(""), 160)
+    let base = match content["@type"].as_str() {
+        Some("messageText") => {
+            let text = masked_formatted_text(&content["text"], 200);
+            if text.is_empty() {
+                "新消息".into()
+            } else {
+                text
+            }
+        }
+        Some("messagePhoto") => {
+            join_label("[图片]", &masked_formatted_text(&content["caption"], 160))
+        }
+        Some("messageVideo") => {
+            let dur = content
+                .pointer("/video/duration")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let tag = if dur > 0 {
+                format!("[视频 {}]", format_duration(dur))
+            } else {
+                "[视频]".into()
+            };
+            join_label(&tag, &masked_formatted_text(&content["caption"], 160))
+        }
+        Some("messageAnimation") => {
+            join_label("[GIF]", &masked_formatted_text(&content["caption"], 160))
+        }
+        Some("messageVideoNote") => {
+            let dur = content
+                .pointer("/video_note/duration")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if dur > 0 {
+                format!("[视频消息 {}]", format_duration(dur))
+            } else {
+                "[视频消息]".into()
+            }
+        }
+        Some("messageVoiceNote") => {
+            let dur = content
+                .pointer("/voice_note/duration")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let tag = if dur > 0 {
+                format!("[语音 {}]", format_duration(dur))
+            } else {
+                "[语音消息]".into()
+            };
+            join_label(&tag, &masked_formatted_text(&content["caption"], 160))
+        }
+        Some("messageAudio") => {
+            let performer = content
+                .pointer("/audio/performer")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let title = content
+                .pointer("/audio/title")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let name = match (performer.trim(), title.trim()) {
+                ("", "") => content
+                    .pointer("/audio/file_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                ("", t) => t.to_owned(),
+                (p, "") => p.to_owned(),
+                (p, t) => format!("{p} - {t}"),
+            };
+            join_label("[音频]", &name)
+        }
+        Some("messageDocument") => {
+            let file_name = content
+                .pointer("/document/file_name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let caption = masked_formatted_text(&content["caption"], 120);
+            let detail = match (clean(file_name, 80).as_str(), caption.as_str()) {
+                ("", "") => String::new(),
+                (name, "") => name.to_owned(),
+                ("", cap) => cap.to_owned(),
+                (name, cap) => format!("{name} · {cap}"),
+            };
+            join_label("[文件]", &detail)
+        }
+        Some("messageSticker") => {
+            let emoji = content
+                .pointer("/sticker/emoji")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            join_label("[贴纸]", emoji)
+        }
+        Some("messagePoll") => {
+            let question = content
+                .pointer("/poll/question/text")
+                .or_else(|| content.pointer("/poll/question"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            join_label("[投票]", question)
+        }
+        Some("messageLocation") => "[位置]".into(),
+        Some("messageVenue") => join_label(
+            "[位置]",
+            content
+                .pointer("/venue/title")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
         ),
-        Some("messageVideo") => "视频".into(),
-        Some("messageSticker") => format!(
-            "贴纸 {}",
-            clean(content["sticker"]["emoji"].as_str().unwrap_or(""), 16)
-        ),
-        Some("messageDocument") => format!(
-            "文件 {}",
-            clean(content["document"]["file_name"].as_str().unwrap_or(""), 160)
-        ),
-        Some("messageVoiceNote") => "语音消息".into(),
+        Some("messageContact") => {
+            let first = content
+                .pointer("/contact/first_name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let last = content
+                .pointer("/contact/last_name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            join_label("[联系人]", &format!("{first} {last}"))
+        }
+        Some("messageCall") => "[通话]".into(),
+        Some("messagePinMessage") => "置顶了一条消息".into(),
         _ => "新消息".into(),
+    };
+    if message.get("forward_info").is_some_and(Value::is_object) {
+        format!("[转发] {base}")
+    } else {
+        base
+    }
+}
+
+fn push_message_body(content: &Value) -> String {
+    match content["@type"].as_str() {
+        Some("pushMessageContentText") => {
+            let text = clean(content["text"].as_str().unwrap_or(""), 200);
+            if text.is_empty() {
+                "新消息".into()
+            } else {
+                text
+            }
+        }
+        Some("pushMessageContentPhoto") => "[图片]".into(),
+        Some("pushMessageContentVideo") => "[视频]".into(),
+        Some("pushMessageContentAnimation") => "[GIF]".into(),
+        Some("pushMessageContentVideoNote") => "[视频消息]".into(),
+        Some("pushMessageContentVoiceNote") => "[语音消息]".into(),
+        Some("pushMessageContentAudio") => {
+            join_label("[音频]", content["title"].as_str().unwrap_or(""))
+        }
+        Some("pushMessageContentDocument") => join_label(
+            "[文件]",
+            content["document"]["file_name"].as_str().unwrap_or(""),
+        ),
+        Some("pushMessageContentSticker") => {
+            join_label("[贴纸]", content["emoji"].as_str().unwrap_or(""))
+        }
+        Some("pushMessageContentPoll") => {
+            join_label("[投票]", content["question"].as_str().unwrap_or(""))
+        }
+        Some("pushMessageContentLocation") => "[位置]".into(),
+        Some("pushMessageContentContact") => {
+            join_label("[联系人]", content["name"].as_str().unwrap_or(""))
+        }
+        _ => "收到一条新消息".into(),
     }
 }
 
@@ -428,5 +746,212 @@ mod tests {
         assert!(state.displayed.len() <= 128);
         assert!(clean(&"界\u{301}".repeat(100_000), 200).chars().count() <= 400);
         assert!(!clean("字\u{1b}\n符", 200).contains('\u{1b}'));
+        assert_eq!(clean("第一行\n第二行\t第三列", 200), "第一行 第二行 第三列");
+    }
+
+    #[test]
+    fn sound_id_string_silent_flag_group_sender_topic_and_mentions_format_clearly() {
+        let mut store = Store::default();
+        store.apply(
+            &json!({"@type":"updateUser","user":{"id":101,"first_name":"小林","last_name":""}}),
+        );
+        store.apply(&json!({
+            "@type": "updateNewChat",
+            "chat": {
+                "id": 7,
+                "title": "技术群",
+                "type": {"@type": "chatTypeSupergroup", "supergroup_id": 70},
+                "is_forum": true,
+                "topics": [{"info": {"message_thread_id": 42, "name": "发布"}, "unread_count": 3}]
+            }
+        }));
+        store.apply(&json!({
+            "@type": "updateNewChat",
+            "chat": {
+                "id": 8,
+                "title": "小林",
+                "type": {"@type": "chatTypePrivate", "user_id": 101}
+            }
+        }));
+        let mut state = State {
+            enabled: true,
+            started: 100,
+            ..State::default()
+        };
+        // TDLib encodes int64 notification_sound_id as a JSON string.
+        let update = json!({
+            "@type": "updateNotificationGroup",
+            "notification_group_id": 10,
+            "type": {"@type": "notificationGroupTypeMentions"},
+            "chat_id": 7,
+            "total_count": 3,
+            "notification_sound_id": "5123456789",
+            "removed_notification_ids": [],
+            "added_notifications": [{
+                "id": 1,
+                "date": 105,
+                "is_silent": false,
+                "type": {
+                    "@type": "notificationTypeNewMessage",
+                    "message": {
+                        "is_outgoing": false,
+                        "sender_id": {"@type": "messageSenderUser", "user_id": 101},
+                        "topic_id": {"@type": "messageTopicForum", "forum_topic_id": 42},
+                        "content": {
+                            "@type": "messageText",
+                            "text": {
+                                "text": "答案是 秘密内容！",
+                                "entities": [{"offset": 4, "length": 4, "type": {"@type": "textEntityTypeSpoiler"}}]
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        let cmds = state.commands(&update, &store, 110);
+        assert!(matches!(
+            &cmds[..],
+            [Command::Show { group: 10, title, body, silent: false }]
+                if title == "技术群 · #发布 · @提及（3 条新消息）" && body == "小林：答案是 ██！"
+        ));
+
+        // Private chat omits duplicate sender prefix, and is_silent forces silent=true.
+        let dm = json!({
+            "@type": "updateNotificationGroup",
+            "notification_group_id": 11,
+            "type": {"@type": "notificationGroupTypeMessages"},
+            "chat_id": 8,
+            "total_count": 1,
+            "notification_sound_id": "5123456789",
+            "removed_notification_ids": [],
+            "added_notifications": [{
+                "id": 2,
+                "date": 106,
+                "is_silent": true,
+                "type": {
+                    "@type": "notificationTypeNewMessage",
+                    "message": {
+                        "is_outgoing": false,
+                        "sender_id": {"@type": "messageSenderUser", "user_id": 101},
+                        "content": {"@type": "messageText", "text": {"text": "晚安\n明天见"}}
+                    }
+                }
+            }]
+        });
+        let cmds = state.commands(&dm, &store, 110);
+        assert!(matches!(
+            &cmds[..],
+            [Command::Show { group: 11, title, body, silent: true }]
+                if title == "小林" && body == "晚安 明天见"
+        ));
+    }
+
+    #[test]
+    fn privacy_preview_hidden_push_messages_and_rich_media_bodies() {
+        let mut store = Store::default();
+        store.apply(&json!({
+            "@type": "updateNewChat",
+            "chat": {
+                "id": 9,
+                "title": "私密群",
+                "notification_settings": {
+                    "use_default_show_preview": false,
+                    "show_preview": false
+                }
+            }
+        }));
+        let mut state = State {
+            enabled: true,
+            started: 100,
+            ..State::default()
+        };
+        let hidden = json!({
+            "@type": "updateNotificationGroup",
+            "notification_group_id": 20,
+            "type": {"@type": "notificationGroupTypeMessages"},
+            "chat_id": 9,
+            "total_count": 2,
+            "notification_sound_id": "0",
+            "removed_notification_ids": [],
+            "added_notifications": [{
+                "id": 1,
+                "date": 105,
+                "type": {
+                    "@type": "notificationTypeNewMessage",
+                    "message": {
+                        "is_outgoing": false,
+                        "content": {"@type": "messageText", "text": {"text": "绝密正文不应泄露"}}
+                    }
+                }
+            }]
+        });
+        let cmds = state.commands(&hidden, &store, 110);
+        assert!(matches!(
+            &cmds[..],
+            [Command::Show { body, .. }] if body == "收到 2 条新消息"
+        ));
+
+        // Push message notification format.
+        store.apply(&json!({"@type":"updateNewChat","chat":{"id":10,"title":"工作群"}}));
+        let push = json!({
+            "@type": "updateNotificationGroup",
+            "notification_group_id": 21,
+            "type": {"@type": "notificationGroupTypeMessages"},
+            "chat_id": 10,
+            "notification_sound_id": "1",
+            "removed_notification_ids": [],
+            "added_notifications": [{
+                "id": 3,
+                "date": 107,
+                "type": {
+                    "@type": "notificationTypeNewPushMessage",
+                    "sender_name": "陈同学",
+                    "content": {"@type": "pushMessageContentPhoto"}
+                }
+            }]
+        });
+        let cmds = state.commands(&push, &store, 110);
+        assert!(matches!(
+            &cmds[..],
+            [Command::Show { title, body, silent: false, .. }]
+                if title == "工作群" && body == "陈同学：[图片]"
+        ));
+
+        // Rich media previews have no trailing spaces and include duration / forward context.
+        assert_eq!(
+            message_body(&json!({"content":{"@type":"messagePhoto"}})),
+            "[图片]"
+        );
+        assert_eq!(
+            message_body(
+                &json!({"content":{"@type":"messageVideo","video":{"duration":75},"caption":{"text":"演示"}}})
+            ),
+            "[视频 1:15] 演示"
+        );
+        assert_eq!(
+            message_body(
+                &json!({"content":{"@type":"messageVoiceNote","voice_note":{"duration":18}}})
+            ),
+            "[语音 0:18]"
+        );
+        assert_eq!(
+            message_body(
+                &json!({"content":{"@type":"messageDocument","document":{"file_name":"report.pdf"}}})
+            ),
+            "[文件] report.pdf"
+        );
+        assert_eq!(
+            message_body(
+                &json!({"content":{"@type":"messagePoll","poll":{"question":{"text":"周几开会？"}}}})
+            ),
+            "[投票] 周几开会？"
+        );
+        assert_eq!(
+            message_body(&json!({
+                "forward_info": {"origin": {"@type": "messageOriginHiddenUser", "sender_name": "某人"}},
+                "content": {"@type": "messageText", "text": {"text": "公告"}}
+            })),
+            "[转发] 公告"
+        );
     }
 }

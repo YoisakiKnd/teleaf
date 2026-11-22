@@ -13,6 +13,66 @@ pub struct PinnedBanner {
     pub excerpt: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageScope {
+    Forum(i64),
+    Discussion(i64),
+}
+
+impl MessageScope {
+    pub fn json(self) -> Value {
+        match self {
+            Self::Forum(id) => serde_json::json!({"@type":"messageTopicForum","forum_topic_id":id}),
+            Self::Discussion(id) => {
+                serde_json::json!({"@type":"messageTopicThread","message_thread_id":id})
+            }
+        }
+    }
+
+    fn matches(self, message: &Value) -> bool {
+        if let Self::Discussion(root) = self
+            && message["id"].as_i64() == Some(root)
+        {
+            return true;
+        }
+        if let Some(scope) = message_scope(message) {
+            return scope == self;
+        }
+        if message
+            .get("topic_id")
+            .is_some_and(|topic| !topic.is_null())
+        {
+            return false;
+        }
+        let id = match self {
+            Self::Forum(id) | Self::Discussion(id) => id,
+        };
+        integer(message.get("message_thread_id")) == id
+    }
+}
+
+fn message_scope(message: &Value) -> Option<MessageScope> {
+    let topic = &message["topic_id"];
+    match kind(topic) {
+        "messageTopicForum" => topic["forum_topic_id"].as_i64().map(MessageScope::Forum),
+        "messageTopicThread" => topic["message_thread_id"]
+            .as_i64()
+            .map(MessageScope::Discussion),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ForumTopic {
+    pub thread_id: i64,
+    pub title: String,
+    pub unread: i64,
+    pub pinned: bool,
+    pub order: i64,
+    pub closed: bool,
+    pub last_preview: String,
+}
+
 #[derive(Clone)]
 pub struct Chat {
     pub id: i64,
@@ -32,6 +92,9 @@ pub struct Chat {
     pub username: String,
     pub bio: String,
     pub pinned_message: Option<PinnedBanner>,
+    pub is_forum: bool,
+    pub topics: Vec<ForumTopic>,
+    pub active_topic: Option<(i64, String)>,
     pub peer: Option<ChatPeer>,
     pub notifications: NotificationSettings,
     orders: HashMap<ChatList, i64>,
@@ -97,6 +160,16 @@ impl NotificationSettings {
                 value[key] = Value::String(id.to_string());
             }
         }
+    }
+
+    fn flag(self, key: &str) -> Option<bool> {
+        let index = NOTIFICATION_FLAGS.iter().position(|flag| *flag == key)?;
+        (self.present & (1 << index) != 0).then_some(self.enabled & (1 << index) != 0)
+    }
+
+    pub fn preview_hidden(self) -> bool {
+        self.flag("use_default_show_preview") == Some(false)
+            && self.flag("show_preview") == Some(false)
     }
 }
 
@@ -169,6 +242,39 @@ pub struct MessageInfo {
     pub reactions: Vec<Reaction>,
     pub entities: Vec<TextEntity>,
     pub media_meta: Option<MediaMeta>,
+    pub media_album_id: i64,
+    pub thread_id: i64,
+    pub reply_count: u32,
+    pub can_get_thread: bool,
+    pub link_preview: Option<LinkPreview>,
+    pub inline_keyboard: Vec<Vec<InlineButton>>,
+}
+
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct LinkPreview {
+    pub site_name: String,
+    pub title: String,
+    pub description: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InlineButtonKind {
+    Url(String),
+    Callback(String),
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineButton {
+    pub text: String,
+    pub kind: InlineButtonKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkItem {
+    Url(String),
+    Mention(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,25 +386,72 @@ impl Message {
                 .media_meta
                 .as_ref()
                 .map_or(0, |meta| meta.file_name.capacity())
+            + self.info.link_preview.as_ref().map_or(0, |lp| {
+                lp.site_name.capacity()
+                    + lp.title.capacity()
+                    + lp.description.capacity()
+                    + lp.url.capacity()
+            })
+            + self.info.inline_keyboard.capacity() * std::mem::size_of::<Vec<InlineButton>>()
+            + self
+                .info
+                .inline_keyboard
+                .iter()
+                .map(|row| {
+                    row.capacity() * std::mem::size_of::<InlineButton>()
+                        + row
+                            .iter()
+                            .map(|btn| {
+                                btn.text.capacity()
+                                    + match &btn.kind {
+                                        InlineButtonKind::Url(s)
+                                        | InlineButtonKind::Callback(s) => s.capacity(),
+                                        InlineButtonKind::Other => 0,
+                                    }
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
     }
-    pub fn first_link(&self) -> Option<String> {
-        self.info
-            .entities
-            .iter()
-            .find_map(|entity| match &entity.kind {
-                EntityKind::TextUrl(url) if !url.is_empty() => Some(url.clone()),
+    pub fn links_and_mentions(&self) -> Vec<LinkItem> {
+        let mut items: Vec<LinkItem> = Vec::new();
+        let mut push = |item: LinkItem| {
+            if items.len() < 32 && !items.contains(&item) {
+                items.push(item);
+            }
+        };
+        for entity in &self.info.entities {
+            match &entity.kind {
+                EntityKind::TextUrl(url) if !url.is_empty() => push(LinkItem::Url(url.clone())),
                 EntityKind::Url => {
-                    let raw = self.text.get(entity.start..entity.end)?.trim();
-                    if raw.is_empty() {
-                        None
-                    } else if raw.starts_with("http://") || raw.starts_with("https://") {
-                        Some(raw.to_owned())
-                    } else {
-                        Some(format!("https://{raw}"))
+                    if let Some(raw) = self.text.get(entity.start..entity.end).map(str::trim)
+                        && !raw.is_empty()
+                    {
+                        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+                            raw.to_owned()
+                        } else {
+                            format!("https://{raw}")
+                        };
+                        push(LinkItem::Url(url));
                     }
                 }
-                _ => None,
-            })
+                EntityKind::Mention => {
+                    if let Some(raw) = self.text.get(entity.start..entity.end).map(str::trim)
+                        && raw.starts_with('@')
+                        && raw.len() > 1
+                    {
+                        push(LinkItem::Mention(raw.chars().take(64).collect()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(lp) = &self.info.link_preview
+            && !lp.url.is_empty()
+        {
+            push(LinkItem::Url(lp.url.clone()));
+        }
+        items
     }
     pub fn retryable(&self) -> bool {
         matches!(
@@ -432,6 +585,7 @@ pub struct Store {
     main_list_position: usize,
     pub exhausted_lists: std::collections::HashSet<ChatList>,
     pub active_chat: Option<i64>,
+    pub message_scope: Option<MessageScope>,
     pub messages: Vec<Message>,
     pub search_results: Vec<Message>,
     pub global_chat_results: Vec<ChatSummary>,
@@ -593,6 +747,46 @@ impl Store {
             || self.sender_names.contains_key(&Sender::Chat(id))
     }
 
+    pub fn notification_chat_title(&self, id: i64) -> Option<&str> {
+        self.chats
+            .get(&id)
+            .map(|chat| chat.title.as_str())
+            .filter(|title| !title.is_empty())
+            .or_else(|| {
+                self.sender_names
+                    .get(&Sender::Chat(id))
+                    .map(String::as_str)
+                    .filter(|title| !title.is_empty())
+            })
+    }
+
+    pub fn notification_sender(&self, chat_id: i64, message: &Value) -> Option<String> {
+        let chat = self.chats.get(&chat_id);
+        if chat.is_some_and(|chat| matches!(chat.peer, Some(ChatPeer::Private(_)))) {
+            return None;
+        }
+        let sender = message.get("sender_id").and_then(Sender::parse);
+        let name = match sender {
+            Some(Sender::User(id)) => self.sender_names.get(&Sender::User(id)).cloned(),
+            Some(Sender::Chat(id)) if id != chat_id => {
+                self.notification_chat_title(id).map(str::to_owned)
+            }
+            _ => None,
+        }
+        .or_else(|| {
+            message
+                .get("author_signature")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })?;
+        if self.notification_chat_title(chat_id) == Some(name.as_str()) {
+            return None;
+        }
+        Some(name)
+    }
+
     pub fn chat_title(&self, id: i64) -> String {
         self.chats
             .get(&id)
@@ -741,13 +935,67 @@ impl Store {
 
     pub fn open(&mut self, id: i64) {
         if self.active_chat != Some(id) {
+            if let Some(chat) = self.active_chat.and_then(|id| self.chats.get_mut(&id)) {
+                chat.topics.clear();
+            }
+            self.set_message_scope(None);
             self.active_chat = Some(id);
-            self.messages.clear();
-            self.search_results.clear();
-            self.history_exhausted = false;
-            self.context_window = false;
             self.requested_senders.clear();
         }
+    }
+
+    pub fn set_message_scope(&mut self, scope: Option<MessageScope>) {
+        if let Some(chat) = self.active_chat.and_then(|id| self.chats.get_mut(&id)) {
+            chat.active_topic = None;
+        }
+        self.message_scope = scope;
+        self.messages.clear();
+        self.search_results.clear();
+        self.history_exhausted = false;
+        self.context_window = false;
+    }
+
+    pub fn message_in_window(&self, value: &Value) -> bool {
+        self.active_chat
+            .is_some_and(|id| value["chat_id"].as_i64() == Some(id))
+            && self.message_scope.is_none_or(|scope| scope.matches(value))
+    }
+
+    pub fn merge_scoped_history(&mut self, values: &[Value]) {
+        let oldest = self.oldest_message_id();
+        for value in values.iter().take(50) {
+            self.add_message(value, true);
+        }
+        self.history_exhausted = self.messages.is_empty()
+            || values.is_empty()
+            || oldest.is_some_and(|old| self.oldest_message_id() == Some(old));
+    }
+
+    pub fn update_topics(&mut self, chat_id: i64, value: &Value) {
+        let Some(chat) = self.chats.get_mut(&chat_id) else {
+            return;
+        };
+        let mut topics = Vec::new();
+        for value in value["topics"].as_array().into_iter().flatten() {
+            if topics.len() == 64 {
+                break;
+            }
+            if let Some(topic) = parse_forum_topic(value)
+                && !topics
+                    .iter()
+                    .any(|existing: &ForumTopic| existing.thread_id == topic.thread_id)
+            {
+                topics.push(topic);
+            }
+        }
+        topics.sort_by_key(|topic| {
+            (
+                Reverse(topic.pinned),
+                Reverse(topic.order),
+                Reverse(topic.thread_id),
+            )
+        });
+        chat.topics = topics;
     }
 
     fn apply_chat_action(&mut self, update: &Value, now: Instant) -> bool {
@@ -881,7 +1129,7 @@ impl Store {
         let mut newest = from;
         // TDLib returns newest first. Insert in chronological order so trimming retains the newer edge.
         for value in values.iter().take(50).rev() {
-            if value["chat_id"].as_i64() != active {
+            if !self.message_in_window(value) {
                 continue;
             }
             count += 1;
@@ -891,6 +1139,7 @@ impl Store {
             }
         }
         let latest = active
+            .filter(|_| self.message_scope.is_none())
             .and_then(|chat| self.chat(chat))
             .map_or(0, |chat| chat.latest_message_id);
         if (latest > 0 && newest >= latest) || (latest == 0 && count < 50) {
@@ -937,7 +1186,7 @@ impl Store {
     pub fn replace_context(&mut self, values: &[Value], target: i64) -> bool {
         // TDLib returns newest first. Reserve the target before filling around it.
         let Some(origin) = values.iter().position(|value| {
-            value["chat_id"].as_i64() == self.active_chat && value["id"].as_i64() == Some(target)
+            self.message_in_window(value) && value["id"].as_i64() == Some(target)
         }) else {
             return false;
         };
@@ -960,7 +1209,7 @@ impl Store {
                     break;
                 }
                 if let Some(value) = values.get(index)
-                    && value["chat_id"].as_i64() == self.active_chat
+                    && self.message_in_window(value)
                     && let Some(message) = parse_message(value)
                     && message.id != target
                 {
@@ -1209,6 +1458,9 @@ impl Store {
                 if update["chat_id"].as_i64() == self.active_chat {
                     let id = integer(update.get("message_id"));
                     let reactions = parse_reactions(update.get("interaction_info"));
+                    let reply_count =
+                        integer(update.pointer("/interaction_info/reply_info/reply_count")).max(0)
+                            as u32;
                     for message in self
                         .messages
                         .iter_mut()
@@ -1216,6 +1468,14 @@ impl Store {
                         .filter(|m| m.id == id)
                     {
                         message.info.reactions = reactions.clone();
+                        if reply_count > 0
+                            || update.pointer("/interaction_info/reply_info").is_some()
+                        {
+                            message.info.reply_count = reply_count;
+                            if reply_count > 0 {
+                                message.info.can_get_thread = true;
+                            }
+                        }
                     }
                 }
             }
@@ -1402,7 +1662,7 @@ impl Store {
                         .and_then(Value::as_array)
                         .into_iter()
                         .flatten()
-                        .filter(|message| message["chat_id"].as_i64() == self.active_chat)
+                        .filter(|message| self.message_in_window(message))
                         .take(50)
                         .filter_map(parse_message)
                         .collect();
@@ -1513,6 +1773,16 @@ impl Store {
                 username: bounded_text(value.get("username"), 64),
                 bio: bounded_text(value.get("bio"), 512),
                 pinned_message: value.get("pinned_message").and_then(parse_pin_banner),
+                is_forum: value["is_forum"] == true
+                    || value.pointer("/view_as_topics").and_then(Value::as_bool) == Some(true),
+                topics: value["topics"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(parse_forum_topic)
+                    .take(64)
+                    .collect(),
+                active_topic: None,
                 notifications: NotificationSettings::parse(&value["notification_settings"]),
                 peer: parse_peer(value),
                 orders: HashMap::new(),
@@ -1616,7 +1886,7 @@ impl Store {
     }
 
     fn add_message(&mut self, value: &Value, from_history: bool) {
-        if value.get("chat_id").and_then(Value::as_i64) != self.active_chat {
+        if !self.message_in_window(value) {
             return;
         }
         let Some(message) = parse_message(value) else {
@@ -1756,6 +2026,18 @@ fn parse_message(value: &Value) -> Option<Message> {
     let media = content.and_then(media_ref);
     let media_meta = content.and_then(parse_media_meta);
     let reactions = parse_reactions(value.get("interaction_info"));
+    let link_preview = content.and_then(parse_link_preview);
+    let inline_keyboard = parse_inline_keyboard(value.get("reply_markup"));
+    let reply_count =
+        integer(value.pointer("/interaction_info/reply_info/reply_count")).max(0) as u32;
+    let can_get_thread = value["can_get_message_thread"] == true || reply_count > 0;
+    let media_album_id = integer(value.get("media_album_id"));
+    let thread_id = message_scope(value).map_or_else(
+        || integer(value.get("message_thread_id")),
+        |scope| match scope {
+            MessageScope::Forum(id) | MessageScope::Discussion(id) => id,
+        },
+    );
     Some(Message {
         id: value.get("id")?.as_i64()?,
         text,
@@ -1808,8 +2090,98 @@ fn parse_message(value: &Value) -> Option<Message> {
             reactions,
             entities,
             media_meta,
+            media_album_id,
+            thread_id,
+            reply_count,
+            can_get_thread,
+            link_preview,
+            inline_keyboard,
         },
     })
+}
+
+pub fn parse_forum_topic(value: &Value) -> Option<ForumTopic> {
+    let info = value.get("info").unwrap_or(value);
+    let thread_id = integer(
+        info.get("forum_topic_id")
+            .or_else(|| info.get("message_thread_id")),
+    );
+    if thread_id <= 0 {
+        return None;
+    }
+    Some(ForumTopic {
+        thread_id,
+        title: bounded_text(info.get("name").or_else(|| info.get("title")), 64),
+        unread: integer(value.get("unread_count")),
+        pinned: value["is_pinned"] == true,
+        order: integer(value.get("order")).max(integer(value.pointer("/last_message/date"))),
+        closed: info["is_closed"] == true,
+        last_preview: value
+            .get("last_message")
+            .map(|msg| preview(Some(msg)).chars().take(120).collect())
+            .unwrap_or_else(|| bounded_text(value.get("last_preview"), 120)),
+    })
+}
+
+fn parse_link_preview(content: &Value) -> Option<LinkPreview> {
+    let lp = content.get("link_preview")?;
+    if lp.is_null() {
+        return None;
+    }
+    let site_name = bounded_text(lp.get("site_name"), 48);
+    let title = bounded_text(lp.get("title"), 120);
+    let description = bounded_text(
+        lp.pointer("/description/text")
+            .or_else(|| lp.get("description")),
+        180,
+    );
+    let url = bounded_text(lp.get("url"), 256);
+    if site_name.is_empty() && title.is_empty() && description.is_empty() {
+        return None;
+    }
+    Some(LinkPreview {
+        site_name,
+        title,
+        description,
+        url,
+    })
+}
+
+fn parse_inline_keyboard(markup: Option<&Value>) -> Vec<Vec<InlineButton>> {
+    let Some(markup) = markup.filter(|m| kind(m) == "replyMarkupInlineKeyboard") else {
+        return Vec::new();
+    };
+    markup["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(8)
+        .filter_map(|row| {
+            let buttons: Vec<InlineButton> = row
+                .as_array()?
+                .iter()
+                .take(6)
+                .filter_map(|btn| {
+                    let text = bounded_text(btn.get("text"), 48);
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let btype = &btn["type"];
+                    let kind = match kind(btype) {
+                        "inlineKeyboardButtonTypeUrl" => {
+                            InlineButtonKind::Url(bounded_text(btype.get("url"), 256))
+                        }
+                        "inlineKeyboardButtonTypeCallback" => {
+                            InlineButtonKind::Callback(bounded_text(btype.get("data"), 256))
+                        }
+                        _ => InlineButtonKind::Other,
+                    };
+                    Some(InlineButton { text, kind })
+                })
+                .collect();
+            (!buttons.is_empty()).then_some(buttons)
+        })
+        .collect()
 }
 
 fn parse_reactions(interaction_info: Option<&Value>) -> Vec<Reaction> {

@@ -97,7 +97,7 @@ const MESSAGE: &[Item] = &[
         action: Action::JumpToMessage,
     },
     Item {
-        label: "打开消息链接",
+        label: "打开链接 / 提及",
         key: 'L',
         action: Action::OpenMessageLink,
     },
@@ -135,6 +135,11 @@ const MESSAGE: &[Item] = &[
         label: "用系统程序打开",
         key: 'o',
         action: Action::OpenExternal,
+    },
+    Item {
+        label: "另存为到下载目录",
+        key: 'E',
+        action: Action::SaveFileAs,
     },
     Item {
         label: "重试失败消息",
@@ -197,6 +202,10 @@ pub fn items(app: &App) -> impl Iterator<Item = Item> + '_ {
                 crate::selection::active(app) || message.is_some_and(|m| !m.text.is_empty())
             }
             Action::Preview | Action::OpenExternal => message.is_some_and(|m| m.media.is_some()),
+            Action::SaveFileAs => message
+                .and_then(|m| m.media.as_ref())
+                .and_then(|media| media.detail_file().1)
+                .is_some(),
             Action::Retry => message.is_some_and(|m| m.retryable()),
             Action::Edit => {
                 message.is_some_and(|m| m.info.text_message && m.media.is_none())
@@ -212,9 +221,7 @@ pub fn items(app: &App) -> impl Iterator<Item = Item> + '_ {
             }
             Action::Reply | Action::React | Action::ToggleMultiSelect => message.is_some(),
             Action::JumpToMessage => app.show_search && message.is_some(),
-            Action::OpenMessageLink => message
-                .and_then(crate::store::Message::first_link)
-                .is_some(),
+            Action::OpenMessageLink => message.is_some_and(|m| !m.links_and_mentions().is_empty()),
             Action::QuoteBack => app.quote_back.is_some(),
             Action::ClearSearch => app.show_search,
             Action::QuickSwitch => true,

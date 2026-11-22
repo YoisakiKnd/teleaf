@@ -226,6 +226,109 @@ pub fn set_draft(chat_id: i64, text: &str, reply_to: Option<i64>) -> Value {
         "draft_message":draft,"@extra":format!("draft:{chat_id}")})
 }
 
+pub fn get_proxies() -> Value {
+    json!({"@type": "getProxies", "@extra": "proxy-list"})
+}
+
+pub fn save_proxy(parsed: &crate::proxy::ParsedProxy, existing: Option<i32>) -> Value {
+    let mut request = json!({
+        "@type": if existing.is_some() { "editProxy" } else { "addProxy" },
+        "proxy": {
+            "@type": "proxy",
+            "server": parsed.server,
+            "port": parsed.port,
+            "type": crate::proxy::proxy_type_json(parsed)
+        },
+        "enable": true
+    });
+    if let Some(id) = existing {
+        request["proxy_id"] = json!(id);
+    }
+    request
+}
+
+pub fn enable_proxy(proxy_id: i32) -> Value {
+    json!({"@type": "enableProxy", "proxy_id": proxy_id, "@extra": format!("proxy-toggle:{proxy_id}:1")})
+}
+
+pub fn disable_proxy() -> Value {
+    json!({"@type": "disableProxy", "@extra": "proxy-toggle:0:0"})
+}
+
+pub fn remove_proxy(proxy_id: i32) -> Value {
+    json!({"@type": "removeProxy", "proxy_id": proxy_id, "@extra": format!("proxy-remove:{proxy_id}")})
+}
+
+pub fn ping_proxy(proxy_id: i32) -> Value {
+    json!({"@type": "pingProxy", "proxy_id": proxy_id, "@extra": format!("proxy-ping:{proxy_id}")})
+}
+
+pub fn search_public_chat(username: &str) -> Value {
+    json!({
+        "@type": "searchPublicChat",
+        "username": username.trim_start_matches('@'),
+        "@extra": format!("mention:{}", username.trim_start_matches('@'))
+    })
+}
+
+pub fn callback_query(chat_id: i64, message_id: i64, data_base64: &str) -> Value {
+    json!({
+        "@type": "getCallbackQueryAnswer",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "payload": {
+            "@type": "callbackQueryPayloadData",
+            "data": data_base64
+        },
+        "@extra": format!("callback:{chat_id}:{message_id}")
+    })
+}
+
+pub fn get_forum_topics(chat_id: i64) -> Value {
+    json!({
+        "@type": "getForumTopics",
+        "chat_id": chat_id,
+        "query": "",
+        "offset_date": 0,
+        "offset_message_id": 0,
+        "offset_forum_topic_id": 0,
+        "limit": 64,
+        "@extra": format!("topics:{chat_id}")
+    })
+}
+
+pub fn get_message_thread(chat_id: i64, message_id: i64) -> Value {
+    json!({
+        "@type": "getMessageThread",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "@extra": format!("thread-info:{chat_id}:{message_id}")
+    })
+}
+
+pub fn get_message_thread_history(chat_id: i64, message_id: i64, from_message_id: i64) -> Value {
+    json!({
+        "@type": "getMessageThreadHistory",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "from_message_id": from_message_id,
+        "offset": 0,
+        "limit": 50,
+        "@extra": format!("thread-history:{chat_id}:{message_id}")
+    })
+}
+
+pub fn scoped_history(chat: i64, scope: crate::store::MessageScope, from: i64) -> Value {
+    match scope {
+        crate::store::MessageScope::Forum(id) => json!({
+            "@type":"getForumTopicHistory","chat_id":chat,"forum_topic_id":id,
+            "from_message_id":from,"offset":0,"limit":50,
+            "@extra":format!("thread-history:{chat}:{id}")
+        }),
+        crate::store::MessageScope::Discussion(id) => get_message_thread_history(chat, id, from),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

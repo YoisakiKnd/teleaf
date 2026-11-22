@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::store::{ChatList, ChatPeer};
+use crate::store::{ChatList, ChatPeer, MessageScope};
 use crate::{App, InputMode, TdWorker, actions, send_request};
 
 type Response = (Option<Value>, bool);
@@ -13,6 +13,12 @@ type Response = (Option<Value>, bool);
 #[derive(Default)]
 pub struct Sync {
     generation: u64,
+    mention: Option<(Option<i64>, String)>,
+    callback: Option<String>,
+    topics: Option<String>,
+    thread_info: Option<String>,
+    thread_history: Option<String>,
+    navigation: Option<Navigation>,
     quick_query: String,
     quick_generation: u64,
     quick_ids: Vec<i64>,
@@ -34,6 +40,11 @@ pub struct Sync {
     toggles: Vec<ChatToggle>,
     draft: DraftSync,
     media: Vec<FileOperation>,
+}
+
+enum Navigation {
+    OpenMention(i64),
+    OpenDiscussion { chat: i64, root: i64 },
 }
 
 #[derive(Default)]
@@ -237,6 +248,379 @@ impl App {
         true
     }
 
+    pub fn reset_chat_requests(&mut self) {
+        self.sync.mention = None;
+        self.sync.callback = None;
+        self.sync.topics = None;
+        self.sync.thread_info = None;
+        self.sync.thread_history = None;
+        self.sync.navigation = None;
+    }
+
+    pub fn search_mention(&mut self, worker: &TdWorker, handle: &str) {
+        let mut request = actions::search_public_chat(handle);
+        let extra = tag(&mut request, self.next_sync_generation());
+        self.sync.mention = Some((self.store.active_chat, extra));
+        if send_request(self, worker, request) {
+            self.notice = Some(format!("正在查找 {handle}…"));
+            self.notice_error = false;
+        }
+    }
+
+    pub fn request_callback(&mut self, worker: &TdWorker, message: i64, data: &str) -> bool {
+        let Some(chat) = self.store.active_chat else {
+            return false;
+        };
+        if self.sync.callback.is_some() {
+            return false;
+        }
+        let mut request = actions::callback_query(chat, message, data);
+        self.sync.callback = Some(tag(&mut request, self.next_sync_generation()));
+        send_request(self, worker, request)
+    }
+
+    pub fn request_forum_topics(&mut self, worker: &TdWorker, chat: i64) {
+        let mut request = actions::get_forum_topics(chat);
+        self.sync.topics = Some(tag(&mut request, self.next_sync_generation()));
+        send_request(self, worker, request);
+    }
+
+    pub fn park_composer(&mut self) {
+        if self.store.message_scope.is_none() {
+            self.save_draft();
+        } else {
+            self.draft.clear();
+            self.suspended_input = None;
+            self.input_mode = InputMode::Off;
+            self.draft_cursor = usize::MAX;
+            self.composer_focus = false;
+        }
+    }
+
+    pub fn scope_outgoing_request(&self, request: &mut Value) {
+        if let Some(scope) = self.store.message_scope
+            && matches!(
+                request["@type"].as_str(),
+                Some(
+                    "sendMessage"
+                        | "sendMessageAlbum"
+                        | "searchChatMessages"
+                        | "setChatDraftMessage"
+                )
+            )
+        {
+            request["topic_id"] = scope.json();
+        }
+    }
+
+    fn reset_scoped_timeline(&mut self) {
+        self.sync.mention = None;
+        self.sync.history = None;
+        self.sync.newer = None;
+        self.sync.search = None;
+        self.sync.jump = None;
+        self.cancel_unread_context();
+        self.sync.thread_info = None;
+        self.sync.thread_history = None;
+        self.sync.callback = None;
+        self.sync.read = ReadSync::default();
+        self.selected_message = None;
+        self.timeline_anchor = None;
+        self.timeline_heights.clear();
+        self.quote_back = None;
+        self.pending_messages = 0;
+        self.selection = None;
+        self.drag = None;
+        self.show_search = false;
+        self.multi_select.clear();
+        self.message_check = None;
+        self.reset_draft_snapshot();
+        self.focus_messages = true;
+    }
+
+    pub fn scoped_history_request(&mut self, chat: i64, from: i64) -> Value {
+        let scope = self.store.message_scope.expect("scoped history");
+        let mut request = actions::scoped_history(chat, scope, from);
+        self.sync.thread_history = Some(tag(&mut request, self.next_sync_generation()));
+        self.history_loading = true;
+        request
+    }
+
+    pub fn open_forum_topic(&mut self, worker: &TdWorker, chat: i64, topic: i64, title: String) {
+        if self.store.active_chat != Some(chat) || self.store.chat(chat).is_none() {
+            return;
+        }
+        if let Some(request) = self.flush_draft(Instant::now(), true) {
+            send_request(self, worker, request);
+        }
+        self.park_composer();
+        self.store
+            .set_message_scope(Some(MessageScope::Forum(topic)));
+        self.store
+            .chat_mut_by_id(chat)
+            .expect("forum chat")
+            .active_topic = Some((topic, title));
+        self.reset_scoped_timeline();
+        let request = self.scoped_history_request(chat, 0);
+        send_request(self, worker, request);
+    }
+
+    pub fn exit_forum_topic(&mut self, worker: &TdWorker) {
+        let Some(chat) = self.store.active_chat else {
+            return;
+        };
+        if !matches!(self.store.message_scope, Some(MessageScope::Forum(_))) {
+            return;
+        }
+        if let Some(request) = self.flush_draft(Instant::now(), true) {
+            send_request(self, worker, request);
+        }
+        self.park_composer();
+        self.store.set_message_scope(None);
+        self.restore_draft(chat);
+        self.reset_scoped_timeline();
+        let request = self.history_request(chat, 0);
+        send_request(self, worker, request);
+    }
+
+    pub fn open_discussion(&mut self, worker: &TdWorker, post_id: i64) -> bool {
+        let Some(source_chat) = self.store.active_chat else {
+            return false;
+        };
+        if self
+            .active_thread
+            .as_ref()
+            .is_some_and(|thread| thread.discussion_chat.is_some())
+        {
+            return false;
+        }
+        let Some(post) = self
+            .active_messages()
+            .iter()
+            .find(|message| message.id == post_id)
+        else {
+            return false;
+        };
+        let title: String = post.text.chars().take(48).collect();
+        self.active_thread = Some(crate::ThreadView {
+            source_chat,
+            post_id,
+            thread_id: post.info.thread_id,
+            discussion_chat: None,
+            title: if title.is_empty() {
+                "评论串".into()
+            } else {
+                title
+            },
+        });
+        let mut request = actions::get_message_thread(source_chat, post_id);
+        self.sync.thread_info = Some(tag(&mut request, self.next_sync_generation()));
+        if send_request(self, worker, request) {
+            self.notice = Some("正在加载评论串…".into());
+            self.notice_error = false;
+        }
+        true
+    }
+
+    pub fn exit_discussion(&mut self, worker: &TdWorker) {
+        let Some(thread) = self.active_thread.clone() else {
+            return;
+        };
+        self.sync.thread_info = None;
+        self.sync.thread_history = None;
+        self.sync.navigation = None;
+        if thread.discussion_chat.is_none() {
+            self.active_thread = None;
+            return;
+        }
+        self.selected_chat = Some(thread.source_chat);
+        for request in self.open_selected() {
+            if request["@type"] != "getChatHistory" {
+                send_request(self, worker, request);
+            }
+        }
+        self.jump_to(worker, thread.post_id);
+    }
+
+    pub fn service_navigation(&mut self, worker: &TdWorker) -> bool {
+        match self.sync.navigation.take() {
+            Some(Navigation::OpenMention(chat)) => {
+                self.close_overlays();
+                self.selected_chat = Some(chat);
+                for request in self.open_selected() {
+                    send_request(self, worker, request);
+                }
+                true
+            }
+            Some(Navigation::OpenDiscussion { chat, root }) => {
+                let Some(thread) = self.active_thread.as_ref().filter(|thread| {
+                    Some(thread.source_chat) == self.store.active_chat
+                        && thread.discussion_chat.is_none()
+                }) else {
+                    return false;
+                };
+                let source = thread.source_chat;
+                if let Some(request) = self.flush_draft(Instant::now(), true) {
+                    send_request(self, worker, request);
+                }
+                self.park_composer();
+                self.close_overlays();
+                self.reset_chat_requests();
+                self.sync.pinned = None;
+                self.sync.chat = None;
+                self.sync.open_session = None;
+                self.sync.details_requested = false;
+                self.sync.details_generation = self.next_sync_generation();
+                self.store.open(chat);
+                self.store
+                    .set_message_scope(Some(MessageScope::Discussion(root)));
+                self.reset_scoped_timeline();
+                if let Some(thread) = &mut self.active_thread {
+                    thread.discussion_chat = Some(chat);
+                    thread.thread_id = root;
+                }
+                if source != chat {
+                    send_request(
+                        self,
+                        worker,
+                        json!({"@type":"closeChat","chat_id":source,"@extra":"close-session"}),
+                    );
+                    let mut open = json!({"@type":"openChat","chat_id":chat,"@extra":format!("open-session:{chat}")});
+                    self.sync.open_session = Some(tag(&mut open, self.next_sync_generation()));
+                    send_request(self, worker, open);
+                }
+                let request = self.scoped_history_request(chat, 0);
+                send_request(self, worker, request);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn receive_chat_feature(&mut self, value: &Value, extra: &str) -> Option<Response> {
+        let mut parts = extra.split(':');
+        let route = parts.next()?;
+        let kind = value["@type"].as_str().unwrap_or_default();
+        if route == "mention" {
+            let Some((source, _)) = self.sync.mention.take_if(|(_, pending)| pending == extra)
+            else {
+                return Some((None, false));
+            };
+            if source != self.store.active_chat {
+                return Some((None, false));
+            }
+            if kind == "chat"
+                && let Some(chat) = value["id"].as_i64().filter(|id| *id != 0)
+            {
+                if self.store.chat(chat).is_none() {
+                    self.store.add_chat(value);
+                } else {
+                    self.store.merge_open_chat(chat, value, true);
+                }
+                self.sync.navigation = Some(Navigation::OpenMention(chat));
+                self.notice = Some("已找到提及的会话".into());
+                self.notice_error = false;
+            } else {
+                self.sync_error(value, "找不到提及的会话");
+            }
+            return Some((None, true));
+        }
+        if !matches!(
+            route,
+            "callback" | "topics" | "thread-info" | "thread-history"
+        ) {
+            return None;
+        }
+        let chat = parts.next().and_then(|id| id.parse::<i64>().ok());
+        if chat.is_none() || chat != self.store.active_chat {
+            return Some((None, false));
+        }
+        let pending = match route {
+            "callback" => &mut self.sync.callback,
+            "topics" => &mut self.sync.topics,
+            "thread-info" => &mut self.sync.thread_info,
+            _ => &mut self.sync.thread_history,
+        };
+        if pending.as_deref() != Some(extra) {
+            return Some((None, false));
+        }
+        *pending = None;
+        let chat = chat.expect("active chat");
+        match route {
+            "callback" if kind == "callbackQueryAnswer" => {
+                let text = value["text"].as_str().unwrap_or_default();
+                let text: String = text
+                    .chars()
+                    .map(|ch| if ch.is_control() { ' ' } else { ch })
+                    .take(160)
+                    .collect();
+                let url = value["url"].as_str().filter(|url| valid_callback_url(url));
+                let alert = value["show_alert"] == true;
+                let prefix = if alert { "Bot 提醒：" } else { "" };
+                self.notice = Some(match (text.trim(), url) {
+                    ("", None) => "Bot 已响应".into(),
+                    ("", Some(url)) => format!("{prefix}Bot 返回链接：{url}"),
+                    (text, None) => format!("{prefix}{text}"),
+                    (text, Some(url)) => format!("{prefix}{text} · 链接：{url}"),
+                });
+                self.notice_error = alert;
+            }
+            "callback" => self.sync_error(value, "Bot 按钮操作失败"),
+            "topics" if !self.show_topics => return Some((None, false)),
+            "topics" if kind == "forumTopics" => {
+                self.store.update_topics(chat, value);
+                self.topic_cursor = 0;
+            }
+            "topics" => self.sync_error(value, "无法读取话题列表"),
+            "thread-info" => {
+                let post = parts.next().and_then(|post| post.parse::<i64>().ok());
+                if !self.active_thread.as_ref().is_some_and(|thread| {
+                    thread.source_chat == chat
+                        && Some(thread.post_id) == post
+                        && thread.discussion_chat.is_none()
+                }) {
+                    return Some((None, false));
+                }
+                if kind == "messageThreadInfo"
+                    && let (Some(discussion), Some(root)) = (
+                        value["chat_id"].as_i64().filter(|id| *id != 0),
+                        value["message_thread_id"].as_i64().filter(|id| *id > 0),
+                    )
+                {
+                    self.sync.navigation = Some(Navigation::OpenDiscussion {
+                        chat: discussion,
+                        root,
+                    });
+                } else {
+                    self.active_thread = None;
+                    self.sync_error(value, "无法打开评论串");
+                }
+            }
+            "thread-history" => {
+                self.history_loading = false;
+                if kind == "messages"
+                    && let Some(messages) = value["messages"].as_array()
+                {
+                    self.store.merge_scoped_history(messages);
+                    self.timeline_heights.clear();
+                    if self
+                        .selected_message
+                        .is_none_or(|id| !self.store.messages.iter().any(|msg| msg.id == id))
+                    {
+                        self.selected_message =
+                            self.store.messages.last().map(|message| message.id);
+                    }
+                    self.notice = None;
+                    self.notice_error = false;
+                } else {
+                    self.sync_error(value, "无法加载话题或评论历史");
+                }
+            }
+            _ => unreachable!(),
+        }
+        Some((None, true))
+    }
+
     pub fn sync_open(&mut self, id: i64, requests: &mut Vec<Value>) {
         self.sync.history = None;
         self.sync.newer = None;
@@ -294,7 +678,10 @@ impl App {
         ) else {
             return false;
         };
-        let mut request = actions::history(chat, from);
+        let mut request = self.store.message_scope.map_or_else(
+            || actions::history(chat, from),
+            |scope| actions::scoped_history(chat, scope, from),
+        );
         request["offset"] = json!(-50);
         request["@extra"] = json!(format!("newer:{chat}"));
         let tag = tag(&mut request, self.next_sync_generation());
@@ -362,7 +749,14 @@ impl App {
             self.reveal_jump(target);
         } else {
             let mut request = actions::jump_to_message(chat, target);
+            if let Some(scope) = self.store.message_scope {
+                let extra = request["@extra"].clone();
+                request = actions::scoped_history(chat, scope, target);
+                request["offset"] = json!(-20);
+                request["@extra"] = extra;
+            }
             self.sync.history = None;
+            self.sync.thread_history = None;
             self.history_loading = false;
             self.sync.jump = Some(tag(&mut request, self.next_sync_generation()));
             send_request(self, worker, request);
@@ -389,7 +783,11 @@ impl App {
             self.store.history_exhausted = false;
             self.store.messages.clear();
             self.timeline_heights.clear();
-            let request = self.history_request(chat, 0);
+            let request = if self.store.message_scope.is_some() {
+                self.scoped_history_request(chat, 0)
+            } else {
+                self.history_request(chat, 0)
+            };
             send_request(self, worker, request);
         }
     }
@@ -449,6 +847,9 @@ impl App {
 
     pub fn receive_sync(&mut self, value: &Value) -> Option<Response> {
         let extra = value["@extra"].as_str().unwrap_or_default();
+        if let Some(response) = self.receive_chat_feature(value, extra) {
+            return Some(response);
+        }
         let mut fields = extra.split(':');
         let route = fields.next().unwrap_or_default();
         if route == "close-session" {
@@ -712,6 +1113,7 @@ impl App {
             self.store.typing_deadline(),
             self.sync.draft.deadline,
             self.global_search_deadline(),
+            self.proxy_deadline(),
             read.deadline
                 .filter(|_| include_viewport && read.pending.is_none()),
         ]
@@ -808,6 +1210,9 @@ impl App {
             }
             (ChatPeer::Supergroup(id), "supergroup") if value["id"].as_i64() == Some(id) => {
                 chat.username = chat_username(value);
+                if let Some(is_forum) = value["is_forum"].as_bool() {
+                    chat.is_forum = is_forum;
+                }
                 if let Some(count) = value["member_count"].as_i64().filter(|count| *count > 0) {
                     chat.subtitle = format!("{count} 位成员");
                 }
@@ -1085,6 +1490,7 @@ impl App {
         let generation = self.next_sync_generation();
         let (text, reply) = self.composer_draft();
         let mut request = actions::set_draft(chat, text, reply);
+        self.scope_outgoing_request(&mut request);
         tag(&mut request, generation);
         self.sync.draft.pending.retain(|(id, _)| *id != chat);
         if self.sync.draft.pending.len() == 16 {
@@ -1147,7 +1553,8 @@ impl App {
             });
             return;
         }
-        if self.composer_focus
+        if self.store.message_scope.is_some()
+            || self.composer_focus
             || self.sync.draft.deadline.is_some()
             || self.suspended_input.is_some()
             || !matches!(
@@ -1315,10 +1722,32 @@ impl App {
             || extra.starts_with("jump:")
             || extra.starts_with("unread:")
             || extra.starts_with("list-chat:")
+            || [
+                "mention:",
+                "callback:",
+                "topics:",
+                "thread-info:",
+                "thread-history:",
+                "newer:",
+            ]
+            .iter()
+            .any(|prefix| extra.starts_with(prefix))
         {
             self.receive_sync(&json!({"@type":"error", "@extra":extra}));
         }
     }
+}
+
+fn valid_callback_url(url: &str) -> bool {
+    url.len() <= 256
+        && !url.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+        && url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .and_then(|rest| rest.split(['/', '?', '#']).next())
+            .is_some_and(|host| {
+                !host.is_empty() && !host.contains('@') && !host.contains(char::from(92))
+            })
 }
 
 fn limited(value: Option<&str>, max: usize) -> String {
@@ -2480,5 +2909,248 @@ mod tests {
         app.parity.filter = crate::parity::MediaFilter::Photo;
         let search_req = app.submit_input().expect("photo filter allows empty query");
         assert_eq!(search_req["filter"]["@type"], "searchMessagesFilterPhoto");
+    }
+    #[test]
+    fn latest_mention_opens_the_returned_unlisted_chat_and_errors_stay_in_chat() {
+        let mut app = live_app();
+        let (worker, commands) = TdWorker::test_pair();
+        app.search_mention(&worker, "@first");
+        let first = request(&commands);
+        app.search_mention(&worker, "@second");
+        let second = request(&commands);
+        assert_eq!(second["username"], "second");
+        assert_eq!(
+            deliver(
+                &mut app,
+                &first,
+                json!({"@type":"chat","id":80,"title":"过期"})
+            ),
+            (None, false)
+        );
+        assert!(app.store.chat(80).is_none());
+        deliver(
+            &mut app,
+            &second,
+            json!({"@type":"chat","id":81,"title":"新会话"}),
+        );
+        assert!(app.service_navigation(&worker));
+        assert_eq!(app.store.active_chat, Some(81));
+        assert_eq!(app.store.chat_title(81), "新会话");
+        assert_eq!(request(&commands)["@type"], "closeChat");
+        assert_eq!(request(&commands)["chat_id"], 81);
+        app.search_mention(&worker, "@missing");
+        let missing = commands
+            .try_iter()
+            .filter_map(|command| match command {
+                TdCommand::Request(value) if value["@type"] == "searchPublicChat" => Some(value),
+                _ => None,
+            })
+            .next()
+            .unwrap();
+        let previous_auth = app.auth.message.clone();
+        deliver(
+            &mut app,
+            &missing,
+            json!({"@type":"error","message":"USERNAME_NOT_OCCUPIED"}),
+        );
+        assert!(app.notice.as_deref().unwrap().contains("找不到提及"));
+        assert_eq!(app.auth.message, previous_auth);
+    }
+
+    #[test]
+    fn callback_accepts_one_request_and_scopes_alert_and_url_to_chat() {
+        let mut app = live_app();
+        let (worker, commands) = TdWorker::test_pair();
+        assert!(app.request_callback(&worker, 2, "YWNr"));
+        let sent = request(&commands);
+        assert_eq!(sent["payload"]["data"], "YWNr");
+        assert!(!app.request_callback(&worker, 2, "YWNr"));
+        assert!(commands.try_recv().is_err());
+        deliver(
+            &mut app,
+            &sent,
+            json!({"@type":"callbackQueryAnswer","show_alert":true,
+            "text":"提".repeat(200),"url":"https://example.org/bot"}),
+        );
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.starts_with("Bot 提醒："));
+        assert_eq!(notice.chars().filter(|ch| *ch == '提').count(), 161);
+        assert!(notice.contains("https://example.org/bot") && app.notice_error);
+        assert!(!valid_callback_url("file:///tmp/example"));
+        assert!(!valid_callback_url("https://"));
+        app.request_callback(&worker, 2, "YWNr");
+        let old = request(&commands);
+        app.selected_chat = Some(2);
+        app.open_selected();
+        assert_eq!(
+            deliver(&mut app, &old, json!({"@type":"error","message":"stale"})),
+            (None, false)
+        );
+        assert!(app.request_callback(&worker, 1, "YWNr"));
+    }
+
+    #[test]
+    fn forum_topics_are_bounded_sorted_and_scope_history_live_messages_and_sends() {
+        let mut app = live_app();
+        app.store.chat_mut_by_id(1).unwrap().is_forum = true;
+        let (worker, commands) = TdWorker::test_pair();
+        app.show_topics = true;
+        app.request_forum_topics(&worker, 1);
+        let old = request(&commands);
+        app.request_forum_topics(&worker, 1);
+        let list = request(&commands);
+        assert!(!deliver(&mut app, &old, json!({"@type":"forumTopics","topics":[]})).1);
+        let topics: Vec<_> = (1..70)
+            .map(|id| {
+                json!({
+                    "info":{"forum_topic_id":id,"name":format!("话题 {id}")},"order":id.to_string(),
+                    "is_pinned":id == 11
+                })
+            })
+            .collect();
+        deliver(
+            &mut app,
+            &list,
+            json!({"@type":"forumTopics","topics":topics}),
+        );
+        let topics = &app.store.chat(1).unwrap().topics;
+        assert_eq!(topics.len(), 64);
+        assert_eq!((topics[0].thread_id, topics[1].thread_id), (11, 64));
+        interaction::perform_target(&mut app, &worker, ui::Target::TopicEntry(0));
+        let history = request(&commands);
+        assert_eq!(history["@type"], "getForumTopicHistory");
+        assert_eq!(history["forum_topic_id"], 11);
+        let forum_message = |msg, topic| {
+            let mut value = message(1, msg);
+            value["topic_id"] = json!({"@type":"messageTopicForum","forum_topic_id":topic});
+            value
+        };
+        deliver(
+            &mut app,
+            &history,
+            json!({"@type":"messages","messages":[forum_message(200,12),forum_message(100,11)]}),
+        );
+        assert_eq!(
+            app.store.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [100]
+        );
+        app.apply(TdEvent::Update(
+            json!({"@type":"updateNewMessage","message":forum_message(101,12)}),
+        ));
+        app.apply(TdEvent::Update(
+            json!({"@type":"updateNewMessage","message":forum_message(102,11)}),
+        ));
+        assert_eq!(
+            app.store.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [100, 102]
+        );
+        let older = app.load_older().unwrap();
+        assert_eq!(older["@type"], "getForumTopicHistory");
+        assert_eq!(older["from_message_id"], 100);
+        app.input_mode = InputMode::Send;
+        app.draft = "话题消息".into();
+        assert_eq!(
+            app.submit_input().unwrap()["topic_id"],
+            json!({"@type":"messageTopicForum","forum_topic_id":11})
+        );
+        app.reset_draft_snapshot();
+        app.exit_forum_topic(&worker);
+        assert_eq!(request(&commands)["@type"], "getChatHistory");
+        assert!(app.store.chat(1).unwrap().active_topic.is_none());
+        assert!(
+            !deliver(
+                &mut app,
+                &older,
+                json!({"@type":"messages","messages":[forum_message(90,11)]})
+            )
+            .1
+        );
+    }
+
+    #[test]
+    fn discussion_resolves_linked_group_filters_other_threads_and_returns_to_original_post() {
+        let mut app = live_app();
+        let (worker, commands) = TdWorker::test_pair();
+        assert!(app.open_discussion(&worker, 2));
+        let info = request(&commands);
+        assert_eq!(info["@type"], "getMessageThread");
+        assert_eq!(info["chat_id"], 1);
+        assert!(commands.try_recv().is_err());
+        app.input_mode = InputMode::Send;
+        app.draft = "频道草稿".into();
+        assert!(app.submit_input().is_none());
+        app.reset_draft_snapshot();
+        deliver(
+            &mut app,
+            &info,
+            json!({"@type":"messageThreadInfo","chat_id":88,"message_thread_id":900}),
+        );
+        assert!(app.service_navigation(&worker));
+        assert_eq!(request(&commands)["@type"], "closeChat");
+        let open = request(&commands);
+        assert_eq!(open["@type"], "openChat");
+        assert_eq!(open["chat_id"], 88);
+        let history = request(&commands);
+        assert_eq!(history["@type"], "getMessageThreadHistory");
+        assert_eq!(history["chat_id"], 88);
+        assert_eq!(history["message_id"], 900);
+        let comment = |msg, root| {
+            let mut value = message(88, msg);
+            value["topic_id"] = json!({"@type":"messageTopicThread","message_thread_id":root});
+            value
+        };
+        deliver(
+            &mut app,
+            &history,
+            json!({"@type":"messages","messages":[message(1,2),comment(902,777),comment(901,900),message(88,900)]}),
+        );
+        app.apply(TdEvent::Update(
+            json!({"@type":"updateNewMessage","message":comment(903,777)}),
+        ));
+        app.apply(TdEvent::Update(
+            json!({"@type":"updateNewMessage","message":comment(904,900)}),
+        ));
+        assert_eq!(
+            app.store.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [900, 901, 904]
+        );
+        let older = app.load_older().unwrap();
+        assert_eq!(older["from_message_id"], 900);
+        app.input_mode = InputMode::Reply(901);
+        app.draft = "评论".into();
+        let sent = app.submit_input().unwrap();
+        assert_eq!(sent["chat_id"], 88);
+        assert_eq!(
+            sent["topic_id"],
+            json!({"@type":"messageTopicThread","message_thread_id":900})
+        );
+        assert_eq!(sent["reply_to"]["message_id"], 901);
+        app.reset_draft_snapshot();
+        app.exit_discussion(&worker);
+        assert_eq!(app.store.active_chat, Some(1));
+        assert!(app.active_thread.is_none());
+        assert_eq!(app.draft, "频道草稿");
+        let jump = commands
+            .try_iter()
+            .find_map(|command| match command {
+                TdCommand::Request(value) if value["@type"] == "getChatHistory" => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(jump["from_message_id"], 2);
+        assert!(
+            !deliver(
+                &mut app,
+                &older,
+                json!({"@type":"messages","messages":[comment(899,900)]})
+            )
+            .1
+        );
+        deliver(
+            &mut app,
+            &jump,
+            json!({"@type":"messages","messages":[message(1,2)]}),
+        );
+        assert_eq!(app.selected_message, Some(2));
     }
 }

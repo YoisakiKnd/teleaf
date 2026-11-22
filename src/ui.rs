@@ -28,6 +28,7 @@ pub(crate) enum Pane {
 pub(crate) enum Editor {
     Composer,
     Auth(usize),
+    Proxy(usize),
     AttachmentPath,
     AttachmentCaption,
     StickerSearch,
@@ -88,6 +89,23 @@ pub(crate) enum Action {
     CleanStorage,
     ConfirmStorage,
     CancelStorage,
+    ProxySettings,
+    ProxyAdd,
+    ProxyImportEnv,
+    ProxyToggle,
+    ProxyPing,
+    ProxyDelete,
+    ProxyDisableAll,
+    ProxySubmit,
+    ProxyCancelForm,
+    ProxyKindPrev,
+    ProxyKindNext,
+    SaveFileAs,
+    PreviewPrev,
+    PreviewNext,
+    Topics,
+    ExitTopic,
+    ExitThread,
     NextField,
     NewLogin,
     Folders,
@@ -116,6 +134,12 @@ pub(crate) enum Target {
     Reaction(i64, usize),
     QuickSwitchChat(i64),
     GlobalSearchHit(i64, i64),
+    ProxyEntry(usize),
+    ProxyField(usize),
+    LinkEntry(usize),
+    TopicEntry(usize),
+    InlineButton(i64, usize, usize),
+    CommentThread(i64),
     Text(Point),
     Image(Rect),
     Composer,
@@ -159,6 +183,8 @@ pub fn action_for_key(key: char) -> Option<Action> {
         'I' => Action::ChatInfo,
         'V' => Action::ToggleMultiSelect,
         'L' => Action::OpenMessageLink,
+        'E' => Action::SaveFileAs,
+        'T' => Action::Topics,
         _ => return None,
     })
 }
@@ -840,6 +866,7 @@ fn editor(
             | Editor::AttachmentCaption
             | Editor::StickerSearch
             | Editor::QuickSwitch
+            | Editor::Proxy(_)
     );
     let focused = match kind {
         Editor::AttachmentPath => app
@@ -852,6 +879,14 @@ fn editor(
             .is_some_and(|p| p.focus == crate::attachments::Focus::Caption),
         Editor::StickerSearch => app.sticker_panel.search_focus,
         Editor::QuickSwitch => app.quick_switcher.is_some(),
+        Editor::Proxy(index) => {
+            app.proxy.open
+                && app
+                    .proxy
+                    .form
+                    .as_ref()
+                    .is_some_and(|form| form.field == index)
+        }
         Editor::Composer => app.composer_focus && app.input_mode != InputMode::Off,
         Editor::Auth(index) => app
             .auth
@@ -945,6 +980,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Style::default().fg(palette().muted),
         ),
     ];
+    if app.proxy.active_summary().is_some() && area.width >= 60 {
+        header_spans.push(Span::styled(
+            " · [代理]",
+            Style::default()
+                .fg(palette().accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if !app.mouse_enabled {
         header_spans.push(Span::styled(
             if area.width < 60 {
@@ -1003,10 +1046,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         chat_page(frame, app, layout[1]);
     }
-    let hint = if app.quick_switcher.is_some() {
+    let hint = if app.proxy.open {
+        if app.proxy.form.is_some() {
+            "Tab 切换字段 · ←→ 选协议 · Enter 保存并启用 · Esc 取消"
+        } else {
+            "↑↓ 选择 · Enter 启用/停用 · a 新增 · e 导入环境代理 · t 测速 · d 删除 · Esc 关"
+        }
+    } else if app.link_picker.is_some() {
+        "↑↓/jk 选择链接或 @提及 · Enter 打开 · Esc 关闭"
+    } else if app.show_topics {
+        "↑↓/jk 选择话题 · Enter 进入话题 · Esc 关闭"
+    } else if app.quick_switcher.is_some() {
         "输入关键词筛选 · ↑↓ 选择 · Enter 打开会话 · Esc 关闭"
     } else if app.show_settings {
-        "Tab 选择 · Enter 操作 · t 配色 · ↑↓/jk 滚动 · F6 鼠标 · Esc 返回"
+        "Tab 选择 · Enter 操作 · p 代理 · t 配色 · c 缓存 · F6 鼠标 · Esc 返回"
     } else if app.show_help {
         "↑↓/jk 滚动 · PgUp/PgDn 翻页 · Esc 返回"
     } else if app.show_folders {
@@ -1014,13 +1067,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.show_chat_info && app.chat_info_modal {
         "↑↓ 滚动 · 点击操作 · Esc 返回"
     } else if app.auth.is_new_login() {
-        "Enter 确认重新登录 · Esc 返回 · Ctrl+C 退出"
+        "Enter 确认重新登录 · F9 代理 · Esc 返回 · Ctrl+C 退出"
     } else if app.auth.is_recovering() {
-        "填入旧本地密钥 · Enter 恢复 · F5 重新登录 · Esc 修改 API"
+        "填入旧本地密钥 · Enter 恢复 · F5 重新登录 · F9 代理 · Esc 修改 API"
     } else if app.auth.setup.is_some() {
-        "Tab 切换字段 · Enter 保存 · F2 官网 · F1 注册帮助 · Ctrl+C 退出"
+        "Tab 切换字段 · Enter 保存 · F9 代理 · F2 官网 · F1 帮助 · Ctrl+C 退出"
     } else if app.auth.state != "authorizationStateReady" {
-        "Enter 继续 · F3 修改 API · F4 设置 · Ctrl+C 退出"
+        "Enter 继续 · F9 代理 · F3 修改 API · F4 设置 · Ctrl+C 退出"
     } else if app.attachments.is_some() {
         "Space 选择 · Tab 切换 · F8 / Ctrl+Enter 发送 · Esc 返回"
     } else if app.sticker_picker {
@@ -1110,7 +1163,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         layout[2],
     );
 
-    if app.show_help
+    if app.proxy.open
+        || app.link_picker.is_some()
+        || app.show_topics
+        || app.show_help
         || app.show_settings
         || app.show_folders
         || app.quick_switcher.is_some()
@@ -1157,23 +1213,51 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .is_some_and(|m| matches!(m.kind, MediaKind::Photo | MediaKind::Sticker));
         media_view(frame, app, rows[0], media);
         if zoomable {
-            let tools = Layout::horizontal([
-                Constraint::Percentage(20),
-                Constraint::Percentage(20),
-                Constraint::Percentage(30),
-                Constraint::Percentage(30),
-            ])
-            .split(rows[1]);
-            for (rect, label, action) in [
-                (tools[0], "[−]", Action::ZoomOut),
-                (tools[1], "[+]", Action::ZoomIn),
-                (tools[2], "[复位]", Action::ZoomReset),
-                (tools[3], "[打开]", Action::OpenExternal),
-            ] {
-                button(frame, app, rect, label, action);
+            if rows[1].width >= 48 {
+                let tools = Layout::horizontal([
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Min(8),
+                    Constraint::Min(10),
+                    Constraint::Min(8),
+                    Constraint::Length(5),
+                ])
+                .split(rows[1]);
+                for (rect, label, action) in [
+                    (tools[0], "[‹]", Action::PreviewPrev),
+                    (tools[1], "[−]", Action::ZoomOut),
+                    (tools[2], "[+]", Action::ZoomIn),
+                    (tools[3], "[复位]", Action::ZoomReset),
+                    (tools[4], "[另存为]", Action::SaveFileAs),
+                    (tools[5], "[打开]", Action::OpenExternal),
+                    (tools[6], "[›]", Action::PreviewNext),
+                ] {
+                    button(frame, app, rect, label, action);
+                }
+            } else {
+                let tools = Layout::horizontal([
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(30),
+                    Constraint::Percentage(30),
+                ])
+                .split(rows[1]);
+                for (rect, label, action) in [
+                    (tools[0], "[−]", Action::ZoomOut),
+                    (tools[1], "[+]", Action::ZoomIn),
+                    (tools[2], "[另存为]", Action::SaveFileAs),
+                    (tools[3], "[打开]", Action::OpenExternal),
+                ] {
+                    button(frame, app, rect, label, action);
+                }
             }
         } else {
-            button(frame, app, rows[1], "[系统打开]", Action::OpenExternal);
+            let tools =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(rows[1]);
+            button(frame, app, tools[0], "[另存为 · E]", Action::SaveFileAs);
+            button(frame, app, tools[1], "[系统打开 · o]", Action::OpenExternal);
         }
     }
     if app.show_folders {
@@ -1329,6 +1413,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(row);
         button(frame, app, cols[0], "[删除]", Action::Confirm);
         button(frame, app, cols[1], "[取消]", Action::Cancel);
+    }
+    if app.show_topics {
+        topics_dialog(frame, app, layout[1]);
+    }
+    if app.link_picker.is_some() {
+        link_picker_dialog(frame, app, layout[1]);
+    }
+    if app.proxy.open {
+        proxy_dialog(frame, app, area);
     }
     app.media.end_frame();
 }
@@ -1600,12 +1693,12 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
             .active_chat
             .map(|id| app.store.chat_title(id))
             .unwrap_or_else(|| "消息".into());
-        let subtitle = app
-            .store
-            .active_chat
-            .and_then(|id| app.store.chat(id))
-            .map(|c| c.subtitle.as_str())
-            .unwrap_or("");
+        let active_chat_ref = app.store.active_chat.and_then(|id| app.store.chat(id));
+        let is_forum = active_chat_ref.is_some_and(|c| c.is_forum);
+        let active_topic_name = active_chat_ref
+            .and_then(|c| c.active_topic.as_ref())
+            .map(|(_, name)| name.clone());
+        let subtitle = active_chat_ref.map(|c| c.subtitle.as_str()).unwrap_or("");
         let title = if app.show_search {
             format!(
                 "搜索 · {}「{}」· {} 条",
@@ -1613,6 +1706,10 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
                 app.search_query,
                 app.store.search_results.len()
             )
+        } else if let Some(thread) = &app.active_thread {
+            format!("评论串 · {}", thread.title)
+        } else if let Some(topic) = &active_topic_name {
+            format!("{base_title} · #{topic}")
         } else if app.history_loading && rows[0].width >= 32 {
             format!("{base_title} · 加载中…")
         } else if !subtitle.is_empty() && rows[0].width >= 52 {
@@ -1620,9 +1717,13 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             base_title
         };
+        let show_topic_btn = rows[0].width >= 44 && is_forum && app.active_thread.is_none();
         let show_info_btn = rows[0].width >= 38 && app.store.active_chat.is_some();
         let show_search_btn = rows[0].width >= 26;
-        let control_width = 6 + u16::from(show_search_btn) * 6 + u16::from(show_info_btn) * 6;
+        let control_width = 6
+            + u16::from(show_search_btn) * 6
+            + u16::from(show_info_btn) * 6
+            + u16::from(show_topic_btn) * 6;
         let focused_timeline = app.focus_messages && app.input_mode == InputMode::Off;
         let block = panel(
             crate::text::ellipsize(
@@ -1642,32 +1743,43 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
 
         let controls = Layout::horizontal([
             Constraint::Min(0),
+            Constraint::Length(if show_topic_btn { 6 } else { 0 }),
             Constraint::Length(if show_search_btn { 6 } else { 0 }),
             Constraint::Length(if show_info_btn { 6 } else { 0 }),
             Constraint::Length(6),
         ])
         .split(Rect::new(inner.x, rows[0].y, inner.width, 1));
-        if show_search_btn {
+        if show_topic_btn {
             button(
                 frame,
                 app,
                 controls[1],
-                if app.show_search {
-                    "[返回]"
+                if active_topic_name.is_some() {
+                    "[全部]"
                 } else {
-                    "[搜索]"
+                    "[话题]"
                 },
-                if app.show_search {
-                    Action::ClearSearch
+                if active_topic_name.is_some() {
+                    Action::ExitTopic
                 } else {
-                    Action::Search
+                    Action::Topics
                 },
             );
         }
-        if show_info_btn {
-            button(frame, app, controls[2], "[详情]", Action::ChatInfo);
+        if show_search_btn {
+            let (label, action) = if app.show_search {
+                ("[返回]", Action::ClearSearch)
+            } else if app.active_thread.is_some() {
+                ("[返回]", Action::ExitThread)
+            } else {
+                ("[搜索]", Action::Search)
+            };
+            button(frame, app, controls[2], label, action);
         }
-        button(frame, app, controls[3], "[更多]", Action::ChatMenu);
+        if show_info_btn {
+            button(frame, app, controls[3], "[详情]", Action::ChatInfo);
+        }
+        button(frame, app, controls[4], "[更多]", Action::ChatMenu);
         if app.store.active_chat.is_none() {
             empty(frame, inner, "选择一个会话", "在左侧选择后按 Enter 打开");
         } else {
@@ -2039,7 +2151,10 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         &app.store.messages
     };
-    let unread_divider_id = if !app.show_search && unread_count > 0 && (read_inbox > 0 || !app.demo)
+    let unread_divider_id = if app.store.message_scope.is_none()
+        && !app.show_search
+        && unread_count > 0
+        && (read_inbox > 0 || !app.demo)
     {
         source
             .iter()
@@ -2050,6 +2165,28 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     app.timeline_rows.clear();
     let mut date_headers = std::collections::HashSet::new();
+    let mut album_positions: std::collections::HashMap<i64, (usize, usize)> =
+        std::collections::HashMap::new();
+    {
+        let mut idx = 0;
+        while idx < source.len() {
+            let album_id = source[idx].info.media_album_id;
+            if album_id != 0 {
+                let start = idx;
+                while idx < source.len() && source[idx].info.media_album_id == album_id {
+                    idx += 1;
+                }
+                let count = idx - start;
+                if count > 1 {
+                    for (offset, msg) in source[start..idx].iter().enumerate() {
+                        album_positions.insert(msg.id, (offset + 1, count));
+                    }
+                }
+            } else {
+                idx += 1;
+            }
+        }
+    }
     let mut previous_date: Option<crate::calendar::Stamp> = None;
     for message in source {
         if let Some(stamp) = message.info.stamp {
@@ -2065,6 +2202,13 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     MediaKind::Document | MediaKind::Video | MediaKind::Voice
                 )
             });
+        let link_preview_rows = message
+            .info
+            .link_preview
+            .as_ref()
+            .map_or(0, |lp| 1 + usize::from(!lp.description.is_empty()));
+        let inline_kb_rows = message.info.inline_keyboard.len();
+        let comment_rows = usize::from(message.info.can_get_thread && app.active_thread.is_none());
         let has_reactions = !message.info.reactions.is_empty();
         let height = *app.timeline_heights.entry(message.id).or_insert_with(|| {
             let body = message_body(message);
@@ -2083,6 +2227,9 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     0
                 }
         }) + usize::from(has_media_card)
+            + link_preview_rows
+            + inline_kb_rows
+            + comment_rows
             + usize::from(has_reactions);
         let extra_dividers = usize::from(date_headers.contains(&message.id))
             + usize::from(unread_divider_id == Some(message.id));
@@ -2237,12 +2384,16 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         }),
                 ));
             }
+            let album_tag = album_positions
+                .get(&message.id)
+                .map(|(i, n)| format!(" [相册 {i}/{n}]"))
+                .unwrap_or_default();
             header_spans.push(Span::styled(
                 format!(
                     "{}{}",
                     if is_selected { "› " } else { "  " },
                     crate::text::ellipsize(
-                        &format!("{label}{tag}"),
+                        &format!("{label}{tag}{album_tag}"),
                         usize::from(width.saturating_sub(controls_width))
                             .saturating_sub(status_width + check_width)
                     )
@@ -2447,6 +2598,104 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         .fg(palette().incoming)
                         .bg(palette().surface),
                 ));
+                extra_rows += 1;
+            }
+            if let Some(lp) = &message.info.link_preview {
+                let head = match (lp.site_name.is_empty(), lp.title.is_empty()) {
+                    (false, false) => format!("{} · {}", lp.site_name, lp.title),
+                    (false, true) => lp.site_name.clone(),
+                    (true, false) => lp.title.clone(),
+                    (true, true) => lp.url.clone(),
+                };
+                let lp_width = usize::from(width).saturating_sub(4);
+                lines.push(Line::from(vec![
+                    Span::styled("  ┃ ", Style::default().fg(palette().accent)),
+                    Span::styled(
+                        crate::text::ellipsize(&head.replace(['\r', '\n'], " "), lp_width),
+                        Style::default()
+                            .fg(palette().text)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                extra_rows += 1;
+                if !lp.description.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  ┃ ", Style::default().fg(palette().accent)),
+                        Span::styled(
+                            crate::text::ellipsize(
+                                &lp.description.replace(['\r', '\n'], " "),
+                                lp_width,
+                            ),
+                            if is_selected {
+                                palette().muted_on_selection()
+                            } else {
+                                Style::default().fg(palette().muted)
+                            },
+                        ),
+                    ]));
+                    extra_rows += 1;
+                }
+            }
+            if !message.info.inline_keyboard.is_empty() {
+                for (r_idx, btn_row) in message.info.inline_keyboard.iter().enumerate() {
+                    let kb_row = before + prefix + body_rows.len() + extra_rows;
+                    let mut spans = vec![Span::raw("  ")];
+                    let mut bx = area.x + 2;
+                    let max_x = area.x + 2 + width;
+                    for (c_idx, btn) in btn_row.iter().enumerate() {
+                        let suffix = match btn.kind {
+                            crate::store::InlineButtonKind::Url(_) => " ↗",
+                            _ => "",
+                        };
+                        let label =
+                            format!(" [{}{suffix}] ", crate::text::ellipsize(&btn.text, 20));
+                        let bw = UnicodeWidthStr::width(label.as_str()) as u16;
+                        if bx + bw > max_x {
+                            break;
+                        }
+                        spans.push(Span::styled(
+                            label,
+                            Style::default()
+                                .fg(palette().accent)
+                                .bg(palette().surface)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        if kb_row >= top && kb_row < top + usize::from(area.height) {
+                            text_targets.push((
+                                Rect::new(bx, area.y + (kb_row - top) as u16, bw, 1),
+                                Target::InlineButton(message.id, r_idx, c_idx),
+                            ));
+                        }
+                        bx = bx.saturating_add(bw + 1);
+                        spans.push(Span::raw(" "));
+                    }
+                    lines.push(Line::from(spans));
+                    extra_rows += 1;
+                }
+            }
+            if message.info.can_get_thread && app.active_thread.is_none() {
+                let c_row = before + prefix + body_rows.len() + extra_rows;
+                let pill = if message.info.reply_count > 0 {
+                    format!(" 💬 {} 条评论 › ", message.info.reply_count)
+                } else {
+                    " 💬 评论 › ".to_owned()
+                };
+                let cw = UnicodeWidthStr::width(pill.as_str()) as u16;
+                if c_row >= top && c_row < top + usize::from(area.height) {
+                    text_targets.push((
+                        Rect::new(area.x + 2, area.y + (c_row - top) as u16, cw.min(width), 1),
+                        Target::CommentThread(message.id),
+                    ));
+                }
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        pill,
+                        Style::default()
+                            .fg(palette().incoming)
+                            .bg(palette().surface),
+                    ),
+                ]));
                 extra_rows += 1;
             }
             if !message.info.reactions.is_empty() {
@@ -4099,12 +4348,13 @@ fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::styled("聊天与附件", Style::default().fg(palette().accent)),
         Line::from("i 写消息    Enter 消息操作/媒体预览    Space 更多操作"),
         Line::from("r 回复    e 编辑    f 转发    x 回应（1-8 快捷）    d 删除"),
-        Line::from("V 多选批量操作    L 打开消息链接    S 收藏    D 复读"),
-        Line::from("p 图片 / a 文件 / Ctrl+O 附件 · t 贴纸 · / 搜索"),
+        Line::from("V 多选批量操作    L 链接与 @提及    S 收藏    D 复读"),
+        Line::from("p 图片 / a 文件 / Ctrl+O 附件 · t 贴纸 · / 搜索（Ctrl+F 筛选）"),
         Line::from("F7 / Ctrl+V 读取剪贴板图片、文件或文字；F8 确认发送"),
         Line::from("附件：点击多选 / 拖入路径 · Tab 说明 · F8 / Ctrl+Enter 发送"),
         Line::from("贴纸：缩略图网格 · [ ] 切换包 · / 搜索 · 点击发送"),
-        Line::from("v 预览媒体    o 用系统程序打开"),
+        Line::from("v 预览媒体（[ ] 切换相册）  E 另存为  o 系统打开  T 话题列表"),
+        Line::from("F9 代理设置（登录页可用，支持 SOCKS5 / HTTP / MTProto / 环境变量）"),
         Line::from(""),
         Line::styled("输入与导航", Style::default().fg(palette().accent)),
         Line::from("↑ ↓ 多行移光标    Alt+Enter 换行    Ctrl+W / Alt+BS 删词"),
@@ -4183,9 +4433,20 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     }
     let (api_id, directory) = app.auth.config_summary();
+    let proxy_line = match app.proxy.active_summary() {
+        Some(summary) => format!("网络代理   已启用 {summary} · 按 p 或 F9 管理"),
+        None => match crate::proxy::detect_env_proxy() {
+            Some((var, parsed)) => format!(
+                "网络代理   未启用（检测到 {var} {}:{} · 按 p 或 F9 一键导入）",
+                parsed.server, parsed.port
+            ),
+            None => "网络代理   直连 · 按 p 或 F9 配置 SOCKS5 / HTTP / MTProto".into(),
+        },
+    };
     let lines = vec![
         Line::styled("账号连接", Style::default().fg(palette().accent)),
         Line::from(format!("API ID   {api_id}")),
+        Line::from(proxy_line),
         muted("API Hash 已隐藏 · F3 修改 API 配置并重新连接"),
         muted("F2 打开 Telegram API 页面"),
         Line::from(""),
@@ -4203,41 +4464,502 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(app.status.clone()),
         muted(app.tdlib_path.as_deref().unwrap_or("TDLib 尚未加载")),
     ];
-    let body = if app.auth.state == "authorizationStateReady" && rows[0].height >= 2 {
+    let body = if rows[0].height >= 2 {
         let footer = Rect::new(rows[0].x, rows[0].bottom() - 1, rows[0].width, 1);
-        let columns = Layout::horizontal([
-            Constraint::Min(1),
-            Constraint::Length(13),
-            Constraint::Length(10),
-        ])
-        .split(footer);
-        if app.parity.storage_confirmation {
-            frame.render_widget(
-                Paragraph::new("清理本机缓存？").style(Style::default().fg(palette().accent)),
-                columns[0],
-            );
-            button(frame, app, columns[1], "[确认清理]", Action::ConfirmStorage);
-            button(frame, app, columns[2], "[取消]", Action::CancelStorage);
+        if app.auth.state == "authorizationStateReady" {
+            if app.parity.storage_confirmation {
+                let columns = Layout::horizontal([
+                    Constraint::Min(1),
+                    Constraint::Length(13),
+                    Constraint::Length(10),
+                ])
+                .split(footer);
+                frame.render_widget(
+                    Paragraph::new("清理本机缓存？").style(Style::default().fg(palette().accent)),
+                    columns[0],
+                );
+                button(frame, app, columns[1], "[确认清理]", Action::ConfirmStorage);
+                button(frame, app, columns[2], "[取消]", Action::CancelStorage);
+            } else {
+                let columns = Layout::horizontal([
+                    Constraint::Min(1),
+                    Constraint::Length(16),
+                    Constraint::Length(16),
+                ])
+                .split(footer);
+                let size = app.parity.storage_size.map_or("—".into(), format_bytes);
+                frame.render_widget(
+                    Paragraph::new(format!("TDLib 缓存 {size}"))
+                        .style(Style::default().fg(palette().muted)),
+                    columns[0],
+                );
+                button(
+                    frame,
+                    app,
+                    columns[1],
+                    "[代理设置 · p]",
+                    Action::ProxySettings,
+                );
+                button(
+                    frame,
+                    app,
+                    columns[2],
+                    "[清理缓存 · c]",
+                    Action::CleanStorage,
+                );
+            }
         } else {
-            let size = app.parity.storage_size.map_or("—".into(), format_bytes);
+            let columns =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(18)]).split(footer);
+            let proxy_status = app
+                .proxy
+                .active_summary()
+                .map_or_else(|| "网络：直连".into(), |s| format!("代理：{s}"));
             frame.render_widget(
-                Paragraph::new(format!("TDLib 缓存 {size}"))
-                    .style(Style::default().fg(palette().muted)),
+                Paragraph::new(crate::text::ellipsize(
+                    &proxy_status,
+                    usize::from(columns[0].width),
+                ))
+                .style(Style::default().fg(palette().muted)),
                 columns[0],
             );
-            let clean = Rect::new(
-                columns[1].x,
-                footer.y,
-                columns[1].width + columns[2].width,
-                1,
+            button(
+                frame,
+                app,
+                columns[1],
+                "[代理设置 · p/F9]",
+                Action::ProxySettings,
             );
-            button(frame, app, clean, "[清理缓存 · c]", Action::CleanStorage);
         }
         Rect::new(rows[0].x, rows[0].y, rows[0].width, rows[0].height - 1)
     } else {
         rows[0]
     };
     scrolling_text(frame, app, lines, body);
+}
+
+fn proxy_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
+    let title = if app.proxy.form.is_some() {
+        "新增代理 · SOCKS5 / HTTP / MTProto"
+    } else {
+        "代理设置（F9）"
+    };
+    let inner = modal(frame, app, centered(area, 72, 20), title);
+    if let Some(form) = app.proxy.form.clone() {
+        let rows = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(if form.kind == crate::proxy::ProxyKind::Mtproto {
+                0
+            } else {
+                3
+            }),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+        let kind_cols = Layout::horizontal([
+            Constraint::Length(10),
+            Constraint::Length(6),
+            Constraint::Min(10),
+            Constraint::Length(6),
+        ])
+        .split(Rect::new(rows[0].x, rows[0].y, rows[0].width, 1));
+        frame.render_widget(
+            Paragraph::new("协议类型").style(Style::default().fg(if form.field == 0 {
+                palette().accent
+            } else {
+                palette().muted
+            })),
+            kind_cols[0],
+        );
+        button(frame, app, kind_cols[1], "[‹]", Action::ProxyKindPrev);
+        frame.render_widget(
+            Paragraph::new(format!(" {} ", form.kind.label()))
+                .alignment(Alignment::Center)
+                .style(if form.field == 0 {
+                    palette().selection().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(palette().text)
+                        .add_modifier(Modifier::BOLD)
+                }),
+            kind_cols[2],
+        );
+        app.hit_targets.push((kind_cols[2], Target::ProxyField(0)));
+        button(frame, app, kind_cols[3], "[›]", Action::ProxyKindNext);
+        if rows[0].height >= 2 {
+            frame.render_widget(
+                Paragraph::new(
+                    "支持粘贴完整代理链接（socks5:// / http:// / tg://proxy?...）自动填充",
+                )
+                .style(Style::default().fg(palette().muted)),
+                Rect::new(rows[0].x, rows[0].y + 1, rows[0].width, 1),
+            );
+        }
+        let draw_field = |frame: &mut Frame,
+                          app: &mut App,
+                          rect: Rect,
+                          idx: usize,
+                          label: &str,
+                          value: &str,
+                          cursor: usize,
+                          masked: bool| {
+            let focused = form.field == idx;
+            let block = panel(label, focused);
+            let field_inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            app.hit_targets.push((rect, Target::ProxyField(idx)));
+            if focused {
+                editor(
+                    frame,
+                    app,
+                    field_inner,
+                    Editor::Proxy(idx),
+                    value,
+                    cursor,
+                    masked,
+                );
+            } else {
+                let shown = if masked {
+                    "•".repeat(value.chars().count())
+                } else {
+                    value.to_owned()
+                };
+                frame.render_widget(
+                    Paragraph::new(crate::text::ellipsize(
+                        &shown,
+                        usize::from(field_inner.width),
+                    )),
+                    field_inner,
+                );
+            }
+        };
+        draw_field(
+            frame,
+            app,
+            rows[1],
+            1,
+            "服务器地址（例如 127.0.0.1）",
+            &form.server,
+            form.server_cursor,
+            false,
+        );
+        draw_field(
+            frame,
+            app,
+            rows[2],
+            2,
+            "端口（例如 7890 / 1080 / 10808）",
+            &form.port,
+            form.port_cursor,
+            false,
+        );
+        let user_label = if form.kind == crate::proxy::ProxyKind::Mtproto {
+            "MTProto Secret（必填）"
+        } else {
+            "用户名（可选，无认证留空）"
+        };
+        draw_field(
+            frame,
+            app,
+            rows[3],
+            3,
+            user_label,
+            &form.user_or_secret,
+            form.user_cursor,
+            form.kind == crate::proxy::ProxyKind::Mtproto,
+        );
+        if form.kind != crate::proxy::ProxyKind::Mtproto && rows[4].height >= 3 {
+            draw_field(
+                frame,
+                app,
+                rows[4],
+                4,
+                "密码（可选，已遮罩）",
+                &form.password,
+                form.password_cursor,
+                true,
+            );
+        }
+        if let Some(error) = form.error.as_deref().or(app.proxy.status.as_deref()) {
+            let is_err = form.error.is_some() || app.proxy.status_error;
+            frame.render_widget(
+                Paragraph::new(crate::text::ellipsize(error, usize::from(rows[5].width))).style(
+                    Style::default().fg(if is_err {
+                        palette().error
+                    } else {
+                        palette().accent
+                    }),
+                ),
+                rows[5],
+            );
+        }
+        let btns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[6]);
+        button(
+            frame,
+            app,
+            btns[0],
+            "[保存并启用 · Enter]",
+            Action::ProxySubmit,
+        );
+        button(frame, app, btns[1], "[取消 · Esc]", Action::ProxyCancelForm);
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    let env_hint = match crate::proxy::detect_env_proxy() {
+        Some((name, parsed)) => format!(
+            "检测到环境变量 {name} ({} {}:{})，按 e 一键导入；启动时设 TG_PROXY 可自动启用。",
+            parsed.kind.label(),
+            parsed.server,
+            parsed.port
+        ),
+        None => "支持 SOCKS5 / HTTP / MTProto 代理；也可用 TG_PROXY=socks5://127.0.0.1:7890 启动。"
+            .into(),
+    };
+    frame.render_widget(
+        Paragraph::new(env_hint)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(palette().muted)),
+        rows[0],
+    );
+    if app.proxy.entries.is_empty() {
+        let msg = if app.proxy.loading {
+            "正在读取 TDLib 代理配置…"
+        } else {
+            "尚未配置代理 · 按 a 手动新增，或按 e 导入环境变量代理"
+        };
+        empty(frame, rows[1], "当前使用直连", msg);
+    } else {
+        let visible = usize::from(rows[1].height).max(1);
+        let selected = app
+            .proxy
+            .selected
+            .min(app.proxy.entries.len().saturating_sub(1));
+        let start = selected.saturating_sub(visible.saturating_sub(1));
+        for (row, (idx, entry)) in app
+            .proxy
+            .entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+        {
+            let is_sel = idx == selected;
+            let rect = Rect::new(rows[1].x, rows[1].y + row as u16, rows[1].width, 1);
+            let dot = if entry.enabled { "●" } else { "○" };
+            let ping = if entry.pinging {
+                "测速中…".into()
+            } else if let Some(ms) = entry.ping_ms {
+                format!("{ms} ms")
+            } else if let Some(err) = &entry.ping_error {
+                err.clone()
+            } else {
+                "未测速".into()
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    if is_sel { "› " } else { "  " },
+                    Style::default().fg(if is_sel {
+                        palette().accent
+                    } else {
+                        palette().muted
+                    }),
+                ),
+                Span::styled(
+                    format!("{dot} "),
+                    Style::default().fg(if entry.enabled {
+                        palette().accent
+                    } else {
+                        palette().muted
+                    }),
+                ),
+                Span::styled(
+                    format!("{} {}:{}", entry.kind.label(), entry.server, entry.port),
+                    Style::default().add_modifier(if entry.enabled || is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::styled(
+                    format!("  ·  {ping}"),
+                    Style::default().fg(if is_sel {
+                        palette().text
+                    } else {
+                        palette().muted
+                    }),
+                ),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line).style(if is_sel {
+                    palette().selection()
+                } else {
+                    palette().surface_base()
+                }),
+                rect,
+            );
+            app.hit_targets.push((rect, Target::ProxyEntry(idx)));
+        }
+    }
+    if let Some(status) = &app.proxy.status {
+        frame.render_widget(
+            Paragraph::new(crate::text::ellipsize(status, usize::from(rows[2].width))).style(
+                Style::default().fg(if app.proxy.status_error {
+                    palette().error
+                } else {
+                    palette().accent
+                }),
+            ),
+            rows[2],
+        );
+    }
+    let btns = Layout::horizontal([
+        Constraint::Percentage(18),
+        Constraint::Percentage(22),
+        Constraint::Percentage(18),
+        Constraint::Percentage(14),
+        Constraint::Percentage(14),
+        Constraint::Percentage(14),
+    ])
+    .split(rows[3]);
+    button(frame, app, btns[0], "[新增·a]", Action::ProxyAdd);
+    button(frame, app, btns[1], "[导环境·e]", Action::ProxyImportEnv);
+    button(frame, app, btns[2], "[启停·⏎]", Action::ProxyToggle);
+    button(frame, app, btns[3], "[测速·t]", Action::ProxyPing);
+    button(frame, app, btns[4], "[删·d]", Action::ProxyDelete);
+    button(frame, app, btns[5], "[直连·0]", Action::ProxyDisableAll);
+}
+
+fn link_picker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(picker) = &app.link_picker else {
+        return;
+    };
+    let items = picker.items.clone();
+    let selected = picker.selected.min(items.len().saturating_sub(1));
+    let inner = modal(frame, app, centered(area, 64, 16), "消息中的链接与 @提及");
+    let visible = usize::from(inner.height).max(1);
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    for (row, (idx, item)) in items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+    {
+        let is_sel = idx == selected;
+        let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        let label = match item {
+            crate::store::LinkItem::Url(url) => format!("🔗 {url}"),
+            crate::store::LinkItem::Mention(handle) => format!("@ {handle} · 打开会话"),
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                if is_sel { "› " } else { "  " },
+                Style::default().fg(if is_sel {
+                    palette().accent
+                } else {
+                    palette().muted
+                }),
+            ),
+            Span::raw(crate::text::ellipsize(
+                &label,
+                usize::from(inner.width.saturating_sub(2)),
+            )),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(if is_sel {
+                palette().selection()
+            } else {
+                palette().surface_base()
+            }),
+            rect,
+        );
+        app.hit_targets.push((rect, Target::LinkEntry(idx)));
+    }
+}
+
+fn topics_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
+    let topics = app
+        .store
+        .active_chat
+        .and_then(|id| app.store.chat(id))
+        .map(|chat| chat.topics.clone())
+        .unwrap_or_default();
+    let inner = modal(
+        frame,
+        app,
+        centered(area, 56, 18),
+        "群组话题（Forum Topics）",
+    );
+    if topics.is_empty() {
+        empty(
+            frame,
+            inner,
+            "正在加载话题列表…",
+            "若该群暂无话题，按 Esc 返回",
+        );
+        return;
+    }
+    let visible = usize::from(inner.height).max(1);
+    let selected = app.topic_cursor.min(topics.len().saturating_sub(1));
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    for (row, (idx, topic)) in topics
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+    {
+        let is_sel = idx == selected;
+        let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        let pin = if topic.pinned { "★ " } else { "" };
+        let closed = if topic.closed { " [已关闭]" } else { "" };
+        let unread = if topic.unread > 0 {
+            format!(" ({})", topic.unread)
+        } else {
+            String::new()
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                if is_sel { "› " } else { "  " },
+                Style::default().fg(if is_sel {
+                    palette().accent
+                } else {
+                    palette().muted
+                }),
+            ),
+            Span::styled(
+                format!("# {pin}{}{closed}", topic.title),
+                Style::default().add_modifier(if is_sel {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            Span::styled(unread, Style::default().fg(palette().accent)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(line).style(if is_sel {
+                palette().selection()
+            } else {
+                palette().surface_base()
+            }),
+            rect,
+        );
+        app.hit_targets.push((rect, Target::TopicEntry(idx)));
+    }
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -5418,6 +6140,113 @@ pub(crate) mod tests {
             app.hit_targets
                 .iter()
                 .any(|(_, t)| *t == Target::Command(Action::MultiForward))
+        );
+    }
+
+    #[test]
+    fn proxy_modal_link_preview_inline_keyboard_comments_albums_and_topics_render() {
+        let mut app = fixture();
+        // 1. Proxy list & add form (masks password).
+        app.proxy.open = true;
+        app.proxy.entries = vec![crate::proxy::ProxyEntry {
+            id: 1,
+            server: "127.0.0.1".into(),
+            port: 7890,
+            kind: crate::proxy::ProxyKind::Socks5,
+            enabled: true,
+            ping_ms: Some(42),
+            pinging: false,
+            ping_error: None,
+        }];
+        let list_view = snapshot(&mut app, 110, 32);
+        assert!(list_view.contains("代理设置") && list_view.contains("SOCKS5 127.0.0.1:7890"));
+        assert!(list_view.contains("42 ms"));
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| *t == Target::ProxyEntry(0))
+        );
+
+        app.proxy.form = Some(crate::proxy::ProxyForm {
+            password: "super-secret".into(),
+            password_cursor: 12,
+            ..Default::default()
+        });
+        let form_view = snapshot(&mut app, 110, 32);
+        assert!(form_view.contains("新增代理") && !form_view.contains("super-secret"));
+        app.proxy.open = false;
+        app.proxy.form = None;
+
+        // 2. Link preview, inline keyboard, comment pill & album grouping.
+        app.store.messages[0].info.media_album_id = 999;
+        app.store.messages[1].info.media_album_id = 999;
+        app.store.messages[0].info.link_preview = Some(crate::store::LinkPreview {
+            site_name: "GitHub".into(),
+            title: "Teleaf Repo".into(),
+            description: "终端客户端仓库".into(),
+            url: "https://github.com/YoisakiKnd/teleaf".into(),
+        });
+        app.store.messages[0].info.inline_keyboard = vec![vec![
+            crate::store::InlineButton {
+                text: "官网".into(),
+                kind: crate::store::InlineButtonKind::Url("https://telegram.org".into()),
+            },
+            crate::store::InlineButton {
+                text: "确认".into(),
+                kind: crate::store::InlineButtonKind::Callback("b2s=".into()),
+            },
+        ]];
+        app.store.messages[0].info.can_get_thread = true;
+        app.store.messages[0].info.reply_count = 7;
+        app.timeline_heights.clear();
+        let timeline = snapshot(&mut app, 110, 36);
+        assert!(timeline.contains("[相册 1/2]") && timeline.contains("[相册 2/2]"));
+        assert!(timeline.contains("GitHub · Teleaf Repo") && timeline.contains("终端客户端仓库"));
+        assert!(timeline.contains("[官网 ↗]") && timeline.contains("[确认]"));
+        assert!(timeline.contains("7 条评论"));
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| *t == Target::InlineButton(1, 0, 1))
+        );
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| *t == Target::CommentThread(1))
+        );
+
+        // 3. Link & mention picker modal.
+        app.link_picker = Some(crate::LinkPicker {
+            items: vec![
+                crate::store::LinkItem::Url("https://example.com".into()),
+                crate::store::LinkItem::Mention("@teleaf".into()),
+            ],
+            selected: 0,
+        });
+        let picker = snapshot(&mut app, 100, 30);
+        assert!(picker.contains("消息中的链接与 @提及") && picker.contains("@teleaf"));
+        app.link_picker = None;
+
+        // 4. Forum topics modal.
+        if let Some(chat) = app.store.chat_mut_by_id(1) {
+            chat.is_forum = true;
+            chat.topics = vec![crate::store::ForumTopic {
+                thread_id: 42,
+                title: "发布公告".into(),
+                unread: 3,
+                pinned: true,
+                order: 0,
+                closed: false,
+                last_preview: "v0.3.0".into(),
+            }];
+        }
+        app.show_topics = true;
+        let topics = snapshot(&mut app, 100, 30);
+        assert!(topics.contains("群组话题") && topics.contains("发布公告"));
+        assert!(
+            app.hit_targets
+                .iter()
+                .any(|(_, t)| *t == Target::TopicEntry(0))
         );
     }
 }
