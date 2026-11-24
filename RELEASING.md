@@ -131,9 +131,23 @@ Windows CI 在一次性桌面写入合成剪贴板，ConPTY 验证 CF_DIB 截图
 - `teleaf-0.3.0-linux-x86_64.tar.gz` SHA-256：`c992691be4224114872485f87280999d403471bd032cc401f232ba707897a678`
 - `teleaf-0.3.0-windows-x86_64.zip` SHA-256：`152e771a4aadce25c9f020e0f81be275dbb5d9c0203a51dc9f2ad7b1b5f918e6`
 
+## 0.3.1 发布验证
+
+2026-11-24（北京时间）已发布 [v0.3.1](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.3.1)，最终标签对应 `2825257f81e10cd7fd57d68d9a53e245b9cd0f80`。本版重构 Bot 内联键盘自适应网格渲染与 VS16 Emoji（`CellDiffOption::ForcedWidth`）宽字符排版并新增 `B` 键按钮选择器、补齐下划线/引用块/带语言标签代码块/Bot 命令/话题标签与媒体说明富文本渲染及零依赖有界 Markdown 发送解析器、重整底栏快捷键提示与输入框内置工具栏（统一 `o` 打开大图、为新弹窗补齐滚轮支持）、将连续相册折叠为单个可交互相册块，并新增链接预览卡片常驻可点击 URL 与基于 TDLib `getWebPageInstantView` 的 Telegraph / Instant View 站内阅读器，详见 `CHANGELOG.md` 与 `MEMORY_BUDGET.md`。
+
+首次五平台构建（`45398312481`）中四个 Linux / macOS 平台通过，Windows 构建在 256 色 Git Bash 环境下暴露 `bot_keyboards_share_emoji_width_background_and_hit_areas` 检查了 `TestBackend` 经 `ForcedWidth(2)` diff 过滤后的缓冲区，未生成 Release。修正该测试改为校验真实渲染帧缓冲 `CompletedFrame::buffer`（本地已通过 `TERM=dumb`、`TERM=xterm-256color` 与 `COLORTERM=truecolor` 三种模式及 8 组 PTY 回归）并更新尚未发布的 `v0.3.1` 标签后，[分支 CI 45402354117](https://github.com/YoisakiKnd/teleaf/actions/runs/45402354117)、[标签 CI 45402376372](https://github.com/YoisakiKnd/teleaf/actions/runs/45402376372) 与 [正式发布 45402376307](https://github.com/YoisakiKnd/teleaf/actions/runs/45402376307) 五个平台全部通过（`cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、204–206 项单元测试、7 项打包测试、TDLib 1.8.61 加载及发布前内置凭据登录验证；Windows CI 通过 ConPTY 键鼠/剪贴板与原生通知回归）。
+
+已核对 `v0.3.1` Release 五个平台归档、GitHub 资产摘要、`SHA256SUMS`、`teleaf.rb`、`teleaf.json` 与 MIT 许可证元数据。Homebrew 分发在 `YoisakiKnd/homebrew-tap` 通过 [同步任务 45405950079](https://github.com/YoisakiKnd/homebrew-tap/actions/runs/45405950079) 更新 `Formula/teleaf.rb`（提交 `205577aea77bb9cb4d23649bdf322a7a500749bd`）；[配方安装测试 45405990686](https://github.com/YoisakiKnd/homebrew-tap/actions/runs/45405990686) 中 Linux ARM64、Linux x64 与 macOS x64 三项已通过，macOS ARM64 任务在 GitHub 公共队列排队期间已在本机 macOS ARM64 独立下载校验正式归档（SHA-256 精确一致，`--version` 输出 `Teleaf 0.3.1`，`--check` 正常加载随包 `TDLib 1.8.61`）。自有 Scoop 在 `YoisakiKnd/scoop-bucket` 通过 [同步任务 45405962788](https://github.com/YoisakiKnd/scoop-bucket/actions/runs/45405962788) 更新 `bucket/teleaf.json`（提交 `5487a2682380614eb91f081af4e72d36684ce50b`）。两份安装清单与 Release 附带文件逐字节一致，许可证均为 `MIT`。主仓库未重建有效 `Formula/teleaf.rb` 并保留 `tap_migrations.json`，未在 `Mythos-404/eimer` 创建或更新 PR。
+
+- `teleaf-0.3.1-macos-aarch64.tar.gz` SHA-256：`8c0ca720e41e4ada8430cb6af2f7e21ab655c3d63314f0e4d6207b63d29f7133`
+- `teleaf-0.3.1-macos-x86_64.tar.gz` SHA-256：`b6effcf2ccce75b836d00c5cf2c34fd842c2c0894ca774d868d9f2584f854a44`
+- `teleaf-0.3.1-linux-aarch64.tar.gz` SHA-256：`005d67ee6a1b06666379c91cd5a1dbcd0c80c72726a360d1c6478d196286ef15`
+- `teleaf-0.3.1-linux-x86_64.tar.gz` SHA-256：`f973851865083beb96f3bc0c4884573b908388519b0edb1a038f4e2419929c2b`
+- `teleaf-0.3.1-windows-x86_64.zip` SHA-256：`6ace0d322ef714c73b38895e483b946cf099c2e5d5c3b13f0459a4f0dcf6266f`
+
 ## 用户安装
 
-[v0.3.0](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.3.0) 及安装清单已发布：
+[v0.3.1](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.3.1) 及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/tap
