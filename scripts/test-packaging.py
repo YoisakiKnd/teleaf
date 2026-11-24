@@ -6,10 +6,12 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 from tdlib_runtime import checksum, extract
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +50,7 @@ class PackagingTests(unittest.TestCase):
         code = '''
 import hashlib, io, sys, tempfile, zipfile
 from pathlib import Path
+from unittest.mock import patch
 from unittest.mock import patch
 sys.path.insert(0, str(Path(sys.argv[1]).parent))
 import tdlib_runtime
@@ -130,6 +133,29 @@ with tempfile.TemporaryDirectory() as folder:
             with self.assertRaises(FileNotFoundError):
                 packages.generate('example/teleaf', '9.9.9', folder, folder / 'missing')
 
+    def test_macos_package_only_stages_executable_runtime_and_docs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            binary = folder / 'teleaf'
+            binary.write_bytes(b'executable')
+            obsolete = folder / 'obsolete.app'
+            obsolete.mkdir()
+            (obsolete / 'Info.plist').write_bytes(b'old bundle')
+
+            def install_fixture(runtime, *_args, **_kwargs):
+                runtime.mkdir()
+                (runtime / 'libtdjson.dylib').write_bytes(b'runtime')
+
+            replacements = dict(current_platform=lambda: 'macos-aarch64',
+                                install=install_fixture, macos_dependencies=lambda _runtime: None)
+            with patch.multiple(release, **replacements), patch.object(release.subprocess, 'run'):
+                archive = release.package(binary, 'macos-aarch64', '0.3.2', folder)
+            with tarfile.open(archive) as package:
+                names = package.getnames()
+                self.assertIn('teleaf', names)
+                self.assertIn('tdlib/libtdjson.dylib', names)
+                self.assertFalse(any('.app/' in name for name in names))
+
     def test_archive_keeps_runtime_next_to_executable(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
@@ -137,13 +163,10 @@ with tempfile.TemporaryDirectory() as folder:
             (staging / 'tdlib').mkdir(parents=True)
             (staging / 'teleaf.exe').write_bytes(b'executable')
             (staging / 'tdlib/tdjson.dll').write_bytes(b'runtime')
-            helper = staging / 'Teleaf Notifications.app/Contents/MacOS/teleaf-notifications'
-            helper.parent.mkdir(parents=True)
-            helper.write_bytes(b'native helper')
             archive = folder / 'teleaf.zip'
             release.write_archive(staging, archive)
             with zipfile.ZipFile(archive) as z:
-                self.assertEqual(set(z.namelist()), {'teleaf.exe', 'tdlib/tdjson.dll', 'Teleaf Notifications.app/Contents/MacOS/teleaf-notifications'})
+                self.assertEqual(set(z.namelist()), {'teleaf.exe', 'tdlib/tdjson.dll'})
                 self.assertEqual(z.read('tdlib/tdjson.dll'), b'runtime')
 
 

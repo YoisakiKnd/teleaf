@@ -245,6 +245,10 @@ impl TdWorker {
                     return;
                 }
             };
+            // Recent TDLib reads this option when opening its database.
+            let _ = client.send(&crate::config::tdlib_boolean_option(
+                "use_storage_optimizer",
+            ));
             if event_sender
                 .send(TdEvent::Connected {
                     version: client.version.clone(),

@@ -108,12 +108,18 @@ impl TerminalGuard {
     fn new() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-            .and_then(|_| enable_mouse_capture(&mut stdout))
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            crossterm::event::EnableFocusChange
+        )
+        .and_then(|_| enable_mouse_capture(&mut stdout))
         {
             let _ = execute!(
                 stdout,
                 DisableBracketedPaste,
+                crossterm::event::DisableFocusChange,
                 DisableMouseCapture,
                 LeaveAlternateScreen
             );
@@ -127,6 +133,7 @@ impl TerminalGuard {
                 let _ = execute!(
                     io::stdout(),
                     DisableBracketedPaste,
+                    crossterm::event::DisableFocusChange,
                     DisableMouseCapture,
                     LeaveAlternateScreen
                 );
@@ -143,6 +150,7 @@ impl Drop for TerminalGuard {
             self.terminal.backend_mut(),
             EndSynchronizedUpdate,
             DisableBracketedPaste,
+            crossterm::event::DisableFocusChange,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -202,6 +210,7 @@ struct App {
     attachments: Option<attachments::Picker>,
     clipboard: clipboard::State,
     notifications: notifications::State,
+    terminal_focused: bool,
     show_help: bool,
     show_settings: bool,
     show_chat_info: bool,
@@ -298,6 +307,7 @@ impl App {
             attachments: None,
             clipboard: clipboard::State::default(),
             notifications: notifications::State::default(),
+            terminal_focused: true,
             show_help: false,
             show_settings: false,
             show_chat_info: false,
@@ -359,6 +369,20 @@ impl App {
         }
     }
 
+    fn sync_notification_view(&mut self) {
+        let viewed = if self.terminal_focused
+            && self.focus_messages
+            && !self.show_search
+            && !self.has_overlay()
+            && self.auth.state == "authorizationStateReady"
+        {
+            self.store.active_chat
+        } else {
+            None
+        };
+        self.notifications.set_viewed(viewed);
+    }
+
     fn apply(&mut self, event: TdEvent) -> (Option<Value>, bool) {
         match event {
             TdEvent::Connected { version, path } => {
@@ -391,6 +415,9 @@ impl App {
                 if let Some((request, changed)) = self.receive_sync(&value) {
                     return (request, changed || menu_changed);
                 }
+                if value["@extra"] == "lightweight-option" {
+                    return (None, false);
+                }
                 let was_ready = self.auth.state == "authorizationStateReady";
                 self.update_count += 1;
                 self.last_update = value
@@ -398,6 +425,7 @@ impl App {
                     .and_then(|kind| kind.as_str())
                     .unwrap_or("未知事件")
                     .to_owned();
+                self.sync_notification_view();
                 self.notifications.update(
                     &value,
                     &self.store,
@@ -649,8 +677,7 @@ impl App {
         self.show_folders = false;
         self.show_help = false;
         self.show_settings = false;
-        self.quick_switcher = None;
-        self.clear_global_search();
+        self.close_quick_switcher();
         self.cancel_batch();
         self.reset_storage_view();
         if self.chat_info_modal {
@@ -667,7 +694,7 @@ impl App {
             self.selected_chat = self.store.active_chat;
             self.reveal_chat = true;
         }
-        self.preview_message = None;
+        self.close_preview();
         self.media.last_error = None;
         self.modal_scroll = 0;
     }
@@ -725,8 +752,9 @@ impl App {
         self.message_check = None;
         self.restore_draft(id);
         self.selected_message = None;
-        self.preview_message = None;
-        self.show_search = false;
+        self.close_preview();
+        self.media.switch_chat();
+        self.clear_message_search();
         self.show_topics = false;
         self.active_thread = None;
         self.reset_chat_requests();
@@ -742,7 +770,8 @@ impl App {
         self.pending_messages = 0;
         self.visible_media.clear();
         self.history_loading = true;
-        self.timeline_heights.clear();
+        self.timeline_heights = HashMap::new();
+        self.timeline_rows = Vec::new();
         if let Some(previous) = previous
             && previous != id
         {
@@ -915,6 +944,12 @@ impl App {
         })
     }
 
+    fn close_preview(&mut self) {
+        if self.preview_message.take().is_some() {
+            self.media.close_preview();
+        }
+    }
+
     fn preview_selected(&mut self) -> Option<Value> {
         let message = self.selected_message()?;
         let media = message.media.as_ref()?;
@@ -992,6 +1027,7 @@ impl App {
         };
         let suggested = message
             .info
+            .extras()
             .media_meta
             .as_ref()
             .map(|meta| meta.file_name.as_str())
@@ -1144,6 +1180,11 @@ fn drain_events(receiver: &Receiver<TdEvent>, app: &mut App, worker: &TdWorker) 
                 }
                 app.initialize_proxy_list(worker);
                 if !was_ready && app.auth.state == "authorizationStateReady" && !app.demo {
+                    changed |= !send_request(
+                        app,
+                        worker,
+                        config::tdlib_boolean_option("disable_top_chats"),
+                    );
                     for request in app.notifications.requests() {
                         changed |= !send_request(app, worker, request);
                     }
@@ -1408,7 +1449,7 @@ fn submit_composer(app: &mut App, worker: &TdWorker) -> bool {
         if app.input_mode == InputMode::Search {
             app.search_query = app.draft.trim().chars().take(256).collect();
             app.show_search = true;
-            app.store.search_results.clear();
+            app.store.search_results = Vec::new();
             app.selected_message = None;
             app.timeline_heights.clear();
         }
@@ -1816,7 +1857,7 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
     }
     if app.preview_message.is_some() {
         match code {
-            KeyCode::Esc | KeyCode::Char('v') => app.preview_message = None,
+            KeyCode::Esc | KeyCode::Char('v') => app.close_preview(),
             KeyCode::Char('o') => app.open_selected_external(),
             KeyCode::Char('E') => {
                 interaction::perform(app, worker, ui::Action::SaveFileAs);
@@ -1923,7 +1964,7 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
             app.show_chat_info = false;
         }
         KeyCode::Esc if app.show_search => {
-            app.show_search = false;
+            app.clear_message_search();
             app.selected_message = app.store.messages.last().map(|message| message.id);
             app.timeline_anchor = None;
             app.timeline_heights.clear();
@@ -2052,6 +2093,7 @@ fn run(demo: bool) -> io::Result<()> {
             }
         }
         stickers::download_visible(&mut app, &worker);
+        app.media.prune_idle(Instant::now());
         dirty |= app.media.poll();
         if let Some((chat, mode, result)) = app.clipboard.poll() {
             accept_clipboard(&mut app, chat, mode, result);
@@ -2069,7 +2111,9 @@ fn run(demo: bool) -> io::Result<()> {
         }
         if app.auth.take_restart() {
             worker.shutdown();
+            let focused = app.terminal_focused;
             app = App::new();
+            app.terminal_focused = focused;
             app.mouse_enabled = capture;
             worker = TdWorker::spawn();
             dirty = true;
@@ -2094,6 +2138,9 @@ fn run(demo: bool) -> io::Result<()> {
             last_draw = Instant::now();
         }
 
+        app.sync_notification_view();
+        app.notifications
+            .write_pending(terminal.terminal.backend_mut())?;
         if !dirty {
             dirty |= app.report_viewport(&worker, Instant::now());
         }
@@ -2335,6 +2382,10 @@ fn run(demo: bool) -> io::Result<()> {
                         }
                         dirty = true;
                     }
+                    event @ (Event::FocusGained | Event::FocusLost) => {
+                        app.terminal_focused = matches!(event, Event::FocusGained);
+                        app.sync_notification_view();
+                    }
                     Event::Paste(text) => {
                         paste_text(&mut app, &text);
                         dirty = true;
@@ -2395,9 +2446,7 @@ fn main() {
         Ok(cli::Command::DismissNotification) => return,
         Ok(cli::Command::TestNotification) => {
             match notifications::test_notification() {
-                Ok(()) => {
-                    println!("已请求显示 Teleaf 测试通知；请检查系统通知中心和勿扰设置。")
-                }
+                Ok(channel) => println!("Teleaf 通知通道 · {channel}"),
                 Err(error) => {
                     eprintln!("Teleaf: {error}");
                     std::process::exit(1);

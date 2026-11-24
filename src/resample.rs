@@ -33,6 +33,7 @@ fn sample(source: u32, target: u32, position: u32) -> Sample {
     Sample { first, weights }
 }
 
+#[cfg(test)]
 pub fn resize<I: GenericImageView>(source: &I, width: u32, height: u32) -> RgbaImage
 where
     I::Pixel: Pixel<Subpixel = u8>,
@@ -46,12 +47,41 @@ pub fn crop_resize(
     width: u32,
     height: u32,
 ) -> RgbaImage {
+    crop_into(source, region, (width, height), (width, height))
+}
+
+pub fn crop_canvas(
+    source: &DynamicImage,
+    region: (u32, u32, u32, u32),
+    width: u32,
+    height: u32,
+) -> RgbaImage {
+    crop_into(
+        source,
+        region,
+        fit(region.2, region.3, width, height),
+        (width, height),
+    )
+}
+
+fn crop_into(
+    source: &DynamicImage,
+    region: (u32, u32, u32, u32),
+    (width, height): (u32, u32),
+    (canvas_width, canvas_height): (u32, u32),
+) -> RgbaImage {
     let (x, y, w, h) = region;
     // Dispatch once for common formats instead of matching DynamicImage on
     // every source pixel. RGB inputs need no whole-image RGBA conversion.
     macro_rules! from_buffer {
         ($buffer:expr) => {
-            resize(&*$buffer.view(x, y, w, h), width, height)
+            resize_into(
+                &*$buffer.view(x, y, w, h),
+                width,
+                height,
+                canvas_width,
+                canvas_height,
+            )
         };
     }
     match source {
@@ -64,6 +94,7 @@ pub fn crop_resize(
 }
 
 /// Preserve aspect ratio, padding the bottom/right of a terminal cell canvas.
+#[cfg(test)]
 pub fn canvas(
     source: &impl GenericImageView<Pixel = Rgba<u8>>,
     width: u32,

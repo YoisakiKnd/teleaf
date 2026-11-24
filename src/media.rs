@@ -3,10 +3,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use image::GenericImageView;
+use image::ImageDecoder;
 use ratatui::layout::Size;
 use ratatui_image::Resize;
 use ratatui_image::picker::{Picker, ProtocolType};
@@ -19,6 +23,7 @@ pub struct View {
     pub x: u16,
     pub y: u16,
     pub inline: bool,
+    pub preview: bool,
 }
 impl Default for View {
     fn default() -> Self {
@@ -27,6 +32,7 @@ impl Default for View {
             x: 500,
             y: 500,
             inline: false,
+            preview: false,
         }
     }
 }
@@ -51,6 +57,7 @@ struct DecodedImage {
     path: String,
     image: image::DynamicImage,
     cropped_view: Option<View>,
+    preview: bool,
 }
 type Decoded = VecDeque<DecodedImage>;
 const DECODED_BUDGET: usize = 8 * 1024 * 1024;
@@ -91,13 +98,54 @@ impl Encoded {
 
 const ENCODED_BUDGET: usize = 12 * 1024 * 1024;
 
+#[derive(Default)]
+struct Epochs {
+    chat: AtomicU64,
+    preview: AtomicU64,
+}
+
+impl Epochs {
+    fn for_view(&self, view: View) -> (u64, u64) {
+        (
+            self.chat.load(Ordering::Relaxed),
+            if view.preview {
+                self.preview.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+        )
+    }
+
+    fn refresh_decoded(&self, previous: &mut (u64, u64), decoded: &mut Decoded) {
+        let current = self.for_view(View {
+            preview: true,
+            ..View::default()
+        });
+        if previous.0 != current.0 {
+            decoded.clear();
+        } else if previous.1 != current.1 {
+            decoded.retain(|image| !image.preview);
+        }
+        *previous = current;
+    }
+}
+
+enum Work {
+    Prepare(Job, (u64, u64)),
+    Wake,
+}
+
 struct Finished {
     key: Key,
+    epoch: (u64, u64),
     result: Option<Result<Encoded, String>>,
 }
 
 pub struct MediaManager {
-    jobs: SyncSender<Job>,
+    jobs: SyncSender<Work>,
+    epochs: Arc<Epochs>,
+    prune_next_frame: bool,
+    idle_deadline: Option<Instant>,
     finished: Receiver<Finished>,
     pending: HashSet<Key>,
     failed: HashSet<Key>,
@@ -121,34 +169,44 @@ impl MediaManager {
     pub(crate) fn from_picker(picker: Picker) -> Self {
         let protocol_name = format!("{:?}", picker.protocol_type());
         let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
-        let (jobs, job_receiver) = mpsc::sync_channel::<Job>(2);
+        let (jobs, job_receiver) = mpsc::sync_channel::<Work>(2);
         let (result_sender, finished) = mpsc::sync_channel::<Finished>(2);
+        let epochs = Arc::new(Epochs::default());
+        let worker_epochs = Arc::clone(&epochs);
         thread::spawn(move || {
             let mut decoded = Decoded::new();
+            let mut previous = (0, 0);
             loop {
-                let mut job = match job_receiver.recv_timeout(Duration::from_secs(30)) {
-                    Ok(job) => job,
+                let first = match job_receiver.recv_timeout(Duration::from_secs(30)) {
+                    Ok(work) => work,
                     Err(RecvTimeoutError::Timeout) => {
                         decoded.clear();
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => return,
                 };
-                // Keep the newest queued viewport for a file; cancelled jobs
-                // still acknowledge their keys so pending work stays bounded.
-                let mut jobs = VecDeque::new();
-                jobs.push_back(job);
-                while let Ok(next) = job_receiver.try_recv() {
-                    if let Some(index) = jobs.iter().position(|old: &Job| {
-                        old.key.0 == next.key.0
-                            && old.key.1 == next.key.1
-                            && old.key.2 == next.key.2
-                            && old.key.3.inline == next.key.3.inline
+                worker_epochs.refresh_decoded(&mut previous, &mut decoded);
+                // Drain at most the queue capacity. Superseded jobs still
+                // acknowledge their keys and terminal image slots.
+                let mut batch = VecDeque::<(Job, (u64, u64))>::new();
+                for work in std::iter::once(first)
+                    .chain(std::iter::from_fn(|| job_receiver.try_recv().ok()).take(2))
+                {
+                    let Work::Prepare(job, epoch) = work else {
+                        continue;
+                    };
+                    if let Some(index) = batch.iter().position(|(old, _)| {
+                        old.key.0 == job.key.0
+                            && old.key.1 == job.key.1
+                            && old.key.2 == job.key.2
+                            && old.key.3.inline == job.key.3.inline
+                            && old.key.3.preview == job.key.3.preview
                     }) {
-                        let old = jobs.remove(index).expect("job");
+                        let (old, epoch) = batch.remove(index).expect("job");
                         if result_sender
                             .send(Finished {
                                 key: old.key,
+                                epoch,
                                 result: None,
                             })
                             .is_err()
@@ -156,15 +214,17 @@ impl MediaManager {
                             return;
                         }
                     }
-                    jobs.push_back(next);
+                    batch.push_back((job, epoch));
                 }
-                while let Some(next) = jobs.pop_front() {
-                    job = next;
-                    let prepared = prepare(&picker, &job, &mut decoded, job.kitty_id);
-                    let result = Some(prepared);
+                for (job, epoch) in batch {
+                    worker_epochs.refresh_decoded(&mut previous, &mut decoded);
+                    let result = (worker_epochs.for_view(job.key.3) == epoch)
+                        .then(|| prepare(&picker, &job, &mut decoded, job.kitty_id));
+                    worker_epochs.refresh_decoded(&mut previous, &mut decoded);
                     if result_sender
                         .send(Finished {
                             key: job.key,
+                            epoch,
                             result,
                         })
                         .is_err()
@@ -176,6 +236,9 @@ impl MediaManager {
         });
         Self {
             jobs,
+            epochs,
+            prune_next_frame: false,
+            idle_deadline: None,
             finished,
             pending: HashSet::new(),
             failed: HashSet::new(),
@@ -197,7 +260,59 @@ impl MediaManager {
     }
 
     pub fn end_frame(&mut self) {
-        self.evict_hidden();
+        self.idle_deadline = Some(Instant::now() + Duration::from_secs(60));
+        if std::mem::take(&mut self.prune_next_frame) {
+            self.prune_hidden();
+        } else {
+            self.evict_hidden();
+        }
+    }
+
+    pub fn close_preview(&mut self) {
+        self.epochs.preview.fetch_add(1, Ordering::Relaxed);
+        let _ = self.jobs.try_send(Work::Wake);
+        self.failed.retain(|key| !key.3.preview);
+        self.visible.retain(|key| !key.3.preview);
+        self.retain_cache(|key, _| !key.3.preview);
+        self.last_error = None;
+    }
+
+    pub fn switch_chat(&mut self) {
+        self.epochs.chat.fetch_add(1, Ordering::Relaxed);
+        let _ = self.jobs.try_send(Work::Wake);
+        self.visible.clear();
+        self.failed.clear();
+        self.last_error = None;
+        self.prune_next_frame = true;
+    }
+
+    pub fn prune_idle(&mut self, now: Instant) {
+        if self.idle_deadline.is_some_and(|deadline| now >= deadline) {
+            self.idle_deadline = None;
+            self.prune_hidden();
+        }
+    }
+
+    fn prune_hidden(&mut self) {
+        self.retain_cache(|key, visible| visible.contains(key));
+        self.failed.retain(|key| self.visible.contains(key));
+        self.failed.shrink_to_fit();
+        self.visible.shrink_to_fit();
+    }
+
+    fn retain_cache(&mut self, keep: impl Fn(&Key, &HashSet<Key>) -> bool) {
+        self.cache.retain(|key, encoded| {
+            let keep = keep(key, &self.visible);
+            if !keep {
+                self.cache_bytes -= encoded.weight();
+                self.kitty_slots.remove(key);
+            }
+            keep
+        });
+        self.recent.retain(|key| self.cache.contains_key(key));
+        self.cache.shrink_to_fit();
+        self.recent.shrink_to_fit();
+        self.kitty_slots.shrink_to_fit();
     }
 
     fn evict_hidden(&mut self) {
@@ -250,11 +365,15 @@ impl MediaManager {
         } else {
             0
         };
-        match self.jobs.try_send(Job {
+        let job = Job {
             key,
             path: path.to_owned(),
             kitty_id,
-        }) {
+        };
+        match self
+            .jobs
+            .try_send(Work::Prepare(job, self.epochs.for_view(view)))
+        {
             Ok(()) => {
                 self.pending.insert(key);
                 if self.is_kitty {
@@ -309,6 +428,14 @@ impl MediaManager {
         let mut changed = false;
         while let Ok(finished) = self.finished.try_recv() {
             self.pending.remove(&finished.key);
+            let visible = self.visible.contains(&finished.key);
+            if finished.epoch != self.epochs.for_view(finished.key.3)
+                || (!visible && self.frame_pinning && self.idle_deadline.is_none())
+            {
+                self.kitty_slots.remove(&finished.key);
+                changed |= visible;
+                continue;
+            }
             match finished.result {
                 Some(Ok(protocol)) => {
                     self.cache_bytes += protocol.weight();
@@ -354,7 +481,11 @@ impl MediaManager {
                 .iter()
                 .rev()
                 .find(|key| {
-                    key.0 == file_id && key.1 == area.width && key.2 == area.height && !key.3.inline
+                    key.0 == file_id
+                        && key.1 == area.width
+                        && key.2 == area.height
+                        && !key.3.inline
+                        && key.3.preview == view.preview
                 })
                 .copied()
         }?;
@@ -374,6 +505,7 @@ fn prepare(
     if let Some(index) = decoded.iter().position(|cached| {
         cached.file_id == job.key.0
             && cached.path == job.path
+            && cached.preview == job.key.3.preview
             && cached.cropped_view.is_none_or(|view| view == job.key.3)
     }) {
         let cached = decoded.remove(index).expect("image");
@@ -383,16 +515,17 @@ fn prepare(
         if metadata.len() > 32 * 1024 * 1024 {
             return Err("图片文件超过预览限制（32 MiB），请用外部程序打开".into());
         }
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(64 * 1024 * 1024);
+        limits.max_image_width = Some(SOURCE_EDGE);
+        limits.max_image_height = Some(SOURCE_EDGE);
         let mut reader = image::ImageReader::open(&job.path)
             .map_err(|error| error.to_string())?
             .with_guessed_format()
             .map_err(|error| error.to_string())?;
-        let (width, height) = image::ImageReader::open(&job.path)
-            .map_err(|error| error.to_string())?
-            .with_guessed_format()
-            .map_err(|error| error.to_string())?
-            .into_dimensions()
-            .map_err(|error| error.to_string())?;
+        reader.limits(limits.clone());
+        let mut decoder = reader.into_decoder().map_err(|error| error.to_string())?;
+        let (width, height) = decoder.dimensions();
         if width > SOURCE_EDGE
             || height > SOURCE_EDGE
             || u64::from(width) * u64::from(height) > 16_000_000
@@ -405,12 +538,27 @@ fn prepare(
             decoded,
             (u64::from(width) * u64::from(height) * 4).min(DECODED_BUDGET as u64) as usize,
         );
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(64 * 1024 * 1024);
-        reader.limits(limits);
-        let image = reader.decode().map_err(|error| error.to_string())?;
+        limits
+            .reserve(decoder.total_bytes())
+            .map_err(|error| error.to_string())?;
+        decoder
+            .set_limits(limits)
+            .map_err(|error| error.to_string())?;
+        let image =
+            image::DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())?;
         let (image, cropped_view) = if picker.protocol_type() == ProtocolType::Halfblocks {
-            (image.thumbnail(768, 768), None)
+            let (w, h) = bounded_pixels(width, height, 768, 768 * 768);
+            let image = if (w, h) == (width, height) {
+                image
+            } else {
+                image::DynamicImage::ImageRgba8(crate::resample::crop_resize(
+                    &image,
+                    (0, 0, width, height),
+                    w,
+                    h,
+                ))
+            };
+            (image, None)
         } else if u64::from(image.width()) * u64::from(image.height()) * 4 <= DECODED_BUDGET as u64
         {
             // Retain enough source detail for zoom instead of permanently shrinking
@@ -430,13 +578,21 @@ fn prepare(
                 Some(view),
             )
         };
-        // 16-bit / floating point originals must not multiply retained cache memory.
-        let image = image::DynamicImage::ImageRgba8(image.into_rgba8());
+        // Keep RGB/grayscale sources in their compact 8-bit layouts. Only
+        // higher-precision formats need conversion to fit the cache budget.
+        let image = match image {
+            image::DynamicImage::ImageRgb8(_)
+            | image::DynamicImage::ImageRgba8(_)
+            | image::DynamicImage::ImageLuma8(_)
+            | image::DynamicImage::ImageLumaA8(_) => image,
+            other => image::DynamicImage::ImageRgba8(other.into_rgba8()),
+        };
         decoded.push_back(DecodedImage {
             file_id: job.key.0,
             path: job.path.clone(),
             image,
             cropped_view,
+            preview: job.key.3.preview,
         });
         while decoded.len() > 2
             || decoded
@@ -460,17 +616,15 @@ fn prepare(
             view
         },
     );
-    let cropped = image
-        .as_rgba8()
-        .expect("RGBA8 cache")
-        .view(x, y, width, height);
+    let region = (x, y, width, height);
     let mut size = Size::new(job.key.1.min(160), job.key.2.min(60));
     if picker.protocol_type() == ProtocolType::Halfblocks {
         let size = fitted_cells(width, height, picker.font_size(), size);
         // Encode at the two pixels per cell actually visible in the fallback.
         // Avoid allocating a full terminal-font-sized intermediate bitmap.
-        let pixels = image::DynamicImage::ImageRgba8(crate::resample::canvas(
-            &*cropped,
+        let pixels = image::DynamicImage::ImageRgba8(crate::resample::crop_canvas(
+            image,
+            region,
             u32::from(size.width),
             u32::from(size.height) * 2,
         ));
@@ -513,8 +667,9 @@ fn prepare(
         } else {
             12
         };
-    let pixels = image::DynamicImage::ImageRgba8(crate::resample::canvas(
-        &*cropped,
+    let pixels = image::DynamicImage::ImageRgba8(crate::resample::crop_canvas(
+        image,
+        region,
         canvas_width,
         canvas_height,
     ));
@@ -594,6 +749,100 @@ fn bounded_pixels(width: u32, height: u32, edge: u32, pixels: u64) -> (u32, u32)
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn closing_preview_and_switching_chats_release_cache_without_evicting_visible_frames() {
+        let path =
+            std::env::temp_dir().join(format!("teleaf-lifecycle-{}.png", std::process::id()));
+        image::RgbImage::from_pixel(24, 16, image::Rgb([20, 60, 100]))
+            .save(&path)
+            .unwrap();
+        let path_str = path.to_str().unwrap();
+        let size = Size::new(10, 7);
+        let inline = View {
+            inline: true,
+            ..View::default()
+        };
+        let preview = View {
+            preview: true,
+            ..View::default()
+        };
+        let mut manager = MediaManager::from_picker(Picker::halfblocks());
+        let await_jobs = |manager: &mut MediaManager| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !manager.pending.is_empty() && Instant::now() < deadline {
+                manager.poll();
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(manager.pending.is_empty());
+        };
+
+        manager.begin_frame();
+        manager.request_inline(1, path_str, size);
+        manager.request_view(9, path_str, size, preview);
+        manager.end_frame();
+        await_jobs(&mut manager);
+        assert!(manager.cache.contains_key(&(9, 10, 7, preview)));
+        manager.request_view(10, path_str, size, preview);
+        manager.close_preview();
+        await_jobs(&mut manager);
+        assert!(!manager.cache.keys().any(|key| key.3.preview));
+        assert!(manager.get_inline(1, size).is_some());
+
+        manager.request_inline(2, path_str, size);
+        await_jobs(&mut manager);
+        manager.switch_chat();
+        manager.begin_frame();
+        manager.request_inline(2, path_str, size);
+        manager.end_frame();
+        assert_eq!(
+            manager.cache.keys().copied().collect::<Vec<_>>(),
+            [(2, 10, 7, inline)]
+        );
+
+        manager.begin_frame();
+        manager.request_inline(1, path_str, size);
+        manager.request_inline(2, path_str, size);
+        manager.end_frame();
+        await_jobs(&mut manager);
+        manager.begin_frame();
+        manager.request_inline(2, path_str, size);
+        manager.end_frame();
+        let idle = manager.idle_deadline.unwrap();
+        manager.prune_idle(idle - Duration::from_millis(1));
+        assert_eq!(manager.cache.len(), 2);
+        manager.prune_idle(idle);
+        assert!(manager.idle_deadline.is_none());
+        assert_eq!(
+            manager.cache.keys().copied().collect::<Vec<_>>(),
+            [(2, 10, 7, inline)]
+        );
+        assert!(!manager.poll());
+
+        let mut decoded = Decoded::new();
+        for (file_id, view) in [(1, inline), (9, preview)] {
+            let job = Job {
+                key: (file_id, 10, 7, view),
+                path: path_str.into(),
+                kitty_id: 0,
+            };
+            prepare(&Picker::halfblocks(), &job, &mut decoded, 0).unwrap();
+        }
+        assert!(
+            decoded
+                .iter()
+                .all(|source| source.image.as_rgb8().is_some())
+        );
+        let mut epochs = manager.epochs.for_view(preview);
+        manager.close_preview();
+        manager.epochs.refresh_decoded(&mut epochs, &mut decoded);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].file_id, 1);
+        manager.switch_chat();
+        manager.epochs.refresh_decoded(&mut epochs, &mut decoded);
+        assert!(decoded.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn sixel_encodes_inline_and_detail_with_bounded_canvas() {

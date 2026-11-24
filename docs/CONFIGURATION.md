@@ -64,18 +64,23 @@ Linux / WSL 使用 `libtdjson.so`，macOS 使用 `libtdjson.dylib`；`TDLIB_PATH
 
 ## 桌面消息通知
 
-从 v0.1.4 起，macOS、Linux 桌面和 Windows 10/11 支持系统原生提醒，应用运行且登录时接收消息。设置页可用鼠标或 `Tab` / `Enter` 切换 **桌面通知**。开关只影响本次运行；长期关闭可设置 `TG_NOTIFICATIONS=0`（PowerShell：`$env:TG_NOTIFICATIONS="0"`）。SSH 和无桌面的 Linux 默认关闭，可用 `TG_NOTIFICATIONS=1` 显式开启；它通知的是程序所在机器，不转发到 SSH 客户端。
+设置页的 **桌面通知** 开关只影响本次运行。设置 `TG_NOTIFICATIONS=0` 可长期关闭，设为 `1` 可显式开启。焦点上报默认从聚焦开始。终端聚焦且正在查看某个会话时，该会话的新消息静默处理。失焦或切到其他会话后可正常提醒，重新查看时支持撤回的通道会移除该会话的提醒。
 
-提醒使用 [TDLib Notification API](https://core.telegram.org/tdlib/notification-api)，支持普通消息与提及，遵循 Telegram 通知/静音设置；忽略启动前的历史通知、自己发送的消息和重复事件。同一通知组的新消息替换已有提醒，消息读完或通知撤回后移除对应提醒。只使用文字和媒体类型摘要，不下载通知图片。当前是只读提醒，不支持点击跳转聊天。
+提醒数据来自 [TDLib Notification API](https://core.telegram.org/tdlib/notification-api)，支持消息与提及，沿用 Telegram 的静音和预览隐私设置。提醒使用文字和媒体摘要，跳过历史、自己发送和重复的消息。
 
-| 平台 | 实现和配置 |
+| 通道 | 自动选择与行为 |
 | --- | --- |
-| macOS 15+ | 安装包附带 **Teleaf Notifications.app**，使用 [UserNotifications](https://developer.apple.com/documentation/usernotifications/unusernotificationcenter)；首次显示提醒时请求系统通知权限。拒绝后可在系统设置 → 通知中开启 Teleaf Notifications，再打开程序里的通知开关。必须保留助手和主程序在同一目录；Homebrew 会自动一起安装。源码构建需要 Xcode Command Line Tools 中的 Swift 编译器。 |
-| Linux X11 / Wayland | 直接连接用户会话的 [D-Bus 桌面通知服务](https://specifications.freedesktop.org/notification/latest-single/)，支持通知替换、撤回及静音提示；无需 `notify-send` 或额外 CLI。需要桌面提供 `org.freedesktop.Notifications`（例如 GNOME/KDE 或 dunst/mako）。没有服务时提示并关闭本次提醒，可在启用服务后通过设置重试。已显示编号仅在当前程序内存中保存，可跨空闲线程重启复用；退出重开后不能撤回上一进程遗留的通知。 |
-| Windows 10/11 | 原生 WinRT Toast；第一次通知创建当前用户的 **Teleaf Notifications** 开始菜单快捷方式及 `teleaf-notification` 关闭协议，无需管理员权限。点击关闭时处理进程立即退出，不加载 TDLib 或账号数据库。 |
+| OSC 99 | Kitty。标题、正文和按会话替换，支持撤回与静音。 |
+| OSC 777 | Ghostty、WezTerm、Foot 和部分 VTE 终端。支持标题和正文。Ghostty 1.4 以 OSC 777 显示通知。 |
+| OSC 9 | iTerm2。标题和正文合为一行。 |
+| Windows Toast | Windows 默认使用 WinRT，包括在 WezTerm 等支持 OSC 的终端中运行时。提醒进入 Windows 通知中心。 |
+| Linux D-Bus | 本地 Linux 终端无法使用 OSC 时回退到 `org.freedesktop.Notifications` 会话服务。 |
+| Terminal BEL | macOS Terminal.app、SSH 远端未识别终端及其他无原生通道的环境。提醒效果取决于终端铃声设置。静音消息跳过 BEL。 |
 
-通知线程按需启动、队列最多 16 项、空闲 30 秒后退出；去重和已显示记录有数量上限，不增加聊天轮询。macOS 主程序不加载 AppKit/UserNotifications，仅在处理通知时启动助手，批量合并同组操作后退出；助手运行时会有临时内存占用。Linux D-Bus 连接只在工作线程活动时存在，编号缓存最多 128 组。通知被系统权限、专注/勿扰模式或桌面服务限制时，仍可正常聊天。
+`TG_NOTIFY_BACKEND` 默认为 `auto`。可设为 `osc`（按环境选择，未识别时用 OSC 99）、`osc99`、`osc777`、`osc9`、`native`、`bell`、`command` 或 `off`。OSC 由终端处理，可通过 SSH 传给客户端。远端未保留外层终端标识时，显式指定对应 OSC；tmux 需允许 `allow-passthrough`，GNU Screen 使用 DCS 透传。OSC 777 和 OSC 9 没有应用侧静音和撤回指令，实际声音由终端及系统设置决定。
 
-先运行 `teleaf --test-notification` 检查系统提醒，无需登录；测试为静音，macOS 首次可能显示授权框。再保持 Teleaf 登录，用另一个账号向未静音会话发消息，检查弹窗与通知中心；读完消息后检查提醒撤回，再检查静音、设置关闭与连续群消息。测试覆盖 TDLib 过滤、Windows XML/快捷方式标识、macOS 助手内容和 Linux 私有 D-Bus 协议。实际横幅、声音和勿扰模式需对应桌面验证。
+可在数据目录的 `config.json` 中添加 `"notify_command": ["/path/to/notify-handler", "--profile", "teleaf"]`，或用 `TG_NOTIFY_CMD` 指定 JSON argv 或单个可执行路径。环境变量优先，空值可覆盖文件配置。配置命令后，`auto` 会选用该命令，也可显式设为 `command`。命令通过 stdin 接收一行 JSON，字段为 `op`（`show` 或 `remove`）、`chat_id`、`title`、`body` 和 `silent`。argv 直接执行，消息内容只进 stdin。每次执行限时 2 秒，输入最多 4 KiB。
+
+运行 `teleaf --test-notification` 可无需登录发送样例并查看所选通道。macOS 的权限归属终端应用，Windows 和 Linux 的原生通知沿用各自通知中心的权限与勿扰设置。
 
 Windows 从 v0.1.6 起会在当前用户注册自己的 `AppUserModelId` 元数据和通知快捷方式；不需要管理员权限。首次发送之前，Windows 可能还没有该应用的通知设置项，查询会返回 `0x80070490`（找不到元素）；此时继续提交第一条实际通知，由系统按权限决定显示，不生成额外的占位通知。遇到旧版本的这个错误时，先确认 `teleaf --version` 并升级，重新运行通知测试。其他错误会注明发生在注册、创建发送器、读取设置或发送阶段；系统关闭通知时也会区分应用、当前用户或组策略。若仍失败，反馈完整错误和 Windows 版本即可。首次查询行为参考 [Microsoft 通知工具包](https://github.com/CommunityToolkit/WindowsCommunityToolkit/blob/main/Microsoft.Toolkit.Uwp.Notifications/Toasts/Compat/ToastNotifierCompat.cs)。

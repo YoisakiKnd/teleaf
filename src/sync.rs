@@ -102,6 +102,16 @@ impl App {
         self.sync.generation
     }
 
+    pub fn close_quick_switcher(&mut self) {
+        self.quick_switcher = None;
+        self.clear_global_search();
+        self.reset_quick_search();
+        self.store.global_chat_results.shrink_to_fit();
+        self.sync.quick_ids.shrink_to_fit();
+        self.sync.quick_fetch.shrink_to_fit();
+        self.sync.quick_query.shrink_to_fit();
+    }
+
     pub fn reset_quick_search(&mut self) {
         self.store.global_chat_results.clear();
         self.sync.quick_ids.clear();
@@ -315,6 +325,8 @@ impl App {
     }
 
     fn reset_scoped_timeline(&mut self) {
+        self.close_preview();
+        self.media.switch_chat();
         self.sync.mention = None;
         self.sync.history = None;
         self.sync.newer = None;
@@ -332,7 +344,7 @@ impl App {
         self.pending_messages = 0;
         self.selection = None;
         self.drag = None;
-        self.show_search = false;
+        self.clear_message_search();
         self.multi_select.clear();
         self.message_check = None;
         self.reset_draft_snapshot();
@@ -727,12 +739,18 @@ impl App {
         self.cancel_unread_context();
     }
 
+    pub fn clear_message_search(&mut self) {
+        self.show_search = false;
+        self.store.search_results = Vec::new();
+        self.search_query = String::new();
+        self.sync.search = None;
+    }
+
     pub fn jump_to(&mut self, worker: &TdWorker, target: i64) -> bool {
         let Some(chat) = self.store.active_chat else {
             return false;
         };
-        self.show_search = false;
-        self.sync.search = None;
+        self.clear_message_search();
         self.sync.jump = None;
         if self.sync.newer.take().is_some() {
             self.history_loading = false;
@@ -2987,7 +3005,7 @@ mod tests {
                 }
             }
         }));
-        let reaction = &app.store.messages[0].info.reactions[0];
+        let reaction = &app.store.messages[0].info.extras().reactions[0];
         assert_eq!(reaction.emoji, "✦");
         assert_eq!(reaction.custom_emoji_id, Some(555));
         assert!(reaction.chosen);

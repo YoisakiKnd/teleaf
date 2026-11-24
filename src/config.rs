@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -221,10 +221,16 @@ impl Config {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let payload = json!({
+        let mut payload = json!({
             "api_id": self.api_id, "api_hash": self.api_hash, "database_key": self.database_key,
             "session": self.session
         });
+        if let Some(command) = read_settings(&self.data_dir)
+            .ok()
+            .and_then(|mut value| value.as_object_mut()?.remove("notify_command"))
+        {
+            payload["notify_command"] = command;
+        }
         let result = (|| -> std::io::Result<()> {
             let mut file = options.open(&temporary)?;
             file.write_all(payload.to_string().as_bytes())?;
@@ -267,7 +273,8 @@ impl Config {
             "use_file_database": true,
             "use_chat_info_database": true,
             "use_message_database": true,
-            "use_secret_chats": true,
+            "use_secret_chats": false,
+            "enable_storage_optimizer": true,
             "api_id": self.api_id,
             "api_hash": self.api_hash,
             "system_language_code": "zh-CN",
@@ -277,7 +284,6 @@ impl Config {
         });
         if legacy {
             parameters["@type"] = json!("tdlibParameters");
-            parameters["enable_storage_optimizer"] = json!(true);
             parameters["ignore_file_names"] = json!(false);
             Ok(json!({
                 "@type": "setTdlibParameters", "parameters": parameters,
@@ -340,9 +346,78 @@ fn resolve_credentials(
     }
 }
 
+pub fn tdlib_boolean_option(name: &str) -> Value {
+    json!({"@type":"setOption","name":name,
+        "value":{"@type":"optionValueBoolean","value":true},"@extra":"lightweight-option"})
+}
+
+pub fn notification_command() -> Result<Option<Vec<String>>, String> {
+    match env::var("TG_NOTIFY_CMD") {
+        Ok(raw) if raw.len() > 8192 => Err("TG_NOTIFY_CMD 超过 8 KiB".into()),
+        Ok(raw) if raw.trim().is_empty() => Ok(None),
+        Ok(raw) if raw.trim_start().starts_with('[') => {
+            let value =
+                serde_json::from_str(&raw).map_err(|_| "TG_NOTIFY_CMD 应为 JSON 参数列表")?;
+            parse_notify_command(&value)
+        }
+        Ok(raw) => parse_notify_command(&json!([raw])),
+        Err(env::VarError::NotPresent) => {
+            let saved = Config::data_dir().and_then(|dir| read_settings(&dir));
+            saved.map_or(Ok(None), |value| {
+                parse_notify_command(&value["notify_command"])
+            })
+        }
+        Err(_) => Err("TG_NOTIFY_CMD 不是有效的 UTF-8".into()),
+    }
+}
+
+fn parse_notify_command(value: &Value) -> Result<Option<Vec<String>>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let argv = value
+        .as_array()
+        .filter(|args| (1..=16).contains(&args.len()))
+        .ok_or("notify_command 应为包含 1 至 16 项的 JSON 参数列表")?;
+    let mut total = 0;
+    let argv: Vec<String> = argv
+        .iter()
+        .map(|arg| {
+            let arg = arg
+                .as_str()
+                .filter(|arg| !arg.contains('\0'))
+                .ok_or("通知命令参数无效")?;
+            total += arg.len();
+            if total > 4096 {
+                return Err("通知命令参数超过 4 KiB");
+            }
+            Ok(arg.to_owned())
+        })
+        .collect::<Result<_, _>>()?;
+    if argv[0].trim().is_empty() {
+        return Err("通知命令缺少可执行文件".into());
+    }
+    #[cfg(windows)]
+    if std::path::Path::new(&argv[0])
+        .extension()
+        .is_some_and(|ext| !ext.eq_ignore_ascii_case("exe"))
+    {
+        return Err("Windows 通知命令需要 .exe 可执行文件".into());
+    }
+    Ok(Some(argv))
+}
+
 fn read_settings(data_dir: &Path) -> Result<Value, String> {
-    match fs::read(data_dir.join("config.json")) {
-        Ok(bytes) => {
+    const MAX_SETTINGS_BYTES: usize = 64 * 1024;
+    match fs::File::open(data_dir.join("config.json")) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(MAX_SETTINGS_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("无法读取配置：{error}"))?;
+            if bytes.len() > MAX_SETTINGS_BYTES {
+                return Err("config.json 超过 64 KiB".into());
+            }
             let value: Value = serde_json::from_slice(&bytes)
                 .map_err(|_| "保存的配置无法读取，请检查 config.json".to_owned())?;
             if !value.is_object() {
@@ -375,6 +450,31 @@ fn create_private_dir(path: &PathBuf) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notification_config_parses_argv_and_lightweight_options_are_boolean() {
+        assert_eq!(
+            parse_notify_command(&json!(["example.exe", "an argument; $HOME"])).unwrap(),
+            Some(vec!["example.exe".into(), "an argument; $HOME".into()])
+        );
+        for bad in [
+            json!("echo shell syntax"),
+            json!([]),
+            json!([""]),
+            json!(["a", "x".repeat(4096)]),
+        ] {
+            assert!(parse_notify_command(&bad).is_err());
+        }
+        for name in ["disable_top_chats", "use_storage_optimizer"] {
+            let request = tdlib_boolean_option(name);
+            assert_eq!(request["@type"], "setOption");
+            assert_eq!(request["name"], name);
+            assert_eq!(
+                request["value"],
+                json!({"@type":"optionValueBoolean","value":true})
+            );
+        }
+    }
+
     #[test]
     fn application_credentials_skip_setup_without_mixing_overrides() {
         use super::resolve_credentials;
@@ -597,6 +697,10 @@ mod tests {
         let modern = config.tdlib_parameters(false).expect("modern parameters");
         let legacy = config.tdlib_parameters(true).expect("legacy parameters");
         assert_eq!(modern["api_id"], 123);
+        for parameters in [&modern, &legacy["parameters"]] {
+            assert_eq!(parameters["use_secret_chats"], false);
+            assert_eq!(parameters["enable_storage_optimizer"], true);
+        }
         assert_eq!(legacy["parameters"]["api_id"], 123);
         assert_eq!(legacy["parameters"]["@type"], "tdlibParameters");
         assert_eq!(modern["database_encryption_key"], STANDARD.encode("secret"));

@@ -50,17 +50,21 @@ pub fn osc52(value: &str, writer: &mut impl Write) -> Result<(), String> {
     let sequence = format!("\x1b]52;c;{encoded}\x07");
     // tmux must forward the control string to the outer terminal.
     if std::env::var_os("TMUX").is_some() {
-        write!(
-            writer,
-            "\x1bPtmux;{}\x1b\\",
-            sequence.replace('\x1b', "\x1b\x1b")
-        )
+        write_tmux_passthrough(writer, &sequence)
     } else {
         writer.write_all(sequence.as_bytes())
     }
     .and_then(|_| writer.flush())
     .map_err(|e| e.to_string())
 }
+pub fn write_tmux_passthrough(writer: &mut impl Write, sequence: &str) -> io::Result<()> {
+    write!(
+        writer,
+        "\x1bPtmux;{}\x1b\\",
+        sequence.replace('\x1b', "\x1b\x1b")
+    )
+}
+
 pub fn terminal_clipboard(value: &str) -> Result<(), String> {
     osc52(value, &mut io::stdout().lock())
 }

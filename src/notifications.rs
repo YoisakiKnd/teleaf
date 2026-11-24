@@ -1,6 +1,10 @@
 //! TDLib decides which messages notify; the UI never polls chats for alerts.
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{self, Write};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod transport;
+use transport::Backend;
 
 use serde_json::Value;
 
@@ -10,11 +14,15 @@ use crate::store::Store;
 enum Command {
     Show {
         group: i64,
+        chat: i64,
         title: String,
         body: String,
         silent: bool,
     },
-    Remove(i64),
+    Remove {
+        group: i64,
+        chat: i64,
+    },
     Clear,
 }
 
@@ -22,7 +30,11 @@ pub struct State {
     pub enabled: bool,
     started: i64,
     seen: VecDeque<(i64, i64)>,
-    displayed: VecDeque<(i64, i64)>,
+    displayed: VecDeque<(i64, i64, i64)>,
+    viewed: Option<i64>,
+    backend: Backend,
+    terminal_queue: VecDeque<Command>,
+    setup_error: Option<String>,
     worker: Option<std::sync::mpsc::SyncSender<Command>>,
     errors: Option<std::sync::mpsc::Receiver<String>>,
     account: String,
@@ -32,8 +44,22 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
+        let (backend, setup_error) = match Backend::detect() {
+            Ok(backend) => (backend, None),
+            Err(error) => (Backend::Off, Some(error)),
+        };
+        let enabled = backend != Backend::Off
+            && match std::env::var("TG_NOTIFICATIONS").as_deref() {
+                Ok("0") => false,
+                Ok("1") => true,
+                _ => backend.defaults_on(),
+            };
         Self {
-            enabled: default_enabled(),
+            enabled,
+            backend,
+            setup_error,
+            viewed: None,
+            terminal_queue: VecDeque::new(),
             started: timestamp(),
             seen: VecDeque::new(),
             displayed: VecDeque::new(),
@@ -63,19 +89,44 @@ impl State {
             })).collect()
     }
     pub fn toggle(&mut self) {
-        self.enabled = !self.enabled && supported();
+        self.enabled = !self.enabled && self.backend != Backend::Off;
         self.seen.clear();
-        self.displayed.clear();
         self.started = timestamp();
-        if self.worker.is_some() {
-            self.dispatch(Command::Clear);
+        if !self.enabled {
+            self.terminal_queue.clear();
+            if self.backend == Backend::Native && self.worker.is_some() {
+                self.dispatch(Command::Clear);
+            } else {
+                for (group, _, chat) in std::mem::take(&mut self.displayed) {
+                    self.dispatch(Command::Remove { group, chat });
+                }
+            }
+            self.displayed.clear();
+        }
+    }
+
+    pub fn set_viewed(&mut self, viewed: Option<i64>) {
+        if std::mem::replace(&mut self.viewed, viewed) == viewed {
+            return;
+        }
+        if let Some(chat) = viewed {
+            while let Some(index) = self.displayed.iter().position(|(_, _, id)| *id == chat) {
+                let (group, _, _) = self
+                    .displayed
+                    .remove(index)
+                    .expect("displayed notification");
+                self.dispatch(Command::Remove { group, chat });
+            }
         }
     }
 
     pub fn update(&mut self, update: &Value, store: &Store, ready: bool) {
         if ready {
-            if self.enabled && update["@type"] == "updateActiveNotifications" {
-                // Clear previous-run toasts instead of replaying the startup backlog.
+            if self.enabled
+                && self.backend == Backend::Native
+                && update["@type"] == "updateActiveNotifications"
+            {
+                // Clear previous-run native toasts instead of replaying the startup backlog.
                 self.dispatch(Command::Clear);
                 return;
             }
@@ -83,6 +134,19 @@ impl State {
                 self.dispatch(command);
             }
         }
+    }
+
+    pub fn write_pending(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        if let Backend::Terminal(terminal) = self.backend {
+            let mut wrote = false;
+            while let Some(command) = self.terminal_queue.pop_front() {
+                wrote |= terminal.write(writer, &command, &self.account)?;
+            }
+            if wrote {
+                writer.flush()?;
+            }
+        }
+        Ok(())
     }
 
     fn commands(&mut self, update: &Value, store: &Store, now: i64) -> Vec<Command> {
@@ -105,13 +169,13 @@ impl State {
             return vec![];
         };
         let mut commands = vec![];
-        if let Some((_, last)) = self.displayed.iter().find(|(id, _)| *id == group)
+        if let Some((_, last, _)) = self.displayed.iter().find(|(id, _, _)| *id == group)
             && update["removed_notification_ids"]
                 .as_array()
                 .is_some_and(|ids| ids.iter().any(|id| id.as_i64() == Some(*last)))
         {
-            self.displayed.retain(|(id, _)| *id != group);
-            commands.push(Command::Remove(group));
+            self.displayed.retain(|(id, _, _)| *id != group);
+            commands.push(Command::Remove { group, chat });
         }
         let is_mention = update["type"]["@type"].as_str() == Some("notificationGroupTypeMentions");
         let total_count = update["total_count"].as_i64().unwrap_or(0).max(0);
@@ -138,7 +202,11 @@ impl State {
                 self.seen.pop_front();
             }
             let date = notification["date"].as_i64().unwrap_or(0);
-            if latest.is_some() || date < self.started || now.saturating_sub(date) > 120 {
+            if self.viewed == Some(chat)
+                || latest.is_some()
+                || date < self.started
+                || now.saturating_sub(date) > 120
+            {
                 continue;
             }
             let notif_type = &notification["type"];
@@ -161,8 +229,11 @@ impl State {
             }
         }
         if let Some((id, is_silent, payload)) = latest {
-            self.displayed.retain(|(existing, _)| *existing != group);
-            self.displayed.push_back((group, id));
+            let by_chat = self.backend.replaces_by_chat();
+            self.displayed.retain(|(existing, _, existing_chat)| {
+                *existing != group && (!by_chat || *existing_chat != chat)
+            });
+            self.displayed.push_back((group, id, chat));
             while self.displayed.len() > 128 {
                 self.displayed.pop_front();
             }
@@ -210,6 +281,7 @@ impl State {
             };
             commands.push(Command::Show {
                 group,
+                chat,
                 title: clean(&title, 80),
                 body: clean(&body, 200),
                 silent: sound_id == 0 || is_silent,
@@ -220,6 +292,31 @@ impl State {
 
     fn dispatch(&mut self, command: Command) {
         use std::sync::mpsc::{self, TrySendError};
+        if self.backend == Backend::Off {
+            return;
+        }
+        if matches!(self.backend, Backend::Terminal(_)) {
+            let target = |command: &Command| match *command {
+                Command::Show { group, chat, .. } | Command::Remove { group, chat } => {
+                    Some((group, chat))
+                }
+                Command::Clear => None,
+            };
+            let pending = target(&command);
+            self.terminal_queue
+                .retain(|old| match (target(old), pending) {
+                    (Some((old_group, old_chat)), Some((group, chat))) => {
+                        old_group != group && old_chat != chat
+                    }
+                    (Some(_), None) | (None, None) => false,
+                    (None, Some(_)) => true,
+                });
+            if self.terminal_queue.len() == 16 {
+                self.terminal_queue.pop_front();
+            }
+            self.terminal_queue.push_back(command);
+            return;
+        }
         let command = if let Some(worker) = &self.worker {
             match worker.try_send(command) {
                 Ok(()) | Err(TrySendError::Full(_)) => return,
@@ -232,15 +329,35 @@ impl State {
         let (errors, error_receiver) = mpsc::sync_channel(1);
         let thread_errors = errors.clone();
         let account = self.account.clone();
+        let hook = if let Backend::Hook(argv) = &self.backend {
+            Some(argv.clone())
+        } else {
+            None
+        };
         #[cfg(target_os = "linux")]
         let history = self.history.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("teleaf-notifications".into())
             .spawn(move || {
-                #[cfg(target_os = "linux")]
-                let result = native::run(receiver, &account, &history);
-                #[cfg(not(target_os = "linux"))]
-                let result = native::run(receiver, &account);
+                let result = if let Some(argv) = hook {
+                    let mut result = Ok(());
+                    while let Ok(command) = receiver.recv_timeout(Duration::from_secs(30)) {
+                        result = transport::run_hook(&argv, &command, Duration::from_secs(2));
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    result
+                } else {
+                    #[cfg(target_os = "linux")]
+                    {
+                        native::run(receiver, &account, &history)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        native::run(receiver, &account)
+                    }
+                };
                 if let Err(error) = result {
                     let _ = thread_errors.try_send(format!("桌面通知不可用：{error}"));
                 }
@@ -256,6 +373,9 @@ impl State {
     }
 
     pub fn poll_error(&mut self) -> Option<String> {
+        if let Some(error) = self.setup_error.take() {
+            return Some(error);
+        }
         if let Some(error) = self
             .errors
             .as_ref()
@@ -277,40 +397,40 @@ fn timestamp() -> i64 {
 }
 
 pub const fn supported() -> bool {
-    cfg!(any(windows, target_os = "macos", target_os = "linux"))
+    true
 }
 
-fn default_enabled() -> bool {
-    default_for(
-        supported(),
-        std::env::var("TG_NOTIFICATIONS").ok().as_deref(),
-        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some(),
-        !cfg!(target_os = "linux")
-            || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
-            || std::env::var_os("DISPLAY").is_some()
-            || std::env::var_os("WAYLAND_DISPLAY").is_some(),
-    )
-}
-
-fn default_for(supported: bool, preference: Option<&str>, remote: bool, desktop: bool) -> bool {
-    supported && preference != Some("0") && (preference == Some("1") || (!remote && desktop))
-}
-
-pub fn test_notification() -> Result<(), String> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    sender
-        .send(Command::Show {
-            group: 1,
-            title: "Teleaf 通知测试".into(),
-            body: "桌面通知已连接。此测试不登录账号或发送消息。".into(),
-            silent: true,
-        })
-        .map_err(|e| e.to_string())?;
-    drop(sender);
-    #[cfg(target_os = "linux")]
-    return native::run(receiver, "teleaf-test", &Default::default());
-    #[cfg(not(target_os = "linux"))]
-    native::run(receiver, "teleaf-test")
+pub fn test_notification() -> Result<&'static str, String> {
+    let backend = Backend::detect()?;
+    let label = backend.label();
+    let command = Command::Show {
+        group: 1,
+        chat: 1,
+        title: "Teleaf 通知测试".into(),
+        body: "通知已连接。此测试无需登录。".into(),
+        silent: label != "Terminal BEL",
+    };
+    match backend {
+        Backend::Off => {}
+        Backend::Terminal(terminal) => {
+            let mut stdout = io::stdout().lock();
+            terminal
+                .write(&mut stdout, &command, "teleaf-test")
+                .and_then(|_| stdout.flush())
+                .map_err(|e| e.to_string())?;
+        }
+        Backend::Hook(argv) => transport::run_hook(&argv, &command, Duration::from_secs(2))?,
+        Backend::Native => {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            sender.send(command).map_err(|e| e.to_string())?;
+            drop(sender);
+            #[cfg(target_os = "linux")]
+            native::run(receiver, "teleaf-test", &Default::default())?;
+            #[cfg(not(target_os = "linux"))]
+            native::run(receiver, "teleaf-test")?;
+        }
+    }
+    Ok(label)
 }
 
 enum NotificationPayload<'a> {
@@ -613,10 +733,7 @@ mod native;
 #[cfg(target_os = "linux")]
 #[path = "notifications/linux.rs"]
 mod native;
-#[cfg(target_os = "macos")]
-#[path = "notifications/macos.rs"]
-mod native;
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "linux")))]
 mod native {
     pub(super) fn run(_: std::sync::mpsc::Receiver<super::Command>, _: &str) -> Result<(), String> {
         Err("这个平台暂不支持桌面通知".into())
@@ -629,13 +746,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn remote_headless_and_explicit_notification_preferences() {
-        assert!(default_for(true, None, false, true));
-        assert!(!default_for(true, None, true, true));
-        assert!(!default_for(true, None, false, false));
-        assert!(default_for(true, Some("1"), true, false));
-        assert!(!default_for(true, Some("0"), false, true));
-        assert!(!default_for(false, Some("1"), false, true));
+    fn state_starts_without_notification_worker() {
         let state = State::default();
         assert!(state.worker.is_none() && state.errors.is_none());
     }
@@ -658,11 +769,51 @@ mod tests {
     }
 
     #[test]
+    fn focused_chat_is_suppressed_and_withdrawn_on_refocus() {
+        let (mut state, store, mut update) = fixture();
+        // Keep this test independent of the desktop environment and external hooks.
+        state.backend = Backend::Terminal(transport::Terminal::test_osc99());
+        state.set_viewed(Some(7));
+        assert!(state.commands(&update, &store, 110).is_empty());
+        state.set_viewed(None);
+        assert!(
+            state.commands(&update, &store, 110).is_empty(),
+            "suppressed updates are deduplicated"
+        );
+        update["added_notifications"][0]["id"] = json!(2);
+        assert!(matches!(
+            &state.commands(&update, &store, 110)[..],
+            [Command::Show { chat: 7, .. }]
+        ));
+        update["chat_id"] = json!(8);
+        update["notification_group_id"] = json!(4);
+        assert!(matches!(
+            &state.commands(&update, &store, 110)[..],
+            [Command::Show { chat: 8, .. }]
+        ));
+        state.set_viewed(Some(7));
+        assert_eq!(state.displayed.len(), 1);
+        assert_eq!(state.displayed[0].2, 8);
+        let mut output = Vec::new();
+        state.write_pending(&mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .ends_with("-7:p=close;\x07")
+        );
+        update["added_notifications"][0]["id"] = json!(3);
+        assert!(matches!(
+            &state.commands(&update, &store, 110)[..],
+            [Command::Show { chat: 8, .. }]
+        ));
+    }
+
+    #[test]
     fn tdlib_notifications_deduplicate_and_withdraw_read_messages() {
         let (mut state, store, mut update) = fixture();
         let commands = state.commands(&update, &store, 110);
         assert!(
-            matches!(&commands[..], [Command::Show { group:3, title, body, silent:true }]
+            matches!(&commands[..], [Command::Show { group:3, title, body, silent:true, .. }]
             if title == "测试群" && body == "你好 <&>")
         );
         assert!(state.commands(&update, &store, 110).is_empty());
@@ -670,7 +821,7 @@ mod tests {
         update["added_notifications"] = json!([]);
         assert!(matches!(
             &state.commands(&update, &store, 110)[..],
-            [Command::Remove(3)]
+            [Command::Remove { group: 3, chat: 7 }]
         ));
         assert!(state.commands(&update, &store, 110).is_empty());
     }
@@ -811,7 +962,7 @@ mod tests {
         let cmds = state.commands(&update, &store, 110);
         assert!(matches!(
             &cmds[..],
-            [Command::Show { group: 10, title, body, silent: false }]
+            [Command::Show { group: 10, title, body, silent: false, .. }]
                 if title == "技术群 · #发布 · @提及（3 条新消息）" && body == "小林：答案是 ██！"
         ));
 
@@ -841,7 +992,7 @@ mod tests {
         let cmds = state.commands(&dm, &store, 110);
         assert!(matches!(
             &cmds[..],
-            [Command::Show { group: 11, title, body, silent: true }]
+            [Command::Show { group: 11, title, body, silent: true, .. }]
                 if title == "小林" && body == "晚安 明天见"
         ));
     }

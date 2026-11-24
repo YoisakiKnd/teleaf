@@ -2111,10 +2111,15 @@ fn album_captions(group: &[Message]) -> impl Iterator<Item = (&Message, &str)> {
                 .strip_prefix("[视频] ")
                 .unwrap_or(&message.text),
             Some(MediaKind::Document)
-                if message.info.media_meta.as_ref().is_some_and(|meta| {
-                    message.text.strip_prefix("[文件] ") == Some(meta.file_name.as_str())
-                        && message.info.entities.is_empty()
-                }) =>
+                if message
+                    .info
+                    .extras()
+                    .media_meta
+                    .as_ref()
+                    .is_some_and(|meta| {
+                        message.text.strip_prefix("[文件] ") == Some(meta.file_name.as_str())
+                            && message.info.extras().entities.is_empty()
+                    }) =>
             {
                 ""
             }
@@ -2136,7 +2141,7 @@ fn inline_media(message: &Message) -> Option<&MediaRef> {
 }
 
 fn has_media_card(message: &Message) -> bool {
-    message.info.media_meta.is_some()
+    message.info.extras().media_meta.is_some()
         && message.media.as_ref().is_some_and(|media| {
             matches!(
                 media.kind,
@@ -2157,6 +2162,7 @@ fn message_body_rows<'a>(
     let body_offset = message.text.len() - body.len();
     let blocks = message
         .info
+        .extras()
         .entities
         .iter()
         .filter(|entity| matches!(entity.kind, EntityKind::Pre(_) | EntityKind::BlockQuote));
@@ -2197,6 +2203,7 @@ fn message_body_height(message: &Message, body: &str, width: usize) -> usize {
         0
     } else if !message
         .info
+        .extras()
         .entities
         .iter()
         .any(|entity| matches!(entity.kind, EntityKind::Pre(_) | EntityKind::BlockQuote))
@@ -2274,7 +2281,7 @@ fn append_message_body(
                         row,
                         selection.clone(),
                         "  ",
-                        &message.info.entities,
+                        &message.info.extras().entities,
                         app.selected_message == Some(message.id),
                         search,
                     );
@@ -2520,8 +2527,8 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let base_height = |body_height| {
             body_height
                 + 2
-                + usize::from(message.info.reply.is_some())
-                + usize::from(message.info.forwarded_from.is_some())
+                + usize::from(message.info.extras().reply.is_some())
+                + usize::from(message.info.extras().forwarded_from.is_some())
                 + inline_media(message).map_or(0, |_| media_height)
         };
         let height = if group.len() > 1 {
@@ -2541,12 +2548,13 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let details = usize::from(has_media_card(message))
             + message
                 .info
+                .extras()
                 .link_preview
                 .as_ref()
                 .map_or(0, |lp| lp.row_count())
-            + message.info.inline_keyboard.len()
+            + message.info.extras().inline_keyboard.len()
             + usize::from(message.info.can_get_thread && app.active_thread.is_none())
-            + usize::from(!message.info.reactions.is_empty());
+            + usize::from(!message.info.extras().reactions.is_empty());
         let dividers = usize::from(date_headers.contains(&first.id))
             + usize::from(unread_row == Some(first.id));
         app.timeline_rows
@@ -2744,8 +2752,8 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 status_style,
             ));
             lines.push(Line::from(header_spans));
-            let forward_rows = usize::from(message.info.forwarded_from.is_some());
-            if let Some(origin) = &message.info.forwarded_from {
+            let forward_rows = usize::from(message.info.extras().forwarded_from.is_some());
+            if let Some(origin) = &message.info.extras().forwarded_from {
                 let name = app.store.forward_label(origin);
                 let label = format!("  ↳ 转发自 {}", name.replace(['\r', '\n'], " "));
                 lines.push(Line::styled(
@@ -2757,7 +2765,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     },
                 ));
             }
-            if let Some(reply) = &message.info.reply {
+            if let Some(reply) = &message.info.extras().reply {
                 let referenced = (Some(reply.chat_id) == app.store.active_chat)
                     .then(|| app.store.messages.iter().find(|m| m.id == reply.message_id))
                     .flatten();
@@ -2848,7 +2856,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             if inline.is_some() {
                 lines.blank(media_height);
             }
-            if let (Some(media), Some(meta)) = (&message.media, &message.info.media_meta)
+            if let (Some(media), Some(meta)) = (&message.media, &message.info.extras().media_meta)
                 && matches!(
                     media.kind,
                     MediaKind::Document | MediaKind::Video | MediaKind::Voice
@@ -2922,7 +2930,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     append_message_body(&mut lines, caption, body, app, area, &mut text_targets);
                 }
             }
-            if let Some(lp) = &message.info.link_preview {
+            if let Some(lp) = &message.info.extras().link_preview {
                 let lp_width = usize::from(width.saturating_sub(2));
                 let head = match (lp.site_name.is_empty(), lp.title.is_empty()) {
                     (false, false) => format!("{} · {}", lp.site_name, lp.title),
@@ -2994,6 +3002,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             }
             let kb_width = message
                 .info
+                .extras()
                 .inline_keyboard
                 .iter()
                 .map(|row| {
@@ -3017,7 +3026,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .unwrap_or(0)
                 .max(28.min(width))
                 .min(width);
-            for (r_idx, row) in message.info.inline_keyboard.iter().enumerate() {
+            for (r_idx, row) in message.info.extras().inline_keyboard.iter().enumerate() {
                 let mut spans = vec![Span::raw("  ")];
                 let mut x = area.x + 2;
                 let n = row.len().max(1) as u16;
@@ -3101,12 +3110,12 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     ),
                 ]));
             }
-            if !message.info.reactions.is_empty() {
+            if !message.info.extras().reactions.is_empty() {
                 let react_row = lines.next;
                 let mut r_spans = vec![Span::raw("  ")];
                 let mut rx = area.x + 2;
                 let max_x = area.x + 2 + width;
-                for (idx, r) in message.info.reactions.iter().enumerate() {
+                for (idx, r) in message.info.extras().reactions.iter().enumerate() {
                     let pill = format!(" {} {} ", r.emoji, r.count);
                     let pw = text_width(pill.as_str()) as u16;
                     if rx + pw > max_x {
@@ -3601,7 +3610,10 @@ fn media_view(frame: &mut Frame, app: &mut App, area: Rect, media: Option<MediaR
     let viewport = centered(area, 160, 60);
     let size = Size::new(viewport.width, viewport.height);
     let view = if preview {
-        app.preview_view
+        crate::media::View {
+            preview: true,
+            ..app.preview_view
+        }
     } else {
         crate::media::View::default()
     };
@@ -5651,7 +5663,7 @@ pub(crate) mod tests {
         use crate::store::{InlineButton, InlineButtonKind};
         let mut app = fixture();
         let name = "✏️ Other (type answer)";
-        app.store.messages[1].info.inline_keyboard = vec![
+        app.store.messages[1].info.extras_mut().inline_keyboard = vec![
             vec![InlineButton {
                 text: name.into(),
                 kind: InlineButtonKind::Callback("YQ==".into()),
@@ -5713,7 +5725,7 @@ pub(crate) mod tests {
         assert!(output.contains("… ↗"));
 
         // Short single-column keyboards stay compact on wide terminals instead of stretching 100+ cols.
-        app.store.messages[1].info.inline_keyboard = vec![
+        app.store.messages[1].info.extras_mut().inline_keyboard = vec![
             vec![InlineButton {
                 text: "1".into(),
                 kind: InlineButtonKind::Callback("MQ==".into()),
@@ -5793,7 +5805,7 @@ pub(crate) mod tests {
         let code = r#"let 中文 = "✏️";"#;
         let body = format!("{quote}\n{code}");
         app.store.messages[1].text = body;
-        app.store.messages[1].info.entities = vec![
+        app.store.messages[1].info.extras_mut().entities = vec![
             TextEntity {
                 start: 0,
                 end: quote.len(),
@@ -5928,7 +5940,7 @@ pub(crate) mod tests {
         let mut app = fixture();
         app.store.messages[0].info.stamp = crate::calendar::local(1700000000);
         app.store.messages[1].info.stamp = crate::calendar::local(1700000060);
-        app.store.messages[1].info.reply = Some(crate::store::Reply {
+        app.store.messages[1].info.extras_mut().reply = Some(crate::store::Reply {
             chat_id: 1,
             message_id: 1,
             excerpt: "引用内容".into(),
@@ -6613,7 +6625,7 @@ pub(crate) mod tests {
                             chat.mention_count = 1;
                             chat.last_stamp = crate::calendar::local(1700000060);
                         }
-                        app.store.messages[0].info.reactions = vec![
+                        app.store.messages[0].info.extras_mut().reactions = vec![
                             crate::store::Reaction {
                                 emoji: "👍".into(),
                                 custom_emoji_id: None,
@@ -6627,11 +6639,12 @@ pub(crate) mod tests {
                                 chosen: false,
                             },
                         ];
-                        app.store.messages[0].info.entities = vec![crate::store::TextEntity {
-                            start: 0,
-                            end: "我们".len(),
-                            kind: crate::store::EntityKind::Bold,
-                        }];
+                        app.store.messages[0].info.extras_mut().entities =
+                            vec![crate::store::TextEntity {
+                                start: 0,
+                                end: "我们".len(),
+                                kind: crate::store::EntityKind::Bold,
+                            }];
                     }
                     "inline-images" => {
                         for (index, message) in app.store.messages.iter_mut().enumerate() {
@@ -6817,7 +6830,7 @@ pub(crate) mod tests {
     fn small_sticker_cursor_quote_ellipsis_and_mouse_off_badge_render() {
         let mut app = fixture();
         app.mouse_enabled = false;
-        app.store.messages[1].info.reply = Some(crate::store::Reply {
+        app.store.messages[1].info.extras_mut().reply = Some(crate::store::Reply {
             chat_id: 1,
             message_id: 1,
             excerpt: "这是一段非常非常长的被引用消息内容用于验证末尾省略号不会被裁切掉".into(),
@@ -6920,13 +6933,13 @@ pub(crate) mod tests {
         app.show_chat_info = false;
 
         // Pinned banner, unread divider, reactions, media progress card, spoiler & dynamic composer.
-        app.store.messages[0].info.reactions = vec![crate::store::Reaction {
+        app.store.messages[0].info.extras_mut().reactions = vec![crate::store::Reaction {
             emoji: "👍".into(),
             custom_emoji_id: None,
             count: 4,
             chosen: true,
         }];
-        app.store.messages[0].info.entities = vec![crate::store::TextEntity {
+        app.store.messages[0].info.extras_mut().entities = vec![crate::store::TextEntity {
             start: 0,
             end: "我们".len(),
             kind: crate::store::EntityKind::Spoiler,
@@ -6938,7 +6951,7 @@ pub(crate) mod tests {
             kind: MediaKind::Document,
             detail: None,
         });
-        app.store.messages[1].info.media_meta = Some(crate::store::MediaMeta {
+        app.store.messages[1].info.extras_mut().media_meta = Some(crate::store::MediaMeta {
             file_name: "design.pdf".into(),
             size_bytes: 2 * 1024 * 1024,
             downloaded_bytes: 1024 * 1024,
@@ -7014,14 +7027,14 @@ pub(crate) mod tests {
         // 2. Link preview, inline keyboard, comment pill & album grouping.
         app.store.messages[0].info.media_album_id = 999;
         app.store.messages[1].info.media_album_id = 999;
-        app.store.messages[0].info.link_preview = Some(crate::store::LinkPreview {
+        app.store.messages[0].info.extras_mut().link_preview = Some(crate::store::LinkPreview {
             instant_view_version: 0,
             site_name: "GitHub".into(),
             title: "Teleaf Repo".into(),
             description: "终端客户端仓库".into(),
             url: "https://github.com/YoisakiKnd/teleaf".into(),
         });
-        app.store.messages[0].info.inline_keyboard = vec![vec![
+        app.store.messages[0].info.extras_mut().inline_keyboard = vec![vec![
             crate::store::InlineButton {
                 text: "官网".into(),
                 kind: crate::store::InlineButtonKind::Url("https://telegram.org".into()),

@@ -1,5 +1,11 @@
 # 更新记录
 
+## 0.3.2 · 2026-11-24
+
+- 重构跨平台通知架构并彻底移除 macOS `Teleaf Notifications.app` 与 Swift 助手编译/打包链路：macOS 与 Linux 支持终端原生 OSC 协议（Kitty 走 `OSC 99` 含按会话替换与已读关闭、Ghostty / WezTerm / Foot / VTE 走 `OSC 777`、iTerm2 走 `OSC 9`），支持 `tmux` / `screen` DCS 透传与严格控制字符清洗；Windows 默认保留原生 WinRT Toast，Linux 非 OSC 终端保留纯 Rust 直连 D-Bus，macOS 非 OSC 终端退化为终端 BEL；新增终端焦点感知（`FocusGained` / `FocusLost`，活跃会话聚焦自动抑制与重聚焦撤回、空闲零重绘）、`TG_NOTIFY_BACKEND` 覆盖及安全 stdin JSON 外部命令钩子（`notify_command` / `TG_NOTIFY_CMD`）。
+- 降低内存占用与峰值：关闭未使用的 `use_secret_chats`，新版与旧版 TDLib 均启用 `enable_storage_optimizer` / `use_storage_optimizer` 与 `disable_top_chats`；将 `MessageInfo` 低频字段装箱为 `Option<Box<MessageExtras>>`（`size_of::<Message>()` 从 504 字节降至 224 字节，`MessageInfo` 从 360 字节降至 80 字节）并在关闭搜索/快速切换器后缩容；8 位 RGB / 灰度图片保持紧凑像素格式，关闭大图预览立即释放解码与编码缓存，切换会话及空闲 60 秒按视口回收离屏编码帧。
+- 修复 UI 渲染与排版细节：将底栏 `layout[2]`、置顶横幅、快捷回应条、链接选择器与话题列表切至 `draw_line` + `ForcedWidth`，彻底修复 `✏️` 等 VS16 Emoji 在最底行触发终端上滚导致的输入框覆盖与消息残影问题；常规终端输入框默认恢复 2 行输入区（总高 5 行，多行最多展开至 8 行）；为堆叠 Bot 内联按钮添加柔和边框色 `[ ... ]` 边界区分；将 `↓ 回到底部` 与 `返回引用前位置` 改为贴右下角的紧凑浮标，避免遮挡左侧正文。
+
 ## 0.3.1 · 2026-11-24
 
 - 重构 Bot 内联键盘渲染与 Emoji/VS16 宽字符排版：去掉冗余方括号，按键盘最宽行自适应网格宽度并均匀对齐按钮，不再硬编码 20 列截断且宽屏下不无谓拉满整栏；通过 `draw_line` 与 `CellDiffOption::ForcedWidth` 修正 `✏️` 等带 `U+FE0F` 宽字符导致的背景色断层与点击热区偏移，并新增 `B` 键 / 消息菜单触发的 `Bot 按钮` 键盘选择器。

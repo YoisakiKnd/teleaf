@@ -28,6 +28,7 @@ def click(x,y): return send(f'\x1b[<0;{x+1};{y+1}M\x1b[<0;{x+1};{y+1}m'.encode()
 try:
     first = read(1.5)
     assert 'API ID'.encode() in first, repr(first[:1500])
+    assert b'\x1b[?1004h' in first, 'focus reporting was not enabled'
     click(10,11)
     typed = send(b'\x1b[200~mouse-secret\x1b[201~')
     assert '•'.encode() in typed and b'mouse-secret' not in output
@@ -50,13 +51,17 @@ try:
     # Movement reports produce no writes/redraws.
     movement = send(b'\x1b[<35;10;15M' * 100)
     assert not movement, f'movement caused output: {len(movement)} bytes'
+    for event in (b'\x1b[O', b'\x1b[I'):
+        focus = send(event)
+        assert not focus, f'focus event caused output: {len(focus)} bytes'
     idle = read(.5)
     assert not idle, f'idle caused output: {len(idle)} bytes'
     send(b'\x03')
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
     assert b'Client.cpp' not in output
-    print('PTY mouse smoke: PASS (API field focus, masked paste, validation button, settings, capture toggle/F6, close, motion and idle with zero output, clean exit)')
+    assert b'\x1b[?1004l' in output, 'focus reporting was not restored'
+    print('PTY mouse smoke: PASS (API field focus, masked paste, validation button, settings, capture toggle/F6, close, focus, motion and idle with zero output, clean exit)')
 finally:
     try: os.kill(pid, signal.SIGTERM)
     except ProcessLookupError: pass

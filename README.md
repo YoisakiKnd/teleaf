@@ -36,7 +36,7 @@ teleaf
 
 在 [Releases](https://github.com/YoisakiKnd/teleaf/releases/latest) 下载对应系统和架构的压缩包，按同页 `SHA256SUMS` 校验后解压，运行 `teleaf` / `teleaf.exe`。
 
-请保留完整解压目录，包括 `tdlib/` 和 macOS 的 `Teleaf Notifications.app`。发行包已附带所需运行库，无需自己编译 TDLib 或安装 Rust、Python。
+请保留完整解压目录，包括 `tdlib/`。发行包已附带所需运行库，无需自己编译 TDLib 或安装 Rust、Python。
 
 | 系统 | 预编译包 |
 | --- | --- |
@@ -99,13 +99,12 @@ PowerShell：先运行 `$env:TG_IMAGE_PROTOCOL="halfblocks"`，再运行 `teleaf
 
 ### 桌面通知
 
-macOS 首次显示提醒时需要允许 **Teleaf Notifications** 的系统通知权限；Linux 需要本地桌面通知服务；Windows 使用原生通知中心。可在 F4 设置页切换 **桌面通知**。
-
+Windows 默认使用 WinRT 桌面通知。其他平台优先使用终端 OSC，Linux 可回退到 D-Bus，也可使用终端铃声。可在 F4 设置页切换 **桌面通知**。
 ```sh
 teleaf --test-notification
 ```
 
-此命令无需登录，发送一条静音测试通知。SSH 和无桌面的 Linux 默认关闭提醒，通知也不会转发到 SSH 客户端。权限、勿扰模式及关闭方法见 [通知配置](docs/CONFIGURATION.md#桌面消息通知)。
+此命令无需登录，发送一条样例并显示所选通道。SSH 可通过客户端终端接收 OSC 通知。环境覆盖、焦点行为和自定义命令见 [通知配置](docs/CONFIGURATION.md#桌面消息通知)。
 
 ## 升级与排查
 

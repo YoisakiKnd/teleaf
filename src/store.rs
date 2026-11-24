@@ -237,17 +237,63 @@ pub struct MessageInfo {
     pub edited: bool,
     pub pinned: bool,
     pub sending: Sending,
+    pub media_album_id: i64,
+    pub thread_id: i64,
+    pub reply_count: u32,
+    pub can_get_thread: bool,
+    extras: Option<Box<MessageExtras>>,
+}
+
+#[derive(Clone, Default)]
+pub struct MessageExtras {
     pub reply: Option<Reply>,
     pub forwarded_from: Option<ForwardOrigin>,
     pub reactions: Vec<Reaction>,
     pub entities: Vec<TextEntity>,
     pub media_meta: Option<MediaMeta>,
-    pub media_album_id: i64,
-    pub thread_id: i64,
-    pub reply_count: u32,
-    pub can_get_thread: bool,
     pub link_preview: Option<LinkPreview>,
     pub inline_keyboard: Vec<Vec<InlineButton>>,
+}
+
+impl MessageExtras {
+    fn boxed(self) -> Option<Box<Self>> {
+        (!self.is_empty()).then(|| Box::new(self))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.reply.is_none()
+            && self.forwarded_from.is_none()
+            && self.reactions.is_empty()
+            && self.entities.is_empty()
+            && self.media_meta.is_none()
+            && self.link_preview.is_none()
+            && self.inline_keyboard.is_empty()
+    }
+}
+
+impl MessageInfo {
+    pub fn extras(&self) -> &MessageExtras {
+        static EMPTY: MessageExtras = MessageExtras {
+            reply: None,
+            forwarded_from: None,
+            reactions: Vec::new(),
+            entities: Vec::new(),
+            media_meta: None,
+            link_preview: None,
+            inline_keyboard: Vec::new(),
+        };
+        self.extras.as_deref().unwrap_or(&EMPTY)
+    }
+
+    pub fn extras_mut(&mut self) -> &mut MessageExtras {
+        self.extras.get_or_insert_with(Box::default)
+    }
+
+    pub fn prune_extras(&mut self) {
+        if self.extras.as_ref().is_some_and(|extras| extras.is_empty()) {
+            self.extras = None;
+        }
+    }
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -377,15 +423,16 @@ pub fn album_range(messages: &[Message], index: usize) -> std::ops::Range<usize>
 
 impl Message {
     pub fn retained_bytes(&self) -> usize {
+        let extras = self.info.extras();
         std::mem::size_of::<Self>()
+            + usize::from(self.info.extras.is_some()) * std::mem::size_of::<MessageExtras>()
             + self.text.capacity()
             + self.author_signature.capacity()
-            + match &self.info.forwarded_from {
+            + match &extras.forwarded_from {
                 Some(ForwardOrigin::Hidden(name)) => name.capacity(),
                 _ => 0,
             }
-            + self
-                .info
+            + extras
                 .reply
                 .as_ref()
                 .map_or(0, |reply| reply.excerpt.capacity())
@@ -401,16 +448,14 @@ impl Message {
                         .and_then(|file| file.path.as_ref())
                         .map_or(0, String::capacity)
             })
-            + self.info.reactions.capacity() * std::mem::size_of::<Reaction>()
-            + self
-                .info
+            + extras.reactions.capacity() * std::mem::size_of::<Reaction>()
+            + extras
                 .reactions
                 .iter()
                 .map(|r| r.emoji.capacity())
                 .sum::<usize>()
-            + self.info.entities.capacity() * std::mem::size_of::<TextEntity>()
-            + self
-                .info
+            + extras.entities.capacity() * std::mem::size_of::<TextEntity>()
+            + extras
                 .entities
                 .iter()
                 .map(|e| match &e.kind {
@@ -418,20 +463,18 @@ impl Message {
                     _ => 0,
                 })
                 .sum::<usize>()
-            + self
-                .info
+            + extras
                 .media_meta
                 .as_ref()
                 .map_or(0, |meta| meta.file_name.capacity())
-            + self.info.link_preview.as_ref().map_or(0, |lp| {
+            + extras.link_preview.as_ref().map_or(0, |lp| {
                 lp.site_name.capacity()
                     + lp.title.capacity()
                     + lp.description.capacity()
                     + lp.url.capacity()
             })
-            + self.info.inline_keyboard.capacity() * std::mem::size_of::<Vec<InlineButton>>()
-            + self
-                .info
+            + extras.inline_keyboard.capacity() * std::mem::size_of::<Vec<InlineButton>>()
+            + extras
                 .inline_keyboard
                 .iter()
                 .map(|row| {
@@ -456,6 +499,7 @@ impl Message {
 
     pub fn inline_buttons(&self) -> impl Iterator<Item = (usize, usize, &InlineButton)> {
         self.info
+            .extras()
             .inline_keyboard
             .iter()
             .enumerate()
@@ -474,7 +518,7 @@ impl Message {
                 items.push(item);
             }
         };
-        let preview = self.info.link_preview.as_ref();
+        let preview = self.info.extras().link_preview.as_ref();
         let add_url = |url: &str, push: &mut dyn FnMut(LinkItem)| {
             if crate::text::is_telegraph(url)
                 || preview.is_some_and(|lp| lp.url == url && lp.has_instant_view())
@@ -483,7 +527,7 @@ impl Message {
             }
             push(LinkItem::Url(url.to_owned()));
         };
-        for entity in &self.info.entities {
+        for entity in &self.info.extras().entities {
             match &entity.kind {
                 EntityKind::TextUrl(url) if !url.is_empty() => add_url(url, &mut push),
                 EntityKind::Url => {
@@ -908,7 +952,7 @@ impl Store {
                     .iter()
                     .chain(&self.search_results)
                     .any(|message| message.sender == Some(*sender)
-                        || matches!(message.info.forwarded_from, Some(ForwardOrigin::Sender(origin)) if origin == *sender))
+                        || matches!(message.info.extras().forwarded_from, Some(ForwardOrigin::Sender(origin)) if origin == *sender))
                     || self.active_chat.map(Sender::Chat) == Some(*sender)
                     || self.chat_actions.iter().any(|action| action.sender == *sender)
             });
@@ -932,7 +976,7 @@ impl Store {
                     .chain(&self.search_results)
                     .flat_map(|message| {
                         let sender = message.sender.filter(|_| !message.outgoing);
-                        let origin = match message.info.forwarded_from {
+                        let origin = match message.info.extras().forwarded_from {
                             Some(ForwardOrigin::Sender(sender)) => Some(sender),
                             _ => None,
                         };
@@ -994,14 +1038,14 @@ impl Store {
                 .iter()
                 .chain(&self.search_results)
                 .any(|message| message.sender == Some(sender)
-                    || matches!(message.info.forwarded_from, Some(ForwardOrigin::Sender(origin)) if origin == sender))
+                    || matches!(message.info.extras().forwarded_from, Some(ForwardOrigin::Sender(origin)) if origin == sender))
                 || self.active_chat.map(Sender::Chat) == Some(sender))
     }
 
     pub fn open(&mut self, id: i64) {
         if self.active_chat != Some(id) {
             if let Some(chat) = self.active_chat.and_then(|id| self.chats.get_mut(&id)) {
-                chat.topics.clear();
+                chat.topics = Vec::new();
             }
             self.set_message_scope(None);
             self.active_chat = Some(id);
@@ -1014,8 +1058,8 @@ impl Store {
             chat.active_topic = None;
         }
         self.message_scope = scope;
-        self.messages.clear();
-        self.search_results.clear();
+        self.messages = Vec::new();
+        self.search_results = Vec::new();
         self.history_exhausted = false;
         self.context_window = false;
     }
@@ -1532,7 +1576,10 @@ impl Store {
                         .chain(&mut self.search_results)
                         .filter(|m| m.id == id)
                     {
-                        message.info.reactions = reactions.clone();
+                        if !reactions.is_empty() || message.info.extras.is_some() {
+                            message.info.extras_mut().reactions = reactions.clone();
+                            message.info.prune_extras();
+                        }
                         if reply_count > 0
                             || update.pointer("/interaction_info/reply_info").is_some()
                         {
@@ -1609,7 +1656,11 @@ impl Store {
                         if update_kind == "updateMessageEdited" {
                             message.info.edited = integer(update.get("edit_date")) > 0;
                             if let Some(markup) = update.get("reply_markup") {
-                                message.info.inline_keyboard = parse_inline_keyboard(Some(markup));
+                                let keyboard = parse_inline_keyboard(Some(markup));
+                                if !keyboard.is_empty() || message.info.extras.is_some() {
+                                    message.info.extras_mut().inline_keyboard = keyboard;
+                                    message.info.prune_extras();
+                                }
                             }
                         } else {
                             message.info.pinned = update["is_pinned"] == true;
@@ -1670,9 +1721,20 @@ impl Store {
                         let new_content = update.get("new_content");
                         message.text = content_text(new_content);
                         message.info.text_message = kind(&update["new_content"]) == "messageText";
-                        message.info.entities = parse_entities(new_content, &message.text);
-                        message.info.link_preview = new_content.and_then(parse_link_preview);
-                        message.info.media_meta = new_content.and_then(parse_media_meta);
+                        let entities = parse_entities(new_content, &message.text);
+                        let link_preview = new_content.and_then(parse_link_preview);
+                        let media_meta = new_content.and_then(parse_media_meta);
+                        if !entities.is_empty()
+                            || link_preview.is_some()
+                            || media_meta.is_some()
+                            || message.info.extras.is_some()
+                        {
+                            let extras = message.info.extras_mut();
+                            extras.entities = entities;
+                            extras.link_preview = link_preview;
+                            extras.media_meta = media_meta;
+                            message.info.prune_extras();
+                        }
                         message.media = new_content.and_then(media_ref);
                     }
                     trim_messages(&mut self.messages, 6 * 1024 * 1024, false);
@@ -1987,7 +2049,11 @@ impl Store {
                 .media
                 .as_ref()
                 .is_some_and(|media| media.file_id == id)
-                && let Some(meta) = &mut message.info.media_meta
+                && let Some(meta) = message
+                    .info
+                    .extras
+                    .as_deref_mut()
+                    .and_then(|extras| extras.media_meta.as_mut())
             {
                 meta.downloading = downloading;
             }
@@ -2016,7 +2082,11 @@ impl Store {
                         media.path = path.clone();
                         changed = true;
                     }
-                    if let Some(meta) = &mut message.info.media_meta
+                    if let Some(meta) = message
+                        .info
+                        .extras
+                        .as_deref_mut()
+                        .and_then(|extras| extras.media_meta.as_mut())
                         && (meta.downloaded_bytes != downloaded
                             || meta.downloading != downloading
                             || (size > 0 && meta.size_bytes != size))
@@ -2142,36 +2212,39 @@ fn parse_message(value: &Value) -> Option<Message> {
                 },
                 _ => Sending::Sent,
             },
-            forwarded_from: parse_forward_origin(&value["forward_info"]["origin"]),
-            reply: value
-                .get("reply_to")
-                .filter(|reply| kind(reply) == "messageReplyToMessage")
-                .map(|reply| Reply {
-                    chat_id: reply["chat_id"]
-                        .as_i64()
-                        .filter(|id| *id != 0)
-                        .unwrap_or(integer(value.get("chat_id"))),
-                    message_id: integer(reply.get("message_id")),
-                    excerpt: reply
-                        .pointer("/quote/text/text")
-                        .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
-                        .map(|text| bounded_text(Some(text), 256))
-                        .unwrap_or_else(|| {
-                            content_text(reply.get("content"))
-                                .chars()
-                                .take(256)
-                                .collect()
-                        }),
-                }),
-            reactions,
-            entities,
-            media_meta,
             media_album_id,
             thread_id,
             reply_count,
             can_get_thread,
-            link_preview,
-            inline_keyboard,
+            extras: MessageExtras {
+                forwarded_from: parse_forward_origin(&value["forward_info"]["origin"]),
+                reply: value
+                    .get("reply_to")
+                    .filter(|reply| kind(reply) == "messageReplyToMessage")
+                    .map(|reply| Reply {
+                        chat_id: reply["chat_id"]
+                            .as_i64()
+                            .filter(|id| *id != 0)
+                            .unwrap_or(integer(value.get("chat_id"))),
+                        message_id: integer(reply.get("message_id")),
+                        excerpt: reply
+                            .pointer("/quote/text/text")
+                            .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                            .map(|text| bounded_text(Some(text), 256))
+                            .unwrap_or_else(|| {
+                                content_text(reply.get("content"))
+                                    .chars()
+                                    .take(256)
+                                    .collect()
+                            }),
+                    }),
+                reactions,
+                entities,
+                media_meta,
+                link_preview,
+                inline_keyboard,
+            }
+            .boxed(),
         },
     })
 }
@@ -2607,6 +2680,44 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn message_size_budget() {
+        let size = std::mem::size_of::<Message>();
+        eprintln!(
+            "Message={size} MessageInfo={}",
+            std::mem::size_of::<MessageInfo>()
+        );
+        assert!(
+            size <= 256,
+            "ordinary messages must stay within 256 bytes, got {size}"
+        );
+        let mut message =
+            parse_message(&json!({"id":9,"content":{"@type":"messageText","text":{"text":"hi"}}}))
+                .unwrap();
+        assert!(message.info.extras.is_none());
+        let plain = message.retained_bytes();
+        message.info.extras_mut().reply = Some(Reply {
+            chat_id: 1,
+            message_id: 2,
+            excerpt: "quote".into(),
+        });
+        let excerpt_bytes = message
+            .info
+            .extras()
+            .reply
+            .as_ref()
+            .unwrap()
+            .excerpt
+            .capacity();
+        assert_eq!(
+            message.retained_bytes(),
+            plain + std::mem::size_of::<MessageExtras>() + excerpt_bytes
+        );
+        message.info.extras_mut().reply = None;
+        message.info.prune_extras();
+        assert_eq!(message.retained_bytes(), plain);
+    }
+
+    #[test]
     fn media_captions_use_utf16_offsets_after_the_display_prefix() {
         for content_type in [
             "messagePhoto",
@@ -2626,8 +2737,8 @@ mod tests {
             }}});
             let message = parse_message(&value).unwrap();
             assert!(message.text.ends_with("中😀 ✏️ 文"));
-            assert_eq!(message.info.entities.len(), 1);
-            let entity = &message.info.entities[0];
+            assert_eq!(message.info.extras().entities.len(), 1);
+            let entity = &message.info.extras().entities[0];
             assert_eq!(&message.text[entity.start..entity.end], "✏️");
             assert_eq!(entity.kind, EntityKind::Underline);
         }
@@ -2661,9 +2772,10 @@ mod tests {
         assert_eq!(
             message
                 .info
+                .extras()
                 .entities
-                .into_iter()
-                .map(|entity| entity.kind)
+                .iter()
+                .map(|entity| entity.kind.clone())
                 .collect::<Vec<_>>(),
             types.map(|(_, kind)| kind)
         );
@@ -2692,7 +2804,7 @@ mod tests {
         .unwrap();
         assert_eq!(preview.instant_view_version, 2);
         assert!(preview.has_instant_view());
-        message.info.link_preview = Some(preview);
+        message.info.extras_mut().link_preview = Some(preview);
         assert_eq!(
             message.links_and_mentions()[2],
             LinkItem::InstantView("https://example.org/article".into())
@@ -2714,13 +2826,13 @@ mod tests {
                 {"text":"✏️ Other","type":{"@type":"inlineKeyboardButtonTypeCallback","data":"YQ=="}}
             ]]}}));
         assert_eq!(
-            store.messages[0].info.inline_keyboard[0][0].text,
+            store.messages[0].info.extras().inline_keyboard[0][0].text,
             "✏️ Other"
         );
         store.apply(
             &json!({"@type":"updateMessageEdited","chat_id":1,"message_id":5,"reply_markup":null}),
         );
-        assert!(store.messages[0].info.inline_keyboard.is_empty());
+        assert!(store.messages[0].info.extras().inline_keyboard.is_empty());
     }
 
     #[test]
@@ -2743,13 +2855,20 @@ mod tests {
         }
         store.apply(&json!({"@type":"updateUser","user":{"id":12,"first_name":"小林"}}));
         let label = |index: usize| {
-            store.forward_label(store.messages[index].info.forwarded_from.as_ref().unwrap())
+            store.forward_label(
+                store.messages[index]
+                    .info
+                    .extras()
+                    .forwarded_from
+                    .as_ref()
+                    .unwrap(),
+            )
         };
         assert_eq!(label(0), "小林");
         assert_eq!(label(3).chars().count(), 80);
         let message = &store.messages[3];
         let mut without_origin = message.clone();
-        without_origin.info.forwarded_from = None;
+        without_origin.info.extras_mut().forwarded_from = None;
         assert!(message.retained_bytes() >= without_origin.retained_bytes() + 80 * 3);
     }
 
@@ -2881,7 +3000,15 @@ mod tests {
                 .sum::<usize>()
                 <= 6 * 1024 * 1024
         );
-        let reply = store.messages.last().unwrap().info.reply.as_ref().unwrap();
+        let reply = store
+            .messages
+            .last()
+            .unwrap()
+            .info
+            .extras()
+            .reply
+            .as_ref()
+            .unwrap();
         assert_eq!(reply.chat_id, 1);
         assert_eq!(reply.excerpt.chars().count(), 256);
         assert!(reply.excerpt.len() <= 1024);

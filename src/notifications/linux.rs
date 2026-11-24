@@ -86,6 +86,7 @@ fn run_connected(
                 title,
                 body,
                 silent,
+                ..
             } => {
                 let previous = history
                     .ids
@@ -123,7 +124,7 @@ fn run_connected(
                     }
                 }
             }
-            Command::Remove(group) => {
+            Command::Remove { group, .. } => {
                 if let Some((_, id)) = history.ids.iter().find(|(existing, _)| *existing == group) {
                     close(&proxy, *id)?;
                 }
@@ -247,13 +248,14 @@ mod tests {
                 sender
                     .send(Command::Show {
                         group: 7,
+                        chat: 7,
                         title: "群 <&>".into(),
                         body: "<b>&你好</b>".into(),
                         silent: true,
                     })
                     .unwrap();
             } else if phase == 2 {
-                sender.send(Command::Remove(7)).unwrap();
+                sender.send(Command::Remove { group: 7, chat: 7 }).unwrap();
             } else {
                 sender.send(Command::Clear).unwrap();
             }
@@ -294,6 +296,7 @@ mod tests {
         sender
             .send(Command::Show {
                 group: 7,
+                chat: 7,
                 title: "新服务".into(),
                 body: "纯文字".into(),
                 silent: false,

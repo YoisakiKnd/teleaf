@@ -295,6 +295,7 @@ pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), Stri
                 title,
                 body,
                 silent,
+                ..
             } => (
                 "发送 Windows 通知",
                 (|| {
@@ -307,7 +308,7 @@ pub(super) fn run(receiver: Receiver<Command>, account: &str) -> Result<(), Stri
                     notifier.Show(&toast)
                 })(),
             ),
-            Command::Remove(group) => (
+            Command::Remove { group, .. } => (
                 "撤回 Windows 通知",
                 factories.history().and_then(|history| {
                     missing_history_is_ok(history.RemoveGroupedTagWithId(

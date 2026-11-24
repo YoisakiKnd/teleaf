@@ -286,7 +286,7 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
         }
         Action::QuickSwitch => {
             if app.quick_switcher.is_some() {
-                app.quick_switcher = None;
+                app.close_quick_switcher();
             } else {
                 app.close_overlays();
                 app.reset_quick_search();
@@ -478,7 +478,7 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
             }
         }
         Action::ClearSearch => {
-            app.show_search = false;
+            app.clear_message_search();
             app.timeline_heights.clear();
             app.timeline_anchor = None;
             app.selection = None;
@@ -554,6 +554,7 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                         app.large_file_pending(media.file_id)
                             || msg
                                 .info
+                                .extras()
                                 .media_meta
                                 .as_ref()
                                 .is_some_and(|meta| meta.downloading),
@@ -1442,7 +1443,7 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                 .active_messages()
                 .iter()
                 .find(|message| message.id == id)
-                .and_then(|message| message.info.link_preview.as_ref());
+                .and_then(|message| message.info.extras().link_preview.as_ref());
             match (target, link) {
                 (Target::PreviewLink(_), Some(link)) => open_message_url(app, &link.url.clone()),
                 (Target::InstantViewLink(_), Some(link)) if link.has_instant_view() => {
@@ -1488,7 +1489,7 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                 .active_messages()
                 .iter()
                 .filter(|message| {
-                    message.info.reply.as_ref().is_some_and(|reply| {
+                    message.info.extras().reply.as_ref().is_some_and(|reply| {
                         Some(reply.chat_id) == app.store.active_chat && reply.message_id == id
                     })
                 })
@@ -1522,7 +1523,7 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
         }
         Target::GlobalSearchHit(chat, message) => app.open_global_hit(worker, chat, message),
         Target::QuickSwitchChat(id) => {
-            app.quick_switcher = None;
+            app.close_quick_switcher();
             app.selected_chat = Some(id);
             for request in app.open_selected() {
                 send_request(app, worker, request);
@@ -1547,7 +1548,7 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                 .active_messages()
                 .iter()
                 .find(|m| m.id == message_id)
-                .and_then(|m| m.info.reactions.get(index))
+                .and_then(|m| m.info.extras().reactions.get(index))
                 .map(|r| (r.emoji.clone(), r.custom_emoji_id, r.chosen));
             if let (Some(chat_id), Some((emoji, custom_id, chosen))) = (app.store.active_chat, info)
             {
@@ -1570,7 +1571,7 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                         .chain(&mut app.store.search_results)
                         .filter(|m| m.id == message_id)
                     {
-                        if let Some(r) = message.info.reactions.get_mut(index) {
+                        if let Some(r) = message.info.extras_mut().reactions.get_mut(index) {
                             if r.chosen {
                                 r.chosen = false;
                                 r.count = r.count.saturating_sub(1);
@@ -1579,7 +1580,8 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                                 r.count = r.count.saturating_add(1);
                             }
                         }
-                        message.info.reactions.retain(|r| r.count > 0);
+                        message.info.extras_mut().reactions.retain(|r| r.count > 0);
+                        message.info.prune_extras();
                     }
                     app.timeline_heights.remove(&message_id);
                 }
@@ -1692,7 +1694,7 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                 .active_messages()
                 .iter()
                 .find(|m| m.id == message_id)
-                .and_then(|m| m.info.inline_keyboard.get(row))
+                .and_then(|m| m.info.extras().inline_keyboard.get(row))
                 .and_then(|r| r.get(col))
                 .cloned();
             let Some(button) = button else {
@@ -1850,7 +1852,7 @@ mod tests {
         use crate::store::{InlineButton, InlineButtonKind};
         let mut app = ui::tests::fixture();
         let (worker, requests) = TdWorker::test_pair();
-        app.store.messages[1].info.inline_keyboard = vec![vec![
+        app.store.messages[1].info.extras_mut().inline_keyboard = vec![vec![
             InlineButton {
                 text: "确认".into(),
                 kind: InlineButtonKind::Callback("YQ==".into()),
@@ -1953,7 +1955,7 @@ mod tests {
         let mut app = ui::tests::fixture();
         let (worker, requests) = TdWorker::test_pair();
         let url = "https://telegra.ph/long-page";
-        app.store.messages[1].info.link_preview = Some(crate::store::LinkPreview {
+        app.store.messages[1].info.extras_mut().link_preview = Some(crate::store::LinkPreview {
             url: url.into(),
             ..Default::default()
         });
@@ -2001,8 +2003,8 @@ mod tests {
         handle_ready_key(&mut app, &worker, KeyCode::Char('q'));
         assert!(app.instant_view.is_none());
 
-        app.store.messages[1].info.link_preview = None;
-        app.store.messages[1].info.entities = vec![crate::store::TextEntity {
+        app.store.messages[1].info.extras_mut().link_preview = None;
+        app.store.messages[1].info.extras_mut().entities = vec![crate::store::TextEntity {
             start: 0,
             end: "好".len(),
             kind: crate::store::EntityKind::TextUrl(url.into()),

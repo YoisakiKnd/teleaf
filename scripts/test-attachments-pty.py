@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix='tg-attachments-smoke-') as folder:
         terminal.click(48,26) # First thumbnail above the composer
         terminal.wait('贴纸已提交')
         terminal.read(.3)
-        terminal.click(68,22) # Installed pack tab
+        terminal.click(68,21) # Installed pack tab above the status row
         terminal.wait('演示贴纸包')
         terminal.read(.3)
         terminal.send(b'/')
