@@ -1220,20 +1220,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         notice.unwrap_or(hint)
     };
-    frame.render_widget(
-        Paragraph::new(text::ellipsize(footer, usize::from(layout[2].width))).style(
-            Style::default().fg(
-                if auth_footer_error || media_footer_error || notice_is_error {
-                    palette().error
-                } else if notice.is_some() {
-                    palette().text
-                } else {
-                    palette().muted
-                },
-            ),
-        ),
-        layout[2],
-    );
+    let footer_style = Style::default()
+        .fg(
+            if auth_footer_error || media_footer_error || notice_is_error {
+                palette().error
+            } else if notice.is_some() {
+                palette().text
+            } else {
+                palette().muted
+            },
+        )
+        .bg(palette().surface);
+    let footer_line = Line::raw(text::ellipsize(footer, usize::from(layout[2].width)));
+    draw_line(frame, layout[2], &footer_line, footer_style);
 
     if app.has_overlay() {
         app.hit_targets.clear();
@@ -1710,8 +1709,9 @@ fn composer_height(app: &App, column_width: u16, column_height: u16) -> u16 {
     let reaction_rows =
         u16::from(matches!(app.input_mode, InputMode::React(_)) && column_height >= 10);
     let edit_width = usize::from(column_width.saturating_sub(3)).max(1);
-    let rows = text::row_count(&app.draft, edit_width);
-    let max_h = column_height.saturating_sub(4).clamp(4, 7);
+    let min_rows = if column_height >= 16 { 2 } else { 1 };
+    let rows = text::row_count(&app.draft, edit_width).max(min_rows);
+    let max_h = column_height.saturating_sub(4).clamp(4, 8);
     rows.saturating_add(3 + usize::from(reaction_rows))
         .min(usize::from(max_h)) as u16
 }
@@ -2399,25 +2399,22 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             usize::from(text_w).saturating_sub(prefix_w),
         );
         let click_rect = Rect::new(banner_rect.x, banner_rect.y, text_w, 1);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "│ ",
-                    Style::default()
-                        .fg(palette().accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "置顶：",
-                    Style::default()
-                        .fg(palette().accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(body, Style::default().fg(palette().text)),
-            ]))
-            .style(palette().surface_base()),
-            click_rect,
-        );
+        let banner_line = Line::from(vec![
+            Span::styled(
+                "│ ",
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "置顶：",
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(body, Style::default().fg(palette().text)),
+        ]);
+        draw_line(frame, click_rect, &banner_line, palette().surface_base());
         app.hit_targets
             .push((click_rect, Target::PinnedBanner(pin.id)));
         button(
@@ -3030,14 +3027,6 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     if w == 0 {
                         break;
                     }
-                    let label = inline_label(button, w);
-                    let spare = usize::from(w).saturating_sub(text_width(&label));
-                    let label = format!(
-                        "{}{}{}",
-                        " ".repeat(spare / 2),
-                        label,
-                        " ".repeat(spare - spare / 2)
-                    );
                     let target = Target::InlineButton(message.id, r_idx, c_idx);
                     let pressed = app
                         .mouse_press
@@ -3050,7 +3039,33 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                             .fg(palette().accent)
                             .add_modifier(Modifier::BOLD)
                     };
-                    spans.push(Span::styled(label, style));
+                    if w >= 6 {
+                        let inner_w = w - 2;
+                        let label = inline_label(button, inner_w.saturating_sub(2));
+                        let spare = usize::from(inner_w).saturating_sub(text_width(&label));
+                        let left_pad = (spare / 2).max(1);
+                        let right_pad = spare.saturating_sub(left_pad);
+                        let inner =
+                            format!("{}{}{}", " ".repeat(left_pad), label, " ".repeat(right_pad));
+                        let edge_style = if pressed {
+                            style
+                        } else {
+                            palette().surface_base().fg(palette().border)
+                        };
+                        spans.push(Span::styled("[", edge_style));
+                        spans.push(Span::styled(inner, style));
+                        spans.push(Span::styled("]", edge_style));
+                    } else {
+                        let label = inline_label(button, w);
+                        let spare = usize::from(w).saturating_sub(text_width(&label));
+                        let label = format!(
+                            "{}{}{}",
+                            " ".repeat(spare / 2),
+                            label,
+                            " ".repeat(spare - spare / 2)
+                        );
+                        spans.push(Span::styled(label, style));
+                    }
                     if lines.viewport.contains(&lines.next) {
                         text_targets.push((
                             Rect::new(x, area.y + (lines.next - top) as u16, w, 1),
@@ -3221,7 +3236,15 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hit_targets.extend(text_targets);
     scrollbar(frame, app, area, Pane::Timeline, top, app.timeline_max);
     if app.quote_back.is_some() && area.height > 0 {
-        let bar = Rect::new(area.x, area.bottom() - 1, area.width.saturating_sub(1), 1);
+        let label = " 返回引用前位置 · b ";
+        let avail = area.width.saturating_sub(1);
+        let pill_w = (text_width(label) as u16).min(avail);
+        let bar = Rect::new(
+            area.x + avail.saturating_sub(pill_w),
+            area.bottom() - 1,
+            pill_w,
+            1,
+        );
         let style = Style::default()
             .fg(palette().accent)
             .bg(palette().surface)
@@ -3231,21 +3254,28 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 Modifier::empty()
             });
-        frame.render_widget(
-            Paragraph::new(" 返回引用前位置 · b ")
-                .style(style)
-                .alignment(Alignment::Center),
+        draw_line(
+            frame,
             bar,
+            &Line::raw(text::ellipsize(label, usize::from(pill_w))),
+            style,
         );
         app.hit_targets
             .push((bar, Target::Command(Action::QuoteBack)));
     } else if (top < app.timeline_max || app.store.context_window) && area.height > 0 {
-        let button_area = Rect::new(area.x, area.bottom() - 1, area.width.saturating_sub(1), 1);
         let label = if app.pending_messages > 0 {
             format!(" ↓ {} 条新消息 · 回到底部 ", app.pending_messages)
         } else {
             " ↓ 回到底部 ".into()
         };
+        let avail = area.width.saturating_sub(1);
+        let pill_w = (text_width(&label) as u16).min(avail);
+        let button_area = Rect::new(
+            area.x + avail.saturating_sub(pill_w),
+            area.bottom() - 1,
+            pill_w,
+            1,
+        );
         let style = if app.pending_messages > 0 {
             palette().primary()
         } else {
@@ -3259,11 +3289,11 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     Modifier::empty()
                 })
         };
-        frame.render_widget(
-            Paragraph::new(label)
-                .style(style)
-                .alignment(Alignment::Center),
+        draw_line(
+            frame,
             button_area,
+            &Line::raw(text::ellipsize(&label, usize::from(pill_w))),
+            style,
         );
         app.hit_targets
             .push((button_area, Target::Command(Action::Bottom)));
@@ -3398,11 +3428,11 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
                 break;
             }
             let cell = Rect::new(x, strip.y, w, 1);
-            frame.render_widget(
-                Paragraph::new(label)
-                    .style(Style::default().fg(palette().text).bg(palette().surface))
-                    .alignment(Alignment::Center),
+            draw_line(
+                frame,
                 cell,
+                &Line::raw(label).alignment(Alignment::Center),
+                Style::default().fg(palette().text).bg(palette().surface),
             );
             app.hit_targets
                 .push((cell, Target::Command(Action::QuickReact(idx))));
@@ -5405,13 +5435,15 @@ fn link_picker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
                 usize::from(inner.width.saturating_sub(2)),
             )),
         ]);
-        frame.render_widget(
-            Paragraph::new(line).style(if is_sel {
+        draw_line(
+            frame,
+            rect,
+            &line,
+            if is_sel {
                 palette().selection()
             } else {
                 palette().surface_base()
-            }),
-            rect,
+            },
         );
         app.hit_targets.push((rect, Target::LinkEntry(idx)));
     }
@@ -5477,13 +5509,15 @@ fn topics_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
             Span::styled(unread, Style::default().fg(palette().accent)),
         ]);
-        frame.render_widget(
-            Paragraph::new(line).style(if is_sel {
+        draw_line(
+            frame,
+            rect,
+            &line,
+            if is_sel {
                 palette().selection()
             } else {
                 palette().surface_base()
-            }),
-            rect,
+            },
         );
         app.hit_targets.push((rect, Target::TopicEntry(idx)));
     }
@@ -5705,6 +5739,25 @@ pub(crate) mod tests {
             .0;
         assert_eq!(top_btn.width, bottom_btn.width);
         assert!(top_btn.width <= 36 && top_btn.width >= 26);
+
+        // A VS16 emoji in the bottom-most footer notice must also use ForcedWidth so it never wraps/scrolls the screen.
+        app.notice = Some("✏️ Type your answer in the chat.".into());
+        let footer_buf = wide
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap()
+            .buffer
+            .clone();
+        let footer_y = footer_buf.area.bottom() - 1;
+        assert_eq!(footer_buf[(0, footer_y)].symbol(), "✏️");
+        assert_eq!(footer_buf[(2, footer_y)].symbol(), " ");
+        let prev =
+            ratatui::buffer::Buffer::filled(footer_buf.area, ratatui::buffer::Cell::new("x"));
+        assert!(
+            !prev
+                .diff(&footer_buf)
+                .iter()
+                .any(|(x, y, _)| *x == 1 && *y == footer_y)
+        );
     }
 
     #[test]
@@ -5823,6 +5876,7 @@ pub(crate) mod tests {
                 .find(|(_, target)| *target == Target::Composer)
                 .unwrap()
                 .0;
+            assert!(composer.height >= 5);
             for action in [Action::File, Action::Stickers, Action::Submit] {
                 let rect = app
                     .hit_targets
