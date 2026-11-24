@@ -431,7 +431,12 @@ pub(crate) fn serve(events: SyncSender<TdEvent>, commands: Receiver<TdCommand>) 
             }
             "sendMessage" => {
                 next_id += 1;
-                let message = json!({"@type":"message","id":next_id,"chat_id":chat,"topic_id":request["topic_id"],"is_outgoing":true,"content":{"@type":"messageText","text":{"text":request.pointer("/input_message_content/text/text").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(||demo_attachment(&request["input_message_content"]))}}});
+                let content = &request["input_message_content"];
+                let text = content
+                    .get("text")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"text":demo_attachment(content)}));
+                let message = json!({"@type":"message","id":next_id,"chat_id":chat,"topic_id":request["topic_id"],"is_outgoing":true,"content":{"@type":"messageText","text":text}});
                 if posted.len() == 128 {
                     posted.pop_front();
                 }

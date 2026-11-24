@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix='tg-chat-smoke-') as folder:
         terminal.read(.3)
         terminal.click(50,36)  # Composer
         terminal.paste('mouse-send-demo')
-        terminal.click(98,38)  # Send button
+        terminal.click(98,37)  # Send button on the toolbar inside the composer
         sent = terminal.read(.6)
         assert b'mouse-send-demo' in sent, 'Mouse send did not add a chat message'
         terminal.click(34,2)  # Folder selector

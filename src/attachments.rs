@@ -268,8 +268,7 @@ impl Picker {
             };
             let mut content = request["input_message_content"].clone();
             if index == 0 && !self.caption.is_empty() {
-                content["caption"] =
-                    json!({"@type":"formattedText","text":self.caption,"entities":[]});
+                content["caption"] = crate::markdown::formatted_text(&self.caption);
             }
             contents.push(content);
         }
@@ -543,14 +542,14 @@ mod tests {
         let mut picker = Picker::new(true, Some(91));
         picker.add(vec![a.clone(), b.clone(), a.clone()]).unwrap();
         assert_eq!(picker.selected.len(), 2);
-        picker.caption = "说明".into();
+        picker.caption = "中😀 **说明**".into();
         let request = picker.request(17).unwrap();
         assert_eq!(request["@type"], "sendMessageAlbum");
         assert_eq!(request["reply_to"]["message_id"], 91);
-        assert_eq!(
-            request["input_message_contents"][0]["caption"]["text"],
-            "说明"
-        );
+        let caption = &request["input_message_contents"][0]["caption"];
+        assert_eq!(caption["text"], "中😀 说明");
+        assert_eq!(caption["entities"][0]["offset"], 4);
+        assert_eq!(caption["entities"][0]["length"], 2);
         assert!(request["input_message_contents"][1]["caption"].is_null());
         picker.photos = false;
         assert_eq!(

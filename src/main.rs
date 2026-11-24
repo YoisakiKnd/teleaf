@@ -6,7 +6,9 @@ mod cli;
 mod clipboard;
 mod config;
 mod demo;
+mod instant_view;
 mod interaction;
+mod markdown;
 mod media;
 mod menu;
 mod notifications;
@@ -156,6 +158,11 @@ struct LinkPicker {
     selected: usize,
 }
 
+struct InlinePicker {
+    message: i64,
+    selected: usize,
+}
+
 #[derive(Clone)]
 struct ThreadView {
     source_chat: i64,
@@ -179,6 +186,8 @@ struct App {
     parity: parity::Parity,
     proxy: proxy::ProxyState,
     link_picker: Option<LinkPicker>,
+    inline_picker: Option<InlinePicker>,
+    instant_view: Option<instant_view::Reader>,
     show_topics: bool,
     topic_cursor: usize,
     active_thread: Option<ThreadView>,
@@ -273,6 +282,8 @@ impl App {
             parity: parity::Parity::default(),
             proxy: proxy::ProxyState::default(),
             link_picker: None,
+            inline_picker: None,
+            instant_view: None,
             show_topics: false,
             topic_cursor: 0,
             active_thread: None,
@@ -359,6 +370,7 @@ impl App {
             TdEvent::Error(message) => {
                 self.status = message;
                 self.tdlib_connected = false;
+                self.fail_instant_view();
                 (None, true)
             }
             TdEvent::Update(value) => {
@@ -600,6 +612,8 @@ impl App {
     fn has_overlay(&self) -> bool {
         self.proxy.open
             || self.link_picker.is_some()
+            || self.inline_picker.is_some()
+            || self.instant_view.is_some()
             || self.show_topics
             || self.show_help
             || self.show_settings
@@ -629,6 +643,8 @@ impl App {
         self.proxy.open = false;
         self.proxy.form = None;
         self.link_picker = None;
+        self.inline_picker = None;
+        self.instant_view = None;
         self.show_topics = false;
         self.show_folders = false;
         self.show_help = false;
@@ -715,6 +731,8 @@ impl App {
         self.active_thread = None;
         self.reset_chat_requests();
         self.link_picker = None;
+        self.inline_picker = None;
+        self.instant_view = None;
         self.multi_select.clear();
         self.confirm_delete_many = false;
         self.forward_many = false;
@@ -803,12 +821,49 @@ impl App {
         if messages.is_empty() {
             return;
         }
-        let current = self
+        let Some(mut current) = self
             .selected_message
             .and_then(|id| messages.iter().position(|message| message.id == id))
-            .unwrap_or(messages.len() - 1);
+        else {
+            let last = store::album_range(messages, messages.len() - 1).start;
+            self.selected_message = Some(messages[last].id);
+            return;
+        };
+        for _ in 0..delta.unsigned_abs() {
+            let group = store::album_range(messages, current);
+            current = if delta < 0 && group.start > 0 {
+                store::album_range(messages, group.start - 1).start
+            } else if delta > 0 && group.end < messages.len() {
+                group.end
+            } else {
+                break;
+            };
+        }
+        self.selected_message = Some(messages[current].id);
+    }
+
+    fn selected_album(&self) -> Option<std::ops::Range<usize>> {
+        let messages = self.active_messages();
+        let index = messages
+            .iter()
+            .position(|message| Some(message.id) == self.selected_message)?;
+        let range = store::album_range(messages, index);
+        (range.len() > 1).then_some(range)
+    }
+
+    fn step_album(&mut self, delta: isize) {
+        let Some(group) = self.selected_album() else {
+            return;
+        };
+        let messages = &self.active_messages()[group];
+        let current = messages
+            .iter()
+            .position(|message| Some(message.id) == self.selected_message)
+            .unwrap();
         let next = current.saturating_add_signed(delta).min(messages.len() - 1);
         self.selected_message = Some(messages[next].id);
+        self.selection = None;
+        self.reveal_message = true;
     }
 
     fn submit_input(&mut self) -> Option<Value> {
@@ -1131,6 +1186,9 @@ fn send_request(app: &mut App, worker: &TdWorker, mut request: Value) -> bool {
     let tag = extra.as_str().unwrap_or_default().to_owned();
     if let Err(error) = worker.request(request) {
         app.request_queue_failed(&tag);
+        if tag.starts_with("instant-view:") {
+            app.receive_instant_view(&json!({"@type":"error","@extra":tag}), &tag);
+        }
         if tag.starts_with("proxy-") {
             app.receive_proxy(&json!({"@type":"error","@extra":tag}));
         }
@@ -1569,6 +1627,10 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         && matches!(code, KeyCode::Char('[') | KeyCode::Char(']'))
         && !(app.composer_focus && app.input_mode != InputMode::Off)
     {
+        if app.focus_messages && app.selected_album().is_some() {
+            app.step_album(if code == KeyCode::Char('[') { -1 } else { 1 });
+            return false;
+        }
         let lists = app.store.chat_lists();
         let index = lists
             .iter()
@@ -1608,6 +1670,68 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
                     .map(|item| item.action);
                 if let Some(action) = action {
                     menu::execute(app, worker, action);
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if let Some(reader) = &mut app.instant_view {
+        let page = reader.page.saturating_sub(1).max(1) as isize;
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                interaction::perform(app, worker, ui::Action::CloseInstantView);
+            }
+            KeyCode::Char('o') => {
+                interaction::perform(app, worker, ui::Action::OpenInstantViewBrowser);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                reader.scroll_by(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                reader.scroll_by(1);
+            }
+            KeyCode::PageUp => {
+                reader.scroll_by(-page);
+            }
+            KeyCode::PageDown => {
+                reader.scroll_by(page);
+            }
+            KeyCode::Home => {
+                reader.set_scroll(0);
+            }
+            KeyCode::End => {
+                reader.set_scroll(usize::MAX);
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if let Some(picker) = &app.inline_picker {
+        let message = picker.message;
+        let entry = app.active_messages().iter().find(|item| item.id == message);
+        let count = entry.map_or(0, |item| item.inline_buttons().count());
+        let selected = picker.selected.min(count.saturating_sub(1));
+        match code {
+            KeyCode::Esc => app.close_overlays(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.inline_picker.as_mut().unwrap().selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.inline_picker.as_mut().unwrap().selected =
+                    (selected + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                if let Some((row, col, _)) =
+                    entry.and_then(|item| item.inline_buttons().nth(selected))
+                {
+                    interaction::perform_target(
+                        app,
+                        worker,
+                        ui::Target::InlineButton(message, row, col),
+                    );
+                } else {
+                    app.close_overlays();
                 }
             }
             _ => {}
@@ -1824,12 +1948,26 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         KeyCode::Down | KeyCode::Char('j') => {
             if app.focus_messages {
                 app.move_message(1);
-                if app.selected_message == app.store.messages.last().map(|msg| msg.id) {
+                if !app.show_search
+                    && (app.selected_message == app.store.messages.last().map(|msg| msg.id)
+                        || app
+                            .selected_album()
+                            .is_some_and(|group| group.end == app.store.messages.len()))
+                {
                     app.load_newer_near_bottom(worker);
                 }
             } else {
                 app.move_selected(1);
             }
+        }
+        KeyCode::Char('o')
+            if app.focus_messages
+                && app
+                    .selected_message()
+                    .and_then(|message| message.media.as_ref())
+                    .is_some_and(|media| media.kind == store::MediaKind::Photo) =>
+        {
+            interaction::perform(app, worker, ui::Action::Preview);
         }
         KeyCode::Enter if !app.focus_messages => {
             for request in app.open_selected() {

@@ -19,10 +19,10 @@ pub fn history(chat_id: i64, from_message_id: i64) -> Value {
     })
 }
 
-fn text_content(text: String) -> Value {
+fn text_content(text: Value) -> Value {
     json!({
         "@type": "inputMessageText",
-        "text": {"@type": "formattedText", "text": text, "entities": []},
+        "text": text,
         "link_preview_options": null,
         "clear_draft": true
     })
@@ -36,14 +36,14 @@ pub fn send_text(chat_id: i64, text: String, reply_to: Option<i64>) -> Value {
     json!({
         "@type": "sendMessage", "chat_id": chat_id, "topic_id": null,
         "reply_to": reply_to, "options": null, "reply_markup": null,
-        "input_message_content": text_content(text)
+        "input_message_content": text_content(crate::markdown::formatted_text(&text))
     })
 }
 
 pub fn edit_text(chat_id: i64, message_id: i64, text: String) -> Value {
     json!({
         "@type": "editMessageText", "chat_id": chat_id, "message_id": message_id,
-        "reply_markup": null, "input_message_content": text_content(text)
+        "reply_markup": null, "input_message_content": text_content(crate::markdown::formatted_text(&text))
     })
 }
 
@@ -212,7 +212,7 @@ pub fn view_messages(chat_id: i64, ids: Vec<i64>) -> Value {
 
 pub fn set_draft(chat_id: i64, text: &str, reply_to: Option<i64>) -> Value {
     let draft = (!text.is_empty() || reply_to.is_some()).then(|| {
-        let mut content = text_content(text.to_owned());
+        let mut content = text_content(json!({"@type":"formattedText","text":text,"entities":[]}));
         content["clear_draft"] = json!(false);
         json!({
             "@type":"draftMessage",
@@ -224,6 +224,10 @@ pub fn set_draft(chat_id: i64, text: &str, reply_to: Option<i64>) -> Value {
     });
     json!({"@type":"setChatDraftMessage","chat_id":chat_id,"topic_id":null,
         "draft_message":draft,"@extra":format!("draft:{chat_id}")})
+}
+
+pub fn get_instant_view(url: &str) -> Value {
+    json!({"@type":"getWebPageInstantView","url":url,"only_local":false,"@extra":"instant-view"})
 }
 
 pub fn get_proxies() -> Value {
@@ -332,6 +336,21 @@ pub fn scoped_history(chat: i64, scope: crate::store::MessageScope, from: i64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sent_text_is_formatted_but_synced_drafts_keep_the_original_markup() {
+        let input = "中文😀 **测试**";
+        let sent = send_text(7, input.into(), Some(11));
+        let text = &sent["input_message_content"]["text"];
+        assert_eq!(sent["reply_to"]["message_id"], 11);
+        assert_eq!(text["text"], "中文😀 测试");
+        assert_eq!(text["entities"][0]["offset"], 5);
+        assert_eq!(text["entities"][0]["length"], 2);
+        let draft = set_draft(7, input, None);
+        let text = &draft["draft_message"]["input_message_text"]["text"];
+        assert_eq!(text["text"], input);
+        assert_eq!(text["entities"], json!([]));
+    }
 
     #[test]
     fn reply_and_forward_keep_source_and_target_ids() {

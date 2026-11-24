@@ -14,6 +14,7 @@ type Response = (Option<Value>, bool);
 pub struct Sync {
     generation: u64,
     mention: Option<(Option<i64>, String)>,
+    instant_view: Option<(String, String)>,
     callback: Option<String>,
     topics: Option<String>,
     thread_info: Option<String>,
@@ -845,8 +846,71 @@ impl App {
         self.notice_error = true;
     }
 
+    fn pending_instant_view(&mut self) -> Option<Value> {
+        if self.sync.instant_view.is_some() {
+            return None;
+        }
+        let reader = self.instant_view.as_ref()?;
+        if !matches!(reader.state, crate::instant_view::State::Loading) {
+            return None;
+        }
+        let url = reader.url.clone();
+        let mut request = actions::get_instant_view(&url);
+        let extra = tag(&mut request, self.next_sync_generation());
+        self.sync.instant_view = Some((extra, url));
+        Some(request)
+    }
+
+    pub fn open_instant_view(&mut self, worker: &TdWorker, url: String) -> bool {
+        if !crate::text::web_url(&url) {
+            return false;
+        }
+        self.close_overlays();
+        self.notice = None;
+        self.notice_error = false;
+        self.instant_view = Some(crate::instant_view::Reader::new(url));
+        if let Some(request) = self.pending_instant_view() {
+            send_request(self, worker, request);
+        }
+        true
+    }
+
+    pub fn fail_instant_view(&mut self) {
+        self.sync.instant_view = None;
+        if let Some(reader) = &mut self.instant_view
+            && matches!(reader.state, crate::instant_view::State::Loading)
+        {
+            reader.state = crate::instant_view::State::Failed;
+        }
+    }
+
+    pub fn receive_instant_view(&mut self, value: &Value, extra: &str) -> Response {
+        use crate::instant_view::{InstantViewArticle, State};
+
+        if !self
+            .sync
+            .instant_view
+            .as_ref()
+            .is_some_and(|(tag, _)| tag == extra)
+        {
+            return (None, false);
+        }
+        let (_, url) = self.sync.instant_view.take().unwrap();
+        let Some(reader) = self.instant_view.as_mut() else {
+            return (None, false);
+        };
+        if reader.url != url {
+            return (self.pending_instant_view(), false);
+        }
+        reader.state = InstantViewArticle::parse(value).map_or(State::Failed, State::Ready);
+        (None, true)
+    }
+
     pub fn receive_sync(&mut self, value: &Value) -> Option<Response> {
         let extra = value["@extra"].as_str().unwrap_or_default();
+        if extra.starts_with("instant-view:") {
+            return Some(self.receive_instant_view(value, extra));
+        }
         if let Some(response) = self.receive_chat_feature(value, extra) {
             return Some(response);
         }
@@ -1796,6 +1860,38 @@ mod tests {
         app.composer_focus = false;
         app.reset_draft_snapshot();
         app
+    }
+
+    #[test]
+    fn instant_view_keeps_one_request_in_flight_and_ignores_closed_or_stale_results() {
+        use crate::instant_view::State;
+        let mut app = ui::tests::fixture();
+        let (worker, requests) = TdWorker::test_pair();
+        assert!(app.open_instant_view(&worker, "https://telegra.ph/first".into()));
+        let first = request(&requests);
+        assert!(app.open_instant_view(&worker, "https://graph.org/second".into()));
+        assert!(requests.try_recv().is_err());
+        let (next, changed) = deliver(&mut app, &first, json!({"@type":"error"}));
+        assert!(!changed);
+        let next = next.unwrap();
+        assert_eq!(next["url"], "https://graph.org/second");
+        assert_ne!(first["@extra"], next["@extra"]);
+        assert!(matches!(
+            app.instant_view.as_ref().unwrap().state,
+            State::Loading
+        ));
+        assert!(!deliver(&mut app, &first, json!({"@type":"error"})).1);
+        app.close_overlays();
+        assert!(!deliver(&mut app, &next, json!({"@type":"error"})).1);
+        assert!(app.instant_view.is_none());
+
+        let (disconnected, requests) = TdWorker::test_pair();
+        drop(requests);
+        assert!(app.open_instant_view(&disconnected, "https://graph.org/third".into()));
+        assert!(matches!(
+            app.instant_view.as_ref().unwrap().state,
+            State::Failed
+        ));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Shared page layout. Views render only visible messages and reuse media caches.
 use ratatui::Frame;
+use ratatui::buffer::CellDiffOption;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -9,10 +10,10 @@ use ratatui::widgets::{
 use ratatui_image::Image;
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use crate::selection::{self, Point, Source};
-use crate::store::{MediaKind, MediaRef};
+use crate::store::{EntityKind, MediaKind, MediaRef, Message, TextEntity};
+use crate::text::{self, Row, grapheme_width, width as text_width};
 use crate::theme::palette;
 use crate::{App, InputMode};
 
@@ -83,6 +84,9 @@ pub(crate) enum Action {
     MultiDelete,
     MultiClear,
     OpenMessageLink,
+    InlineButtons,
+    OpenInstantViewBrowser,
+    CloseInstantView,
     JumpToMessage,
     QuickReact(usize),
     CycleMediaFilter,
@@ -139,6 +143,9 @@ pub(crate) enum Target {
     LinkEntry(usize),
     TopicEntry(usize),
     InlineButton(i64, usize, usize),
+    AlbumItem(i64),
+    PreviewLink(i64),
+    InstantViewLink(i64),
     CommentThread(i64),
     Text(Point),
     Image(Rect),
@@ -169,7 +176,7 @@ pub fn action_for_key(key: char) -> Option<Action> {
         'D' => Action::Repeat,
         'x' => Action::React,
         'd' => Action::Delete,
-        'c' => Action::Copy,
+        'c' | 'y' => Action::Copy,
         'p' => Action::Photo,
         'a' => Action::File,
         't' => Action::Stickers,
@@ -183,6 +190,7 @@ pub fn action_for_key(key: char) -> Option<Action> {
         'I' => Action::ChatInfo,
         'V' => Action::ToggleMultiSelect,
         'L' => Action::OpenMessageLink,
+        'B' => Action::InlineButtons,
         'E' => Action::SaveFileAs,
         'T' => Action::Topics,
         _ => return None,
@@ -220,8 +228,7 @@ fn button(frame: &mut Frame, app: &mut App, area: Rect, label: &str, action: Act
     };
     // A compact filled label keeps the border and whitespace quiet. The whole
     // original button rectangle remains clickable, including its surrounding space.
-    let label_width =
-        (UnicodeWidthStr::width(label) as u16 + if primary { 2 } else { 0 }).min(area.width);
+    let label_width = (text_width(label) as u16 + if primary { 2 } else { 0 }).min(area.width);
     let visual = Rect::new(
         area.x + (area.width - label_width) / 2,
         area.y,
@@ -271,7 +278,7 @@ fn folder_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
     let tab_widths: Vec<u16> = lists
         .iter()
         .map(|(_, name)| {
-            ((UnicodeWidthStr::width(name.as_str()) as u16) + 3)
+            ((text_width(name.as_str()) as u16) + 3)
                 .clamp(7, 11)
                 .min(available.max(1))
         })
@@ -505,7 +512,7 @@ fn excerpt(value: &str, width: usize) -> String {
         } else {
             grapheme
         };
-        let size = UnicodeWidthStr::width(grapheme);
+        let size = grapheme_width(grapheme);
         if used + size > width
             || output.len().saturating_add(grapheme.len()) > width.saturating_mul(16).max(32)
         {
@@ -514,7 +521,7 @@ fn excerpt(value: &str, width: usize) -> String {
                     .grapheme_indices(true)
                     .next_back()
                     .expect("nonempty prefix");
-                used = used.saturating_sub(UnicodeWidthStr::width(last));
+                used = used.saturating_sub(grapheme_width(last));
                 output.truncate(index);
             }
             output.push('…');
@@ -598,12 +605,59 @@ fn auth_field(frame: &mut Frame, app: &mut App, area: Rect, index: usize, label:
     );
 }
 
+fn draw_line(frame: &mut Frame, area: Rect, line: &Line<'_>, base: Style) {
+    let style = base.patch(line.style);
+    let buffer = frame.buffer_mut();
+    buffer.set_style(area, style);
+    let mut x = area.x;
+    if let Some(alignment @ (Alignment::Center | Alignment::Right)) = line.alignment {
+        let line_width = line
+            .spans
+            .iter()
+            .map(|span| text_width(&span.content))
+            .sum();
+        let padding = usize::from(area.width).saturating_sub(line_width) as u16;
+        x += if alignment == Alignment::Center {
+            padding / 2
+        } else {
+            padding
+        };
+    }
+    for span in &line.spans {
+        let span_style = style.patch(span.style);
+        for grapheme in span.content.graphemes(true) {
+            let width = grapheme_width(grapheme) as u16;
+            if width == 0 {
+                continue;
+            }
+            if width > area.right().saturating_sub(x) {
+                return;
+            }
+            let cell = &mut buffer[(x, area.y)];
+            cell.set_symbol(grapheme).set_style(span_style);
+            // Skip continuation cells even when replacing old text. A write
+            // into the second cell can erase the entire VS16 emoji.
+            if grapheme.contains('\u{fe0f}') {
+                cell.set_diff_option(CellDiffOption::ForcedWidth(
+                    std::num::NonZeroU16::new(width).unwrap(),
+                ));
+            }
+            for trailing in x + 1..x + width {
+                let cell = &mut buffer[(trailing, area.y)];
+                cell.reset();
+                cell.set_style(span_style);
+            }
+            x += width;
+        }
+    }
+}
+
 fn styled_message_line(
     value: &str,
-    row: crate::text::Row,
+    row: Row,
     selection: Option<std::ops::Range<usize>>,
     prefix: &str,
-    entities: &[crate::store::TextEntity],
+    entities: &[TextEntity],
     reveal_spoiler: bool,
     search_query: Option<&str>,
 ) -> Line<'static> {
@@ -611,83 +665,61 @@ fn styled_message_line(
         return selected_line(value, row, selection, prefix);
     }
     let slice = &value[row.start..row.end];
-    let mut search_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut search_ranges = Vec::new();
     if let Some(query) = search_query.filter(|q| !q.is_empty()) {
         let lower_slice = slice.to_lowercase();
         let lower_query = query.to_lowercase();
         if lower_slice.len() == slice.len() {
-            let mut offset = 0;
-            while let Some(pos) = lower_slice[offset..].find(&lower_query) {
-                let abs_start = row.start + offset + pos;
-                let abs_end = abs_start + lower_query.len();
-                if value.is_char_boundary(abs_start) && value.is_char_boundary(abs_end) {
-                    search_ranges.push(abs_start..abs_end);
-                }
-                offset += pos + lower_query.len().max(1);
-            }
+            search_ranges.extend(
+                lower_slice
+                    .match_indices(&lower_query)
+                    .map(|(i, text)| row.start + i..row.start + i + text.len()),
+            );
         }
     }
-    let mut cuts = vec![row.start, row.end];
-    if let Some(ref sel) = selection {
-        cuts.push(sel.start.clamp(row.start, row.end));
-        cuts.push(sel.end.clamp(row.start, row.end));
-    }
-    for entity in entities {
-        if entity.end > row.start && entity.start < row.end {
-            cuts.push(entity.start.clamp(row.start, row.end));
-            cuts.push(entity.end.clamp(row.start, row.end));
-        }
-    }
-    for range in &search_ranges {
-        cuts.push(range.start);
-        cuts.push(range.end);
-    }
-    cuts.sort_unstable();
-    cuts.dedup();
-
-    let mut spans = vec![Span::raw(prefix.to_owned())];
-    for pair in cuts.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        if a >= b || !value.is_char_boundary(a) || !value.is_char_boundary(b) {
-            continue;
-        }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let overlaps = |range: &std::ops::Range<usize>, a, b| range.start < b && range.end > a;
+    for (offset, grapheme) in slice.grapheme_indices(true) {
+        let a = row.start + offset;
+        let b = a + grapheme.len();
         let in_selection = selection
             .as_ref()
-            .is_some_and(|r| a >= r.start && b <= r.end);
-        let in_search = search_ranges.iter().any(|r| a >= r.start && b <= r.end);
+            .is_some_and(|range| overlaps(range, a, b));
+        let in_search = search_ranges.iter().any(|range| overlaps(range, a, b));
         let mut style = Style::default();
         let mut hidden_spoiler = false;
-        for entity in entities {
-            if a >= entity.start && b <= entity.end {
-                match entity.kind {
-                    crate::store::EntityKind::Bold => style = style.add_modifier(Modifier::BOLD),
-                    crate::store::EntityKind::Italic => {
-                        style = style.add_modifier(Modifier::ITALIC)
-                    }
-                    crate::store::EntityKind::Code | crate::store::EntityKind::Pre => {
-                        style = style.fg(palette().incoming).bg(palette().surface);
-                    }
-                    crate::store::EntityKind::Strike => {
-                        style = style.add_modifier(Modifier::CROSSED_OUT)
-                    }
-                    crate::store::EntityKind::Spoiler => {
-                        if reveal_spoiler {
-                            style = style.bg(palette().surface);
-                        } else {
-                            hidden_spoiler = true;
-                            style = style.fg(palette().muted);
-                        }
-                    }
-                    crate::store::EntityKind::Url | crate::store::EntityKind::TextUrl(_) => {
-                        style = style
-                            .fg(palette().incoming)
-                            .add_modifier(Modifier::UNDERLINED);
-                    }
-                    crate::store::EntityKind::Mention => {
-                        style = style.fg(palette().accent);
-                    }
+        for entity in entities
+            .iter()
+            .filter(|entity| entity.start < b && entity.end > a)
+        {
+            style = match entity.kind {
+                EntityKind::Bold => style.add_modifier(Modifier::BOLD),
+                EntityKind::Italic => style.add_modifier(Modifier::ITALIC),
+                EntityKind::Underline => style.add_modifier(Modifier::UNDERLINED),
+                EntityKind::Code | EntityKind::Pre(_) => {
+                    style.fg(palette().incoming).bg(palette().surface)
                 }
-            }
+                EntityKind::BlockQuote => style.fg(palette().muted),
+                EntityKind::Strike => style.add_modifier(Modifier::CROSSED_OUT),
+                EntityKind::Spoiler if reveal_spoiler => style.bg(palette().surface),
+                EntityKind::Spoiler => {
+                    hidden_spoiler = true;
+                    style.fg(palette().muted)
+                }
+                EntityKind::Url | EntityKind::TextUrl(_) => style
+                    .fg(palette().incoming)
+                    .add_modifier(Modifier::UNDERLINED),
+                EntityKind::Mention => style.fg(palette().accent),
+                EntityKind::BotCommand => style.fg(palette().accent).add_modifier(Modifier::BOLD),
+                EntityKind::Hashtag => style.fg(palette().incoming).add_modifier(Modifier::BOLD),
+                EntityKind::Cashtag => style.fg(palette().accent).add_modifier(Modifier::ITALIC),
+                EntityKind::EmailAddress => style
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::UNDERLINED),
+                EntityKind::PhoneNumber => {
+                    style.fg(palette().incoming).add_modifier(Modifier::ITALIC)
+                }
+            };
         }
         if in_search {
             style = style
@@ -698,13 +730,21 @@ fn styled_message_line(
         if in_selection {
             style = palette().primary();
         }
-        let text = if hidden_spoiler && !in_selection {
-            "░".repeat(UnicodeWidthStr::width(&value[a..b]).max(1))
+        let span: &mut Span<'_> =
+            if let Some(last) = spans.last_mut().filter(|span| span.style == style) {
+                last
+            } else {
+                spans.push(Span::styled(String::new(), style));
+                spans.last_mut().unwrap()
+            };
+        let text = span.content.to_mut();
+        if hidden_spoiler && !in_selection {
+            text.extend(std::iter::repeat_n('░', grapheme_width(grapheme)));
         } else {
-            value[a..b].to_owned()
-        };
-        spans.push(Span::styled(text, style));
+            text.push_str(grapheme);
+        }
     }
+    spans.insert(0, Span::raw(prefix.to_owned()));
     Line::from(spans)
 }
 
@@ -761,7 +801,7 @@ fn point_targets(
     )];
     let mut x = area.x;
     for (i, g) in value[row.start..row.end].grapheme_indices(true) {
-        let width = UnicodeWidthStr::width(g) as u16;
+        let width = grapheme_width(g) as u16;
         if x + width <= area.right() {
             targets.push((
                 Rect::new(x, area.y, width, 1),
@@ -831,28 +871,17 @@ fn editor(
         } else {
             value[row.start..row.end].to_owned()
         };
-        if kind == Editor::Composer {
-            frame.render_widget(
-                Paragraph::new(selected_line(
-                    value,
-                    *row,
-                    selection::range(app, Source::Composer),
-                    "",
-                )),
-                line_area,
-            );
+        let line = if kind == Editor::Composer {
+            selected_line(value, *row, selection::range(app, Source::Composer), "")
         } else {
-            frame.render_widget(Paragraph::new(shown), line_area);
-        }
+            Line::raw(shown)
+        };
+        draw_line(frame, line_area, &line, Style::default());
         app.hit_targets
             .push((line_area, Target::Cursor(kind, row.end)));
         let mut x = area.x;
         for (i, g) in value[row.start..row.end].grapheme_indices(true) {
-            let w = if masked {
-                1
-            } else {
-                UnicodeWidthStr::width(g) as u16
-            };
+            let w = if masked { 1 } else { grapheme_width(g) as u16 };
             if x + w <= area.right() {
                 app.hit_targets
                     .push((Rect::new(x, y, w, 1), Target::Cursor(kind, row.start + i)));
@@ -900,12 +929,144 @@ fn editor(
         let x = if masked {
             prefix.graphemes(true).count()
         } else {
-            UnicodeWidthStr::width(prefix)
+            text_width(prefix)
         };
         frame.set_cursor_position((
             area.x + (x as u16).min(area.width - 1),
             area.y + (cursor_row - start) as u16,
         ));
+    }
+}
+
+fn shortcut_hint(app: &App, width: u16) -> &'static str {
+    let (wide, narrow) = if app.proxy.open {
+        if app.proxy.form.is_some() {
+            (
+                "Tab 切换字段 · ←→ 选协议 · Enter 保存并启用 · Esc 取消",
+                "Tab 切换 · ←→ 协议 · Enter 保存 · Esc",
+            )
+        } else {
+            (
+                "↑↓ 选择 · Enter 开关 · a 新增 · e 导入 · t 测速 · d 删除 · Esc 关闭",
+                "↑↓ 选择 · Enter 开关 · a 新增 · Esc",
+            )
+        }
+    } else if app.instant_view.is_some() {
+        (
+            "j/k 滚动 · PgUp/PgDn 翻页 · Home/End 首尾 · o 浏览器 · Esc/q 关闭",
+            "j/k 滚动 · o 浏览器 · Esc/q 关闭",
+        )
+    } else if app.inline_picker.is_some() {
+        (
+            "↑↓/jk 选择按钮 · Enter 触发 · Esc 关闭",
+            "↑↓ 选择 · Enter 触发 · Esc",
+        )
+    } else if app.link_picker.is_some() {
+        (
+            "↑↓/jk 选择链接或 @提及 · Enter 打开 · Esc 关闭",
+            "↑↓ 选链接 · Enter 打开 · Esc",
+        )
+    } else if app.show_topics {
+        (
+            "↑↓/jk 选择话题 · Enter 进入话题 · Esc 关闭",
+            "↑↓ 选话题 · Enter 进入 · Esc",
+        )
+    } else if app.quick_switcher.is_some() {
+        (
+            "输入关键词筛选 · ↑↓ 选择 · Enter 打开会话 · Esc 关闭",
+            "输入筛选 · Enter 打开 · Esc 关闭",
+        )
+    } else if app.show_settings {
+        (
+            "Tab 选择 · Enter 操作 · p 代理 · t 配色 · c 缓存 · F6 鼠标 · Esc 返回",
+            "Tab 选择 · Enter 操作 · p 代理 · Esc",
+        )
+    } else if app.show_help {
+        (
+            "↑↓/jk 滚动 · PgUp/PgDn 翻页 · Esc 返回",
+            "↑↓/jk 滚动 · Esc 返回",
+        )
+    } else if app.show_folders {
+        (
+            "↑↓/jk 选择 · Enter 切换分组 · Esc 返回",
+            "↑↓ 选择 · Enter 切换 · Esc",
+        )
+    } else if app.show_chat_info && app.chat_info_modal {
+        ("↑↓ 滚动 · 点击操作 · Esc 返回", "↑↓ 滚动 · Esc 返回")
+    } else if app.auth.is_new_login() {
+        (
+            "Enter 确认重新登录 · F9 代理 · Esc 返回 · Ctrl+C 退出",
+            "Enter 确认 · Esc 返回",
+        )
+    } else if app.auth.is_recovering() {
+        (
+            "填入旧本地密钥 · Enter 恢复 · F5 重新登录 · F9 代理 · Esc 修改 API",
+            "Enter 恢复 · F5 重新登录",
+        )
+    } else if app.auth.setup.is_some() {
+        (
+            "Tab 切换字段 · Enter 保存 · F9 代理 · F2 官网 · F1 帮助 · Ctrl+C 退出",
+            "Tab 切换 · Enter 保存 · F9 代理",
+        )
+    } else if app.auth.state != "authorizationStateReady" {
+        (
+            "Enter 继续 · F9 代理 · F3 修改 API · F4 设置 · Ctrl+C 退出",
+            "Enter 继续 · F9 代理 · Ctrl+C 退出",
+        )
+    } else if app.attachments.is_some() {
+        (
+            "Space 选择 · Tab 切换 · F8 / Ctrl+Enter 发送 · Esc 返回",
+            "Space 选择 · Tab 切换 · F8 发送 · Esc",
+        )
+    } else if app.sticker_picker {
+        (
+            "方向键选择 · 点击/Enter 发送 · [ ] 切换贴纸包 · / 搜索",
+            "↑↓ 选择 · Enter 发送 · [ ] 切换",
+        )
+    } else if app.action_menu.is_some() || app.forward_message.is_some() {
+        (
+            "↑↓ 选择 · Enter 确认 · Esc 返回",
+            "↑↓ 选择 · Enter 确认 · Esc",
+        )
+    } else if app.confirm_delete.is_some() {
+        ("Enter / y 删除 · Esc / n 取消", "Enter/y 删除 · Esc/n 取消")
+    } else if app.preview_message.is_some() {
+        (
+            "滚轮缩放 · 拖动平移 · 0 复位 · Esc 返回",
+            "滚轮缩放 · 拖动平移 · Esc 返回",
+        )
+    } else if !app.multi_select.is_empty() {
+        (
+            "Space / 点击勾选消息 · 底部按钮批量操作 · Esc 退出多选",
+            "Space 勾选 · Esc 退出多选",
+        )
+    } else if matches!(app.input_mode, InputMode::React(_)) && app.composer_focus {
+        (
+            "1–8 快捷回应 · Enter 提交表情 · Esc 取消",
+            "1–8 回应 · Enter 提交 · Esc",
+        )
+    } else if app.input_mode != InputMode::Off && app.composer_focus {
+        (
+            "Enter 提交 · Alt+Enter 换行 · ↑↓ 移光标 · Ctrl+W 删词 · Esc 取消",
+            "Enter 提交 · Alt+Enter 换行 · Esc",
+        )
+    } else if app.focus_messages {
+        (
+            "i 写消息 · r 回复 · Enter 操作 · / 搜索 · Ctrl+K 找会话 · Space 更多 · ? 帮助",
+            "i 写消息 · r 回复 · / 搜索 · ? 帮助",
+        )
+    } else {
+        (
+            "↑↓ 选择 · Enter 打开 · Ctrl+K 找会话 · Tab 消息 · s 设置 · ? 帮助",
+            "↑↓ 选择 · Enter 打开 · Ctrl+K",
+        )
+    };
+    if width >= 68 && text_width(wide) <= usize::from(width) {
+        wide
+    } else if app.focus_messages && wide.starts_with("i 写消息") && width >= 50 {
+        "i 写消息 · r 回复 · Enter 操作 · / 搜索 · ? 帮助"
+    } else {
+        narrow
     }
 }
 
@@ -1046,99 +1207,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         chat_page(frame, app, layout[1]);
     }
-    let hint = if app.proxy.open {
-        if app.proxy.form.is_some() {
-            "Tab 切换字段 · ←→ 选协议 · Enter 保存并启用 · Esc 取消"
-        } else {
-            "↑↓ 选择 · Enter 启用/停用 · a 新增 · e 导入环境代理 · t 测速 · d 删除 · Esc 关"
-        }
-    } else if app.link_picker.is_some() {
-        "↑↓/jk 选择链接或 @提及 · Enter 打开 · Esc 关闭"
-    } else if app.show_topics {
-        "↑↓/jk 选择话题 · Enter 进入话题 · Esc 关闭"
-    } else if app.quick_switcher.is_some() {
-        "输入关键词筛选 · ↑↓ 选择 · Enter 打开会话 · Esc 关闭"
-    } else if app.show_settings {
-        "Tab 选择 · Enter 操作 · p 代理 · t 配色 · c 缓存 · F6 鼠标 · Esc 返回"
-    } else if app.show_help {
-        "↑↓/jk 滚动 · PgUp/PgDn 翻页 · Esc 返回"
-    } else if app.show_folders {
-        "↑↓/jk 选择 · Enter 切换分组 · Esc 返回"
-    } else if app.show_chat_info && app.chat_info_modal {
-        "↑↓ 滚动 · 点击操作 · Esc 返回"
-    } else if app.auth.is_new_login() {
-        "Enter 确认重新登录 · F9 代理 · Esc 返回 · Ctrl+C 退出"
-    } else if app.auth.is_recovering() {
-        "填入旧本地密钥 · Enter 恢复 · F5 重新登录 · F9 代理 · Esc 修改 API"
-    } else if app.auth.setup.is_some() {
-        "Tab 切换字段 · Enter 保存 · F9 代理 · F2 官网 · F1 帮助 · Ctrl+C 退出"
-    } else if app.auth.state != "authorizationStateReady" {
-        "Enter 继续 · F9 代理 · F3 修改 API · F4 设置 · Ctrl+C 退出"
-    } else if app.attachments.is_some() {
-        "Space 选择 · Tab 切换 · F8 / Ctrl+Enter 发送 · Esc 返回"
-    } else if app.sticker_picker {
-        "方向键选择 · 点击/Enter 发送 · [ ] 切换贴纸包 · / 搜索"
-    } else if app.action_menu.is_some() || app.forward_message.is_some() {
-        "↑ ↓ 选择 · Enter 确认 · Esc 返回"
-    } else if app.confirm_delete.is_some() {
-        "Enter / y 删除 · Esc / n 取消"
-    } else if app.preview_message.is_some() {
-        "滚轮缩放 · 拖动平移 · 0 复位 · Esc 返回"
-    } else if !app.multi_select.is_empty() {
-        "Space / 点击勾选消息 · 底部按钮批量操作 · Esc 退出多选"
-    } else if app.input_mode != InputMode::Off {
-        if matches!(app.input_mode, InputMode::React(_)) {
-            "按 1-8 快捷回应 · 或输入表情 Enter 提交 · Esc 取消"
-        } else {
-            "Enter 提交 · Alt+Enter 换行 · ↑↓ 移光标 · Ctrl+W 删词 · Esc 取消"
-        }
-    } else if app.focus_messages {
-        "i 写消息 · Ctrl+K 找会话 · I 详情 · V 多选 · Space 更多 · ? 帮助"
-    } else {
-        "↑ ↓ 选择 · Enter 打开 · Ctrl+K 找会话 · Tab 消息 · s 设置 · ? 帮助"
-    };
+    let hint = shortcut_hint(app, area.width);
     let notice = app.notice.as_deref().or(app.media.last_error.as_deref());
-    let hint = if area.width < 60 {
-        if app.quick_switcher.is_some() {
-            "输入筛选 · Enter 打开 · Esc 关"
-        } else if app.show_settings {
-            "Tab 选 · Enter 确认 · t 配色 · Esc 退"
-        } else if app.show_help {
-            "↑↓/jk 滚动 · Esc 返回"
-        } else if app.show_folders {
-            "↑↓ 选择 · Enter 切换 · Esc 退"
-        } else if app.show_chat_info && app.chat_info_modal {
-            "↑↓ 滚动 · Esc 返回"
-        } else if app.attachments.is_some() {
-            "Space 选 · Tab · F8 发 · Esc"
-        } else if app.sticker_picker {
-            "方向选 · Enter 发 · [] · / 搜"
-        } else if app.action_menu.is_some() || app.forward_message.is_some() {
-            "↑↓选择 Enter 确认 Esc 返回"
-        } else if app.confirm_delete.is_some() {
-            "Enter/y 删除 · Esc/n 取消"
-        } else if app.preview_message.is_some() {
-            "滚轮缩放 · 拖动平移 · Esc 返回"
-        } else if !app.multi_select.is_empty() {
-            "Space 勾选 · Esc 退出多选"
-        } else if app.auth.is_new_login() {
-            "Enter 确认 · Esc 返回"
-        } else if app.auth.is_recovering() {
-            "Enter 恢复 · F5 重新登录"
-        } else if app.auth.setup.is_some() {
-            "Tab 切换 · Enter 继续 · F2"
-        } else if app.auth.state != "authorizationStateReady" {
-            "Enter 继续 · F4 设置 · ^C 退出"
-        } else if app.input_mode != InputMode::Off {
-            "Enter 提交 · Esc 取消"
-        } else if app.focus_messages {
-            "i 输入 · ^K 找会话 · Tab 会话"
-        } else {
-            "↑↓ 选择 · Enter 打开 · ^K 找会话"
-        }
-    } else {
-        hint
-    };
     let auth_footer_error = app.auth.is_error && app.auth.state == "authorizationStateReady";
     let media_footer_error = app.notice.is_none() && app.media.last_error.is_some();
     let notice_is_error = app
@@ -1151,33 +1221,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         notice.unwrap_or(hint)
     };
     frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(
-            if auth_footer_error || media_footer_error || notice_is_error {
-                palette().error
-            } else if notice.is_some() {
-                palette().text
-            } else {
-                palette().muted
-            },
-        )),
+        Paragraph::new(text::ellipsize(footer, usize::from(layout[2].width))).style(
+            Style::default().fg(
+                if auth_footer_error || media_footer_error || notice_is_error {
+                    palette().error
+                } else if notice.is_some() {
+                    palette().text
+                } else {
+                    palette().muted
+                },
+            ),
+        ),
         layout[2],
     );
 
-    if app.proxy.open
-        || app.link_picker.is_some()
-        || app.show_topics
-        || app.show_help
-        || app.show_settings
-        || app.show_folders
-        || app.quick_switcher.is_some()
-        || (app.show_chat_info && app.chat_info_modal)
-        || app.action_menu.is_some()
-        || app.forward_message.is_some()
-        || app.sticker_picker
-        || app.attachments.is_some()
-        || app.confirm_delete.is_some()
-        || app.preview_message.is_some()
-    {
+    if app.has_overlay() {
         app.hit_targets.clear();
         app.scrollbars.clear();
         app.hit_targets.push((area, Target::Backdrop));
@@ -1420,6 +1478,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.link_picker.is_some() {
         link_picker_dialog(frame, app, layout[1]);
     }
+    if app.inline_picker.is_some() {
+        inline_picker_dialog(frame, app, layout[1]);
+    }
+    if app.instant_view.is_some() {
+        instant_view_dialog(frame, app, layout[1]);
+    }
     if app.proxy.open {
         proxy_dialog(frame, app, area);
     }
@@ -1643,20 +1707,13 @@ fn composer_height(app: &App, column_width: u16, column_height: u16) -> u16 {
     if !app.multi_select.is_empty() {
         return 3;
     }
-    if matches!(app.input_mode, InputMode::React(_)) && column_height >= 10 {
-        return 5;
-    }
-    if app.draft.is_empty() || column_width < 6 {
-        return 4;
-    }
+    let reaction_rows =
+        u16::from(matches!(app.input_mode, InputMode::React(_)) && column_height >= 10);
     let edit_width = usize::from(column_width.saturating_sub(3)).max(1);
-    let rows = crate::text::row_count(&app.draft, edit_width);
-    if rows <= 2 {
-        4
-    } else {
-        let max_h = column_height.saturating_sub(4).clamp(4, 7);
-        ((rows as u16) + 2).clamp(4, max_h)
-    }
+    let rows = text::row_count(&app.draft, edit_width);
+    let max_h = column_height.saturating_sub(4).clamp(4, 7);
+    rows.saturating_add(3 + usize::from(reaction_rows))
+        .min(usize::from(max_h)) as u16
 }
 
 fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1891,7 +1948,7 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
             } else {
                 String::new()
             };
-            let badge_width = UnicodeWidthStr::width(unread.as_str()).min(width);
+            let badge_width = text_width(unread.as_str()).min(width);
             let mention = if chat.mention_count > 0 && width >= badge_width + 10 {
                 "@ "
             } else {
@@ -1909,21 +1966,17 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
             } else {
                 String::new()
             };
-            let meta_width = UnicodeWidthStr::width(time_tag.as_str())
-                + UnicodeWidthStr::width(pin_tag)
-                + UnicodeWidthStr::width(mention);
+            let meta_width =
+                text_width(time_tag.as_str()) + text_width(pin_tag) + text_width(mention);
             let right_width = meta_width + badge_width;
             let active_prefix = if is_active { "· " } else { "" };
             let title_text = crate::text::ellipsize(
                 &chat.title,
                 width.saturating_sub(
-                    right_width
-                        + usize::from(right_width > 0)
-                        + UnicodeWidthStr::width(active_prefix),
+                    right_width + usize::from(right_width > 0) + text_width(active_prefix),
                 ),
             );
-            let title_width =
-                UnicodeWidthStr::width(active_prefix) + UnicodeWidthStr::width(title_text.as_str());
+            let title_width = text_width(active_prefix) + text_width(title_text.as_str());
             let padding = width.saturating_sub(title_width + right_width);
             let title_style = if is_active {
                 Style::default()
@@ -1979,7 +2032,7 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
                 )
             } else if let Some(draft) = draft_text {
                 let tag = "[草稿] ";
-                let tag_w = UnicodeWidthStr::width(tag);
+                let tag_w = text_width(tag);
                 Line::from(vec![
                     Span::styled(tag, Style::default().fg(palette().error)),
                     Span::styled(excerpt(draft, width.saturating_sub(tag_w)), preview_style),
@@ -2038,7 +2091,7 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
     );
 }
 
-fn message_body(message: &crate::store::Message) -> &str {
+fn message_body(message: &Message) -> &str {
     match message.media.as_ref().map(|media| media.kind) {
         Some(MediaKind::Photo) => message
             .text
@@ -2047,6 +2100,278 @@ fn message_body(message: &crate::store::Message) -> &str {
         Some(MediaKind::Sticker) if message.text.starts_with("[贴纸]") => "",
         _ => &message.text,
     }
+}
+
+fn album_captions(group: &[Message]) -> impl Iterator<Item = (&Message, &str)> {
+    let mut seen = std::collections::HashSet::new();
+    group.iter().filter_map(move |message| {
+        let text = match message.media.as_ref().map(|media| media.kind) {
+            Some(MediaKind::Video) => message
+                .text
+                .strip_prefix("[视频] ")
+                .unwrap_or(&message.text),
+            Some(MediaKind::Document)
+                if message.info.media_meta.as_ref().is_some_and(|meta| {
+                    message.text.strip_prefix("[文件] ") == Some(meta.file_name.as_str())
+                        && message.info.entities.is_empty()
+                }) =>
+            {
+                ""
+            }
+            Some(MediaKind::Document) => message
+                .text
+                .strip_prefix("[文件] ")
+                .unwrap_or(&message.text),
+            _ => message_body(message),
+        };
+        (!text.is_empty() && seen.insert(text)).then_some((message, text))
+    })
+}
+
+fn inline_media(message: &Message) -> Option<&MediaRef> {
+    message
+        .media
+        .as_ref()
+        .filter(|media| matches!(media.kind, MediaKind::Photo | MediaKind::Sticker))
+}
+
+fn has_media_card(message: &Message) -> bool {
+    message.info.media_meta.is_some()
+        && message.media.as_ref().is_some_and(|media| {
+            matches!(
+                media.kind,
+                MediaKind::Document | MediaKind::Video | MediaKind::Voice
+            )
+        })
+}
+
+fn message_body_rows<'a>(
+    message: &'a Message,
+    body: &str,
+    width: usize,
+    mut visit: impl FnMut(Row, Option<&'a EntityKind>, bool),
+) {
+    if body.is_empty() {
+        return;
+    }
+    let body_offset = message.text.len() - body.len();
+    let blocks = message
+        .info
+        .entities
+        .iter()
+        .filter(|entity| matches!(entity.kind, EntityKind::Pre(_) | EntityKind::BlockQuote));
+    let mut start = body_offset;
+    for logical_line in body
+        .split_inclusive('\n')
+        .chain(body.ends_with('\n').then_some(""))
+    {
+        let content = logical_line.strip_suffix('\n').unwrap_or(logical_line);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        let end = start + content.len();
+        let block = blocks.clone().find(|entity| {
+            entity.start <= end && entity.end > start && (entity.start < end || content.is_empty())
+        });
+        if let Some(entity) = block
+            && matches!(&entity.kind, EntityKind::Pre(language) if !language.is_empty())
+            && entity.start >= start
+        {
+            visit(Row { start, end: start }, Some(&entity.kind), true);
+        }
+        let line_width = width.saturating_sub(2 * usize::from(block.is_some()));
+        text::scan_rows(content, line_width, |row| {
+            visit(
+                Row {
+                    start: start + row.start,
+                    end: start + row.end,
+                },
+                block.map(|entity| &entity.kind),
+                false,
+            );
+        });
+        start += logical_line.len();
+    }
+}
+
+fn message_body_height(message: &Message, body: &str, width: usize) -> usize {
+    if body.is_empty() {
+        0
+    } else if !message
+        .info
+        .entities
+        .iter()
+        .any(|entity| matches!(entity.kind, EntityKind::Pre(_) | EntityKind::BlockQuote))
+    {
+        text::row_count(body, width)
+    } else {
+        let mut height = 0;
+        message_body_rows(message, body, width, |_, _, _| height += 1);
+        height
+    }
+}
+
+struct TimelineLines {
+    visible: Vec<Line<'static>>,
+    next: usize,
+    viewport: std::ops::Range<usize>,
+}
+
+impl TimelineLines {
+    fn push(&mut self, line: Line<'static>) {
+        if self.viewport.contains(&self.next) {
+            self.visible.push(line);
+        }
+        self.next += 1;
+    }
+
+    fn blank(&mut self, height: usize) {
+        let begin = self.next.max(self.viewport.start);
+        let end = (self.next + height).min(self.viewport.end);
+        self.visible.extend((begin..end).map(|_| Line::default()));
+        self.next += height;
+    }
+}
+
+fn append_message_body(
+    lines: &mut TimelineLines,
+    message: &Message,
+    body: &str,
+    app: &App,
+    area: Rect,
+    targets: &mut Vec<(Rect, Target)>,
+) {
+    let width = area.width.saturating_sub(3).max(1);
+    let source = Source::Message(message.id);
+    let selection = selection::range(app, source);
+    let search =
+        (app.show_search && !app.search_query.is_empty()).then_some(app.search_query.as_str());
+    message_body_rows(
+        message,
+        body,
+        usize::from(width),
+        |row, block, language_header| {
+            if !lines.viewport.contains(&lines.next) {
+                lines.next += 1;
+                return;
+            }
+            let y = area.y + (lines.next - lines.viewport.start) as u16;
+            let quote_style = Style::default().fg(palette().muted);
+            let code_style = Style::default()
+                .fg(palette().incoming)
+                .bg(palette().surface);
+            let mut line =
+                if let Some(EntityKind::Pre(language)) = block.filter(|_| language_header) {
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("┃ ", code_style),
+                        Span::styled(
+                            text::ellipsize(language, usize::from(width.saturating_sub(2))),
+                            code_style.add_modifier(Modifier::BOLD),
+                        ),
+                    ])
+                } else {
+                    let mut line = styled_message_line(
+                        &message.text,
+                        row,
+                        selection.clone(),
+                        "  ",
+                        &message.info.entities,
+                        app.selected_message == Some(message.id),
+                        search,
+                    );
+                    if block.is_some() {
+                        let style = if matches!(block, Some(EntityKind::Pre(_))) {
+                            code_style
+                        } else {
+                            quote_style
+                        };
+                        line.spans.insert(1, Span::styled("┃ ", style));
+                    }
+                    let inset = 2 * u16::from(block.is_some());
+                    let row_area = Rect::new(area.x + 2 + inset, y, width.saturating_sub(inset), 1);
+                    targets.extend(point_targets(&message.text, row, source, row_area));
+                    line
+                };
+            if matches!(block, Some(EntityKind::Pre(_))) {
+                let used = line
+                    .spans
+                    .iter()
+                    .map(|span| text_width(&span.content))
+                    .sum();
+                line.spans.push(Span::styled(
+                    " ".repeat((usize::from(width) + 2).saturating_sub(used)),
+                    code_style,
+                ));
+            }
+            lines.push(line);
+        },
+    );
+}
+
+fn inline_label(button: &crate::store::InlineButton, width: u16) -> String {
+    let label = button.text.replace(['\r', '\n', '\t'], " ");
+    let width = usize::from(width);
+    if matches!(button.kind, crate::store::InlineButtonKind::Url(_)) {
+        let suffix = if width >= 3 { " ↗" } else { "↗" };
+        return format!(
+            "{}{suffix}",
+            text::ellipsize(&label, width.saturating_sub(text_width(suffix)))
+        );
+    }
+    text::ellipsize(&label, width)
+}
+
+fn album_strip(
+    group: &[Message],
+    current: usize,
+    checked: &[i64],
+    width: u16,
+    row: Option<Rect>,
+    targets: &mut Vec<(Rect, Target)>,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    let item_width = group.len().ilog10() as u16 + 3;
+    let hint = if width >= 45 {
+        "[ / ] 切图 · o 大图 · E 保存"
+    } else if width >= 26 {
+        "[ / ] 切图"
+    } else {
+        "[ / ]"
+    };
+    let max_items =
+        usize::from(width.saturating_sub(text_width(hint) as u16 + 1) / (item_width + 1)).max(1);
+    let start = current.saturating_add(1).saturating_sub(max_items);
+    let end = (start + max_items).min(group.len());
+    let mut x = 0;
+    for (index, message) in group.iter().enumerate().take(end).skip(start) {
+        let label = format!("{:^w$}", index + 1, w = usize::from(item_width));
+        let mut style = if index == current {
+            palette().primary()
+        } else {
+            palette().surface_base().fg(palette().incoming)
+        };
+        if checked.contains(&message.id) {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        spans.push(Span::styled(label, style));
+        if let Some(row) = row {
+            targets.push((
+                Rect::new(row.x + x, row.y, item_width, 1),
+                Target::AlbumItem(message.id),
+            ));
+        }
+        spans.push(Span::raw(" "));
+        x += item_width + 1;
+    }
+    let label = if start > 0 || end < group.len() {
+        format!("… {hint}")
+    } else {
+        hint.to_owned()
+    };
+    spans.push(Span::styled(
+        text::ellipsize(&label, usize::from(width.saturating_sub(x))),
+        Style::default().fg(palette().muted),
+    ));
+    Line::from(spans)
 }
 
 fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -2068,7 +2393,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
         let dismiss_w = 3u16.min(banner_rect.width);
         let text_w = banner_rect.width.saturating_sub(dismiss_w + 1);
         let prefix = "│ 置顶：";
-        let prefix_w = UnicodeWidthStr::width(prefix);
+        let prefix_w = text_width(prefix);
         let body = crate::text::ellipsize(
             &excerpt(&pin.excerpt, usize::from(text_w).saturating_sub(prefix_w)),
             usize::from(text_w).saturating_sub(prefix_w),
@@ -2165,81 +2490,76 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     app.timeline_rows.clear();
     let mut date_headers = std::collections::HashSet::new();
-    let mut album_positions: std::collections::HashMap<i64, (usize, usize)> =
-        std::collections::HashMap::new();
-    {
-        let mut idx = 0;
-        while idx < source.len() {
-            let album_id = source[idx].info.media_album_id;
-            if album_id != 0 {
-                let start = idx;
-                while idx < source.len() && source[idx].info.media_album_id == album_id {
-                    idx += 1;
-                }
-                let count = idx - start;
-                if count > 1 {
-                    for (offset, msg) in source[start..idx].iter().enumerate() {
-                        album_positions.insert(msg.id, (offset + 1, count));
-                    }
-                }
-            } else {
-                idx += 1;
-            }
-        }
-    }
     let mut previous_date: Option<crate::calendar::Stamp> = None;
-    for message in source {
-        if let Some(stamp) = message.info.stamp {
+    let mut selected_row = None;
+    let mut unread_row = None;
+    let mut anchor_row = None;
+    for group in source.chunk_by(Message::same_album) {
+        let first = &group[0];
+        let selected = group
+            .iter()
+            .find(|message| Some(message.id) == app.selected_message);
+        if selected.is_some() {
+            selected_row = Some(first.id);
+        }
+        if group
+            .iter()
+            .any(|message| Some(message.id) == unread_divider_id)
+        {
+            unread_row = Some(first.id);
+        }
+        if let Some((anchor, _)) = app.timeline_anchor
+            && group.iter().any(|message| message.id == anchor)
+        {
+            anchor_row = Some(first.id);
+        }
+        if let Some(stamp) = first.info.stamp {
             if previous_date.is_none_or(|previous| !previous.same_date(stamp)) {
-                date_headers.insert(message.id);
+                date_headers.insert(first.id);
             }
             previous_date = Some(stamp);
         }
-        let has_media_card = message.info.media_meta.is_some()
-            && message.media.as_ref().is_some_and(|media| {
-                matches!(
-                    media.kind,
-                    MediaKind::Document | MediaKind::Video | MediaKind::Voice
-                )
-            });
-        let link_preview_rows = message
-            .info
-            .link_preview
-            .as_ref()
-            .map_or(0, |lp| 1 + usize::from(!lp.description.is_empty()));
-        let inline_kb_rows = message.info.inline_keyboard.len();
-        let comment_rows = usize::from(message.info.can_get_thread && app.active_thread.is_none());
-        let has_reactions = !message.info.reactions.is_empty();
-        let height = *app.timeline_heights.entry(message.id).or_insert_with(|| {
-            let body = message_body(message);
-            (if body.is_empty() {
-                0
-            } else {
-                crate::text::row_count(body, usize::from(width))
-            }) + 2
+        let message = selected.unwrap_or(first);
+        let base_height = |body_height| {
+            body_height
+                + 2
                 + usize::from(message.info.reply.is_some())
                 + usize::from(message.info.forwarded_from.is_some())
-                + if message.media.as_ref().is_some_and(|media| {
-                    matches!(media.kind, MediaKind::Photo | MediaKind::Sticker)
-                }) {
-                    media_height
-                } else {
-                    0
-                }
-        }) + usize::from(has_media_card)
-            + link_preview_rows
-            + inline_kb_rows
-            + comment_rows
-            + usize::from(has_reactions);
-        let extra_dividers = usize::from(date_headers.contains(&message.id))
-            + usize::from(unread_divider_id == Some(message.id));
+                + inline_media(message).map_or(0, |_| media_height)
+        };
+        let height = if group.len() > 1 {
+            let captions = album_captions(group)
+                .map(|(caption, body)| message_body_height(caption, body, usize::from(width)))
+                .sum();
+            base_height(captions) + 1
+        } else {
+            *app.timeline_heights.entry(message.id).or_insert_with(|| {
+                base_height(message_body_height(
+                    message,
+                    message_body(message),
+                    usize::from(width),
+                ))
+            })
+        };
+        let details = usize::from(has_media_card(message))
+            + message
+                .info
+                .link_preview
+                .as_ref()
+                .map_or(0, |lp| lp.row_count())
+            + message.info.inline_keyboard.len()
+            + usize::from(message.info.can_get_thread && app.active_thread.is_none())
+            + usize::from(!message.info.reactions.is_empty());
+        let dividers = usize::from(date_headers.contains(&first.id))
+            + usize::from(unread_row == Some(first.id));
         app.timeline_rows
-            .push((message.id, height + extra_dividers));
+            .push((first.id, height + details + dividers));
     }
     let total: usize = app.timeline_rows.iter().map(|(_, height)| height).sum();
     app.timeline_max = total.saturating_sub(usize::from(area.height));
     let mut top = app.timeline_max;
     if let Some((anchor, offset)) = app.timeline_anchor {
+        let anchor = anchor_row.unwrap_or(anchor);
         top = 0;
         let mut before = 0;
         for &(id, height) in &app.timeline_rows {
@@ -2256,7 +2576,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.reveal_message {
         let mut before = 0;
         for &(id, height) in &app.timeline_rows {
-            if Some(id) == app.selected_message {
+            if Some(id) == selected_row {
                 if before < top {
                     top = before;
                 } else if before >= top + usize::from(area.height) {
@@ -2281,9 +2601,16 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let navigation_bar =
         app.quote_back.is_some() || top < app.timeline_max || app.store.context_window;
     let readable_end = top + usize::from(area.height).saturating_sub(usize::from(navigation_bar));
-    for (message, &(_, height)) in source.iter().zip(&app.timeline_rows) {
+    for (group, &(_, height)) in source.chunk_by(Message::same_album).zip(&app.timeline_rows) {
         if before + height > top && before < top + usize::from(area.height) {
-            let label = app.store.sender_label(message);
+            let first = &group[0];
+            let active = group
+                .iter()
+                .position(|message| Some(message.id) == app.selected_message)
+                .unwrap_or(0);
+            let message = &group[active];
+            let is_album = group.len() > 1;
+            let label = app.store.sender_label(first);
             let tag = message
                 .media
                 .as_ref()
@@ -2295,16 +2622,16 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     MediaKind::Voice => " · 语音",
                 })
                 .unwrap_or("");
-            let date_div = usize::from(date_headers.contains(&message.id));
-            let unread_div = usize::from(unread_divider_id == Some(message.id));
+            let date_div = usize::from(date_headers.contains(&first.id));
+            let unread_div = usize::from(unread_row == Some(first.id));
             let divider = date_div + unread_div;
-            if measure_reads
-                && !message.outgoing
-                && message.id > read_inbox
-                && before + divider < readable_end
-                && before + height - 1 > top
-            {
-                read_ids.push(message.id);
+            if measure_reads && before + divider < readable_end && before + height - 1 > top {
+                read_ids.extend(
+                    group
+                        .iter()
+                        .filter(|item| !item.outgoing && item.id > read_inbox)
+                        .map(|item| item.id),
+                );
             }
             let is_selected = Some(message.id) == app.selected_message;
             let multi_active = !app.multi_select.is_empty();
@@ -2331,11 +2658,14 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             );
             let max_status = usize::from(width.saturating_sub(controls_width + 10));
             let status = crate::text::ellipsize(&raw_status, max_status);
-            let status_width =
-                UnicodeWidthStr::width(status.as_str()) + usize::from(!status.is_empty()) * 3;
-            let mut lines = Vec::new();
+            let status_width = text_width(status.as_str()) + usize::from(!status.is_empty()) * 3;
+            let mut lines = TimelineLines {
+                visible: Vec::new(),
+                next: before,
+                viewport: top..top + usize::from(area.height),
+            };
             if date_div > 0 {
-                let date = message.info.stamp.expect("date header").date();
+                let date = first.info.stamp.expect("date header").date();
                 let date_line = if width >= 18 {
                     Line::from(vec![
                         Span::styled("── ", Style::default().fg(palette().border)),
@@ -2384,16 +2714,18 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         }),
                 ));
             }
-            let album_tag = album_positions
-                .get(&message.id)
-                .map(|(i, n)| format!(" [相册 {i}/{n}]"))
-                .unwrap_or_default();
+            let album_tag = if is_album {
+                format!("[相册 {}/{}] ", active + 1, group.len())
+            } else {
+                String::new()
+            };
+            let tag = if is_album { "" } else { tag };
             header_spans.push(Span::styled(
                 format!(
                     "{}{}",
                     if is_selected { "› " } else { "  " },
                     crate::text::ellipsize(
-                        &format!("{label}{tag}{album_tag}"),
+                        &format!("{album_tag}{label}{tag}"),
                         usize::from(width.saturating_sub(controls_width))
                             .saturating_sub(status_width + check_width)
                     )
@@ -2443,7 +2775,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 // "  │ " uses 4 columns while `width` only subtracts 2 left + 1 scrollbar.
                 let quote_width = usize::from(width).saturating_sub(2);
                 let label_prefix = format!("{reply_label}：");
-                let label_w = UnicodeWidthStr::width(label_prefix.as_str());
+                let label_w = text_width(label_prefix.as_str());
                 let quote_muted = if is_selected {
                     palette().muted_on_selection()
                 } else {
@@ -2504,44 +2836,21 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     ));
                 }
             }
-            let prefix = divider + 1 + forward_rows + usize::from(message.info.reply.is_some());
-            let body = message_body(message);
-            let body_offset = message.text.len() - body.len();
-            let body_rows = if body.is_empty() {
-                vec![]
-            } else {
-                crate::text::rows(body, usize::from(width))
-                    .into_iter()
-                    .map(|row| crate::text::Row {
-                        start: row.start + body_offset,
-                        end: row.end + body_offset,
-                    })
-                    .collect()
-            };
-            let source = Source::Message(message.id);
-            let selected_range = selection::range(app, source);
-            let search_highlight = (app.show_search && !app.search_query.is_empty())
-                .then_some(app.search_query.as_str());
-            lines.extend(body_rows.iter().map(|row| {
-                styled_message_line(
-                    &message.text,
-                    *row,
-                    selected_range.clone(),
-                    "  ",
-                    &message.info.entities,
-                    is_selected,
-                    search_highlight,
-                )
-            }));
-            let inline = message
-                .media
-                .as_ref()
-                .filter(|media| matches!(media.kind, MediaKind::Photo | MediaKind::Sticker));
-            let media_start = before + prefix + body_rows.len();
-            if inline.is_some() {
-                lines.extend((0..media_height).map(|_| Line::from("")));
+            if !is_album {
+                append_message_body(
+                    &mut lines,
+                    message,
+                    message_body(message),
+                    app,
+                    area,
+                    &mut text_targets,
+                );
             }
-            let mut extra_rows = if inline.is_some() { media_height } else { 0 };
+            let inline = inline_media(message);
+            let media_start = lines.next;
+            if inline.is_some() {
+                lines.blank(media_height);
+            }
             if let (Some(media), Some(meta)) = (&message.media, &message.info.media_meta)
                 && matches!(
                     media.kind,
@@ -2585,7 +2894,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 };
                 detail_parts.push(progress);
                 let card = format!("  {icon} · {}", detail_parts.join(" · "));
-                let row = before + lines.len();
+                let row = lines.next;
                 if row >= top && row < readable_end {
                     text_targets.push((
                         Rect::new(area.x, area.y + (row - top) as u16, width, 1),
@@ -2598,89 +2907,169 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                         .fg(palette().incoming)
                         .bg(palette().surface),
                 ));
-                extra_rows += 1;
+            }
+            if is_album {
+                let rect = lines
+                    .viewport
+                    .contains(&lines.next)
+                    .then(|| Rect::new(area.x + 2, area.y + (lines.next - top) as u16, width, 1));
+                lines.push(album_strip(
+                    group,
+                    active,
+                    &app.multi_select,
+                    width,
+                    rect,
+                    &mut text_targets,
+                ));
+                for (caption, body) in album_captions(group) {
+                    append_message_body(&mut lines, caption, body, app, area, &mut text_targets);
+                }
             }
             if let Some(lp) = &message.info.link_preview {
+                let lp_width = usize::from(width.saturating_sub(2));
                 let head = match (lp.site_name.is_empty(), lp.title.is_empty()) {
                     (false, false) => format!("{} · {}", lp.site_name, lp.title),
                     (false, true) => lp.site_name.clone(),
                     (true, false) => lp.title.clone(),
-                    (true, true) => lp.url.clone(),
+                    (true, true) => String::new(),
                 };
-                let lp_width = usize::from(width).saturating_sub(4);
-                lines.push(Line::from(vec![
-                    Span::styled("  ┃ ", Style::default().fg(palette().accent)),
-                    Span::styled(
-                        crate::text::ellipsize(&head.replace(['\r', '\n'], " "), lp_width),
+                let accent = Style::default().fg(palette().accent);
+                let link = Style::default()
+                    .fg(palette().incoming)
+                    .add_modifier(Modifier::UNDERLINED);
+                let card_line = |label: &str, style| {
+                    Line::from(vec![
+                        Span::styled("  ┃ ", accent),
+                        Span::styled(
+                            text::ellipsize(&label.replace(['\r', '\n'], " "), lp_width),
+                            style,
+                        ),
+                    ])
+                };
+                if !head.is_empty() {
+                    lines.push(card_line(
+                        &head,
                         Style::default()
                             .fg(palette().text)
                             .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                extra_rows += 1;
-                if !lp.description.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled("  ┃ ", Style::default().fg(palette().accent)),
-                        Span::styled(
-                            crate::text::ellipsize(
-                                &lp.description.replace(['\r', '\n'], " "),
-                                lp_width,
-                            ),
-                            if is_selected {
-                                palette().muted_on_selection()
-                            } else {
-                                Style::default().fg(palette().muted)
-                            },
-                        ),
-                    ]));
-                    extra_rows += 1;
+                    ));
                 }
-            }
-            if !message.info.inline_keyboard.is_empty() {
-                for (r_idx, btn_row) in message.info.inline_keyboard.iter().enumerate() {
-                    let kb_row = before + prefix + body_rows.len() + extra_rows;
-                    let mut spans = vec![Span::raw("  ")];
-                    let mut bx = area.x + 2;
-                    let max_x = area.x + 2 + width;
-                    for (c_idx, btn) in btn_row.iter().enumerate() {
-                        let suffix = match btn.kind {
-                            crate::store::InlineButtonKind::Url(_) => " ↗",
-                            _ => "",
-                        };
-                        let label =
-                            format!(" [{}{suffix}] ", crate::text::ellipsize(&btn.text, 20));
-                        let bw = UnicodeWidthStr::width(label.as_str()) as u16;
-                        if bx + bw > max_x {
-                            break;
-                        }
-                        spans.push(Span::styled(
-                            label,
-                            Style::default()
-                                .fg(palette().accent)
-                                .bg(palette().surface)
-                                .add_modifier(Modifier::BOLD),
-                        ));
-                        if kb_row >= top && kb_row < top + usize::from(area.height) {
+                if !lp.description.is_empty() {
+                    lines.push(card_line(
+                        &lp.description,
+                        if is_selected {
+                            palette().muted_on_selection()
+                        } else {
+                            Style::default().fg(palette().muted)
+                        },
+                    ));
+                }
+                for (show, label, style, target) in [
+                    (
+                        lp.has_instant_view(),
+                        "[阅读全文]".into(),
+                        accent.bg(palette().surface),
+                        Target::InstantViewLink(message.id),
+                    ),
+                    (
+                        !lp.url.is_empty(),
+                        format!("🔗 {}", lp.url),
+                        link,
+                        Target::PreviewLink(message.id),
+                    ),
+                ] {
+                    if show {
+                        if lines.viewport.contains(&lines.next) {
+                            let label_width = text_width(&text::ellipsize(&label, lp_width)) as u16;
                             text_targets.push((
-                                Rect::new(bx, area.y + (kb_row - top) as u16, bw, 1),
-                                Target::InlineButton(message.id, r_idx, c_idx),
+                                Rect::new(
+                                    area.x + 4,
+                                    area.y + (lines.next - top) as u16,
+                                    label_width,
+                                    1,
+                                ),
+                                target,
                             ));
                         }
-                        bx = bx.saturating_add(bw + 1);
-                        spans.push(Span::raw(" "));
+                        lines.push(card_line(&label, style));
                     }
-                    lines.push(Line::from(spans));
-                    extra_rows += 1;
                 }
             }
+            let kb_width = message
+                .info
+                .inline_keyboard
+                .iter()
+                .map(|row| {
+                    let max_cell = row
+                        .iter()
+                        .map(|button| {
+                            let extra =
+                                if matches!(button.kind, crate::store::InlineButtonKind::Url(_)) {
+                                    2
+                                } else {
+                                    0
+                                };
+                            text_width(&button.text.replace(['\r', '\n', '\t'], " ")) + extra + 4
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    let n = row.len().max(1);
+                    (max_cell * n + n - 1).min(usize::from(width)) as u16
+                })
+                .max()
+                .unwrap_or(0)
+                .max(28.min(width))
+                .min(width);
+            for (r_idx, row) in message.info.inline_keyboard.iter().enumerate() {
+                let mut spans = vec![Span::raw("  ")];
+                let mut x = area.x + 2;
+                let n = row.len().max(1) as u16;
+                let available = kb_width.saturating_sub(n - 1);
+                for (c_idx, button) in row.iter().enumerate() {
+                    let w = available / n + u16::from((c_idx as u16) < available % n);
+                    if w == 0 {
+                        break;
+                    }
+                    let label = inline_label(button, w);
+                    let spare = usize::from(w).saturating_sub(text_width(&label));
+                    let label = format!(
+                        "{}{}{}",
+                        " ".repeat(spare / 2),
+                        label,
+                        " ".repeat(spare - spare / 2)
+                    );
+                    let target = Target::InlineButton(message.id, r_idx, c_idx);
+                    let pressed = app
+                        .mouse_press
+                        .is_some_and(|(_, pressed)| pressed == target);
+                    let style = if pressed {
+                        palette().primary()
+                    } else {
+                        palette()
+                            .surface_base()
+                            .fg(palette().accent)
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    spans.push(Span::styled(label, style));
+                    if lines.viewport.contains(&lines.next) {
+                        text_targets.push((
+                            Rect::new(x, area.y + (lines.next - top) as u16, w, 1),
+                            target,
+                        ));
+                    }
+                    x += w + 1;
+                    spans.push(Span::raw(" "));
+                }
+                lines.push(Line::from(spans));
+            }
             if message.info.can_get_thread && app.active_thread.is_none() {
-                let c_row = before + prefix + body_rows.len() + extra_rows;
+                let c_row = lines.next;
                 let pill = if message.info.reply_count > 0 {
                     format!(" 💬 {} 条评论 › ", message.info.reply_count)
                 } else {
                     " 💬 评论 › ".to_owned()
                 };
-                let cw = UnicodeWidthStr::width(pill.as_str()) as u16;
+                let cw = text_width(pill.as_str()) as u16;
                 if c_row >= top && c_row < top + usize::from(area.height) {
                     text_targets.push((
                         Rect::new(area.x + 2, area.y + (c_row - top) as u16, cw.min(width), 1),
@@ -2696,16 +3085,15 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                             .bg(palette().surface),
                     ),
                 ]));
-                extra_rows += 1;
             }
             if !message.info.reactions.is_empty() {
-                let react_row = before + prefix + body_rows.len() + extra_rows;
+                let react_row = lines.next;
                 let mut r_spans = vec![Span::raw("  ")];
                 let mut rx = area.x + 2;
                 let max_x = area.x + 2 + width;
                 for (idx, r) in message.info.reactions.iter().enumerate() {
                     let pill = format!(" {} {} ", r.emoji, r.count);
-                    let pw = UnicodeWidthStr::width(pill.as_str()) as u16;
+                    let pw = text_width(pill.as_str()) as u16;
                     if rx + pw > max_x {
                         break;
                     }
@@ -2733,27 +3121,12 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
             let skip = top.saturating_sub(before);
             let y = area.y + before.saturating_sub(top) as u16;
             let h = (height - skip).min(usize::from(area.bottom() - y)) as u16;
-            for (index, row) in body_rows.iter().enumerate() {
-                let absolute_row = before + index + prefix;
-                if absolute_row >= top && absolute_row < top + usize::from(area.height) {
-                    let row_area = Rect::new(
-                        area.x + 2,
-                        area.y + (absolute_row - top) as u16,
-                        area.width.saturating_sub(3),
-                        1,
-                    );
-                    text_targets.extend(point_targets(&message.text, *row, source, row_area));
-                }
-            }
+            debug_assert_eq!(lines.next, before + height);
             let has_trailing_blank = skip + usize::from(h) == height;
             visible.push((
                 message.id,
                 Rect::new(area.x, y, area.width.saturating_sub(1), h),
-                lines
-                    .into_iter()
-                    .skip(skip)
-                    .take(usize::from(h))
-                    .collect::<Vec<_>>(),
+                lines.visible,
                 inline.and_then(|media| {
                     let start = media_start.max(top);
                     let end = (media_start + media_height).min(top + usize::from(area.height));
@@ -2779,20 +3152,22 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
         before += height;
     }
     for (id, rect, mut lines, inline, header, retryable, has_trailing_blank) in visible {
-        if Some(id) == app.selected_message {
-            // Keep the trailing blank separator row unhighlighted for a crisp selection block.
-            let content_height = if has_trailing_blank && rect.height > 1 {
-                lines.pop();
-                rect.height - 1
-            } else {
-                rect.height
-            };
-            frame.render_widget(
-                Paragraph::new(lines).style(palette().selection()),
-                Rect::new(rect.x, rect.y, rect.width, content_height),
+        let selected = Some(id) == app.selected_message;
+        if selected && has_trailing_blank && rect.height > 1 {
+            lines.pop();
+        }
+        for (row, line) in lines.iter().enumerate() {
+            let row = Rect::new(rect.x, rect.y + row as u16, rect.width, 1);
+            draw_line(
+                frame,
+                row,
+                line,
+                if selected {
+                    palette().selection()
+                } else {
+                    Style::default()
+                },
             );
-        } else {
-            frame.render_widget(Paragraph::new(lines), rect);
         }
         app.hit_targets.push((rect, Target::Message(id)));
         if let Some((media, area, skip)) = inline {
@@ -2926,7 +3301,8 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let focused = app.composer_focus && app.input_mode != InputMode::Off;
     let inner_width = area.width.saturating_sub(2);
-    let inner_height = area.height.saturating_sub(2);
+    let reaction_row = matches!(app.input_mode, InputMode::React(_)) && area.height >= 5;
+    let inner_height = area.height.saturating_sub(3 + u16::from(reaction_row));
     app.composer_width = usize::from(inner_width.saturating_sub(1)).max(1);
     let row_hint = if !app.draft.is_empty() && inner_width > 1 && inner_height > 0 {
         let edit_width = app.composer_width;
@@ -2976,48 +3352,37 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
             Action::Cancel,
         );
     }
-    let tools = Rect::new(
-        area.x + 1,
-        area.bottom() - 1,
-        area.width.saturating_sub(2),
-        1,
-    );
-    let submit_label = if matches!(app.input_mode, InputMode::Search) {
-        "[查找]"
-    } else if matches!(app.input_mode, InputMode::Edit(_)) {
-        "[保存]"
-    } else if matches!(app.input_mode, InputMode::React(_)) {
-        "[回应]"
-    } else {
-        "[发送]"
+    let tools = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+    let (submit_label, tool) = match app.input_mode {
+        InputMode::Search => ("[查找]", Some(format!("[{} ↻]", app.parity.filter.label()))),
+        InputMode::Edit(_) => ("[保存]", None),
+        InputMode::React(_) => ("[回应]", None),
+        _ => ("[发送]", None),
     };
-    if tools.width >= 36 {
-        let cols = Layout::horizontal([
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Min(1),
-            Constraint::Length(14),
-        ])
-        .split(tools);
-        button(frame, app, cols[0], "[附件]", Action::File);
-        button(frame, app, cols[1], "[贴纸]", Action::Stickers);
-        if app.input_mode == InputMode::Search {
-            let label = format!("[{} ↻]", app.parity.filter.label());
-            button(frame, app, cols[2], &label, Action::CycleMediaFilter);
-        }
-        button(frame, app, cols[3], submit_label, Action::Submit);
+    frame
+        .buffer_mut()
+        .set_style(tools, palette().surface_base());
+    let submit_width = if tools.width >= 36 { 14 } else { 8 }.min(tools.width);
+    let submit = Rect::new(tools.right() - submit_width, tools.y, submit_width, 1);
+    if let Some(label) = tool {
+        let filter = Rect::new(tools.x, tools.y, (tools.width - submit_width).min(18), 1);
+        button(frame, app, filter, &label, Action::CycleMediaFilter);
     } else {
-        let cols = Layout::horizontal([
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-        ])
-        .split(tools);
-        button(frame, app, cols[0], "[附件]", Action::File);
-        button(frame, app, cols[1], "[贴纸]", Action::Stickers);
-        button(frame, app, cols[2], submit_label, Action::Submit);
+        let left_width = (tools.width - submit_width).min(20);
+        let first = Rect::new(tools.x, tools.y, left_width / 2, 1);
+        let second = Rect::new(first.right(), tools.y, left_width - first.width, 1);
+        button(frame, app, first, "[附件]", Action::File);
+        button(frame, app, second, "[贴纸]", Action::Stickers);
     }
-    let editor_area = if matches!(app.input_mode, InputMode::React(_)) && inner.height >= 3 {
+    button(frame, app, submit, submit_label, Action::Submit);
+
+    let inner = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let editor_area = if reaction_row && inner.height >= 2 {
         let strip = Rect::new(inner.x, inner.y, inner.width, 1);
         let mut x = strip.x;
         for (idx, reaction) in app
@@ -3028,7 +3393,7 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
             .enumerate()
         {
             let label = format!("{}{}", idx + 1, reaction.label());
-            let w = (UnicodeWidthStr::width(label.as_str()) as u16) + 2;
+            let w = (text_width(label.as_str()) as u16) + 2;
             if x + w > strip.right() {
                 break;
             }
@@ -4158,14 +4523,14 @@ fn quick_switcher_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 String::new()
             };
-            let badge_w = UnicodeWidthStr::width(badge.as_str());
+            let badge_w = text_width(badge.as_str());
             let prefix = if is_sel { "› " } else { "  " };
             let text_w = usize::from(row_w).saturating_sub(2);
             let title_str = crate::text::ellipsize(
                 title,
                 text_w.saturating_sub(badge_w + usize::from(badge_w > 0)),
             );
-            let pad = text_w.saturating_sub(UnicodeWidthStr::width(title_str.as_str()) + badge_w);
+            let pad = text_w.saturating_sub(text_width(title_str.as_str()) + badge_w);
             let badge_style = if *remote || chat.is_some_and(|c| c.muted) {
                 Style::default().fg(palette().muted).bg(palette().surface)
             } else {
@@ -4341,19 +4706,19 @@ fn help_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let lines = vec![
         Line::styled("浏览会话", Style::default().fg(palette().accent)),
         muted("单击选择 · 右键操作 · 滚轮滚动所在面板"),
-        Line::from("Ctrl+K / K 快速切换会话    I 会话详情    Tab 切换面板"),
+        Line::from("Ctrl+K / K 快速切换会话    Shift+I 会话详情    Tab 切换面板"),
         Line::from("↑ ↓ / j k 选择    Enter 打开    [ ] 切换分组"),
         Line::from("g 加载更早消息    m 更多会话    PgUp/PgDn 滚动消息"),
         Line::from(""),
         Line::styled("聊天与附件", Style::default().fg(palette().accent)),
         Line::from("i 写消息    Enter 消息操作/媒体预览    Space 更多操作"),
         Line::from("r 回复    e 编辑    f 转发    x 回应（1-8 快捷）    d 删除"),
-        Line::from("V 多选批量操作    L 链接与 @提及    S 收藏    D 复读"),
+        Line::from("V 多选    L 链接与 @提及    B Bot 按钮    S 收藏    D 复读"),
         Line::from("p 图片 / a 文件 / Ctrl+O 附件 · t 贴纸 · / 搜索（Ctrl+F 筛选）"),
         Line::from("F7 / Ctrl+V 读取剪贴板图片、文件或文字；F8 确认发送"),
         Line::from("附件：点击多选 / 拖入路径 · Tab 说明 · F8 / Ctrl+Enter 发送"),
         Line::from("贴纸：缩略图网格 · [ ] 切换包 · / 搜索 · 点击发送"),
-        Line::from("v 预览媒体（[ ] 切换相册）  E 另存为  o 系统打开  T 话题列表"),
+        Line::from("[ ] 切换相册图片    o 打开大图或文件    E 另存为    T 话题"),
         Line::from("F9 代理设置（登录页可用，支持 SOCKS5 / HTTP / MTProto / 环境变量）"),
         Line::from(""),
         Line::styled("输入与导航", Style::default().fg(palette().accent)),
@@ -4388,7 +4753,7 @@ fn settings_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     ])
     .split(inner);
     let theme_label = format!("[配色：{} · t]", palette().name);
-    let theme_w = (UnicodeWidthStr::width(theme_label.as_str()) as u16 + 2).min(rows[1].width);
+    let theme_w = (text_width(theme_label.as_str()) as u16 + 2).min(rows[1].width);
     let sep_w = rows[1].width.saturating_sub(theme_w);
     if sep_w > 0 {
         frame.render_widget(
@@ -4842,6 +5207,167 @@ fn proxy_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     button(frame, app, btns[5], "[直连·0]", Action::ProxyDisableAll);
 }
 
+fn instant_view_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
+    use crate::instant_view::{Kind, State};
+
+    let inner = modal(frame, app, centered(area, 84, area.height), "即时阅读");
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let footer = Layout::horizontal([Constraint::Min(1), Constraint::Length(9)]).split(rows[1]);
+    frame
+        .buffer_mut()
+        .set_style(rows[1], palette().surface_base());
+    button(
+        frame,
+        app,
+        footer[0],
+        "[在浏览器打开]",
+        Action::OpenInstantViewBrowser,
+    );
+    button(frame, app, footer[1], "[关闭]", Action::CloseInstantView);
+    let Some(reader) = &mut app.instant_view else {
+        return;
+    };
+    let body = rows[0];
+    reader.page = usize::from(body.height).max(1);
+    let article = match &reader.state {
+        State::Loading => {
+            empty(frame, body, "正在加载…", "o 在浏览器打开");
+            return;
+        }
+        State::Failed => {
+            empty(frame, body, "无法加载即时阅读", "按 o 在浏览器打开");
+            return;
+        }
+        State::Ready(article) => article,
+    };
+
+    // Reserve a column for the scrollbar so resizing never changes wrapping twice.
+    let width = usize::from(body.width.saturating_sub(1)).max(1);
+    let block_layout = |block: &crate::instant_view::Block| {
+        let indent = (usize::from(block.indent) * 2).min(width / 3);
+        let bar = 2 * usize::from(matches!(block.kind, Kind::Quote | Kind::Code));
+        (indent, width.saturating_sub(indent + bar).max(1))
+    };
+    let skips_gap = |kind: Kind| matches!(kind, Kind::Divider | Kind::Code | Kind::Muted);
+    let total: usize = article
+        .blocks
+        .iter()
+        .map(|block| {
+            text::row_count(&block.text, block_layout(block).1)
+                + usize::from(!skips_gap(block.kind))
+        })
+        .sum::<usize>()
+        + usize::from(article.partial);
+    reader.max_scroll = total.saturating_sub(reader.page);
+    reader.scroll = reader.scroll.min(reader.max_scroll);
+    let top = reader.scroll;
+    let end = top + reader.page;
+    let max_scroll = reader.max_scroll;
+    let mut index = 0;
+    for block in &article.blocks {
+        if index >= end {
+            break;
+        }
+        let (indent, wrap_width) = block_layout(block);
+        let (prefix, style) = match block.kind {
+            Kind::Title => (
+                "",
+                Style::default()
+                    .fg(palette().accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Kind::Heading => (
+                "",
+                Style::default()
+                    .fg(palette().incoming)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Kind::Muted => ("", Style::default().fg(palette().muted)),
+            Kind::Quote => ("┃ ", Style::default().fg(palette().muted)),
+            Kind::Code => ("┃ ", palette().surface_base().fg(palette().incoming)),
+            Kind::Divider => ("", Style::default().fg(palette().border)),
+            Kind::Body => ("", Style::default().fg(palette().text)),
+        };
+        text::scan_rows(&block.text, wrap_width, |row| {
+            if (top..end).contains(&index) {
+                let y = body.y + (index - top) as u16;
+                let line = if matches!(block.kind, Kind::Divider) {
+                    Line::raw("─".repeat(wrap_width))
+                } else {
+                    Line::from(vec![
+                        Span::raw(prefix),
+                        Span::raw(&block.text[row.start..row.end]),
+                    ])
+                };
+                draw_line(
+                    frame,
+                    Rect::new(body.x + indent as u16, y, (width - indent) as u16, 1),
+                    &line,
+                    style,
+                );
+            }
+            index += 1;
+        });
+        index += usize::from(!skips_gap(block.kind));
+    }
+    if article.partial && (top..end).contains(&index) {
+        let rect = Rect::new(body.x, body.y + (index - top) as u16, width as u16, 1);
+        draw_line(
+            frame,
+            rect,
+            &muted("内容未完整显示 · o 在浏览器打开"),
+            Style::default(),
+        );
+    }
+    scrollbar(frame, app, body, Pane::Modal, top, max_scroll);
+}
+
+fn inline_picker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
+    let inner = modal(frame, app, centered(area, 60, 16), "Bot 按钮");
+    let Some(picker) = &app.inline_picker else {
+        return;
+    };
+    let Some(message) = app
+        .active_messages()
+        .iter()
+        .find(|message| message.id == picker.message)
+    else {
+        empty(frame, inner, "消息已移出当前窗口", "Esc 关闭");
+        return;
+    };
+    let count = message.inline_buttons().count();
+    if count == 0 {
+        empty(frame, inner, "按钮已更新", "Esc 关闭");
+        return;
+    }
+    let selected = picker.selected.min(count - 1);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(usize::from(inner.height));
+    let mut targets = Vec::new();
+    for (index, (row, col, button)) in message
+        .inline_buttons()
+        .enumerate()
+        .skip(start)
+        .take(usize::from(inner.height))
+    {
+        let rect = Rect::new(inner.x, inner.y + (index - start) as u16, inner.width, 1);
+        let style = if index == selected {
+            palette().selection()
+        } else {
+            palette().surface_base()
+        };
+        let label = inline_label(button, inner.width.saturating_sub(2));
+        let line = Line::from(vec![
+            Span::raw(if index == selected { "› " } else { "  " }),
+            Span::raw(label),
+        ]);
+        draw_line(frame, rect, &line, style);
+        targets.push((rect, Target::InlineButton(message.id, row, col)));
+    }
+    app.hit_targets.extend(targets);
+}
+
 fn link_picker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(picker) = &app.link_picker else {
         return;
@@ -4861,7 +5387,8 @@ fn link_picker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         let is_sel = idx == selected;
         let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
         let label = match item {
-            crate::store::LinkItem::Url(url) => format!("🔗 {url}"),
+            crate::store::LinkItem::Url(url) => format!("浏览器 · {url}"),
+            crate::store::LinkItem::InstantView(url) => format!("阅读全文 · {url}"),
             crate::store::LinkItem::Mention(handle) => format!("@ {handle} · 打开会话"),
         };
         let line = Line::from(vec![
@@ -5083,6 +5610,256 @@ pub(crate) mod tests {
         app.selected_message = Some(2);
         app.focus_messages = true;
         app
+    }
+
+    #[test]
+    fn bot_keyboards_share_emoji_width_background_and_hit_areas() {
+        use crate::store::{InlineButton, InlineButtonKind};
+        let mut app = fixture();
+        let name = "✏️ Other (type answer)";
+        app.store.messages[1].info.inline_keyboard = vec![
+            vec![InlineButton {
+                text: name.into(),
+                kind: InlineButtonKind::Callback("YQ==".into()),
+            }],
+            vec![
+                InlineButton {
+                    text: "网址".repeat(9),
+                    kind: InlineButtonKind::Url("https://example.com".into()),
+                },
+                InlineButton {
+                    text: "确认".into(),
+                    kind: InlineButtonKind::Callback("Yg==".into()),
+                },
+            ],
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let get = |r, c| {
+            app.hit_targets
+                .iter()
+                .find(|(_, target)| *target == Target::InlineButton(2, r, c))
+                .unwrap()
+                .0
+        };
+        let single = get(0, 0);
+        let left = get(1, 0);
+        let right = get(1, 1);
+        assert_eq!(single.width, left.width + right.width + 1);
+        assert_eq!(left.right() + 1, right.x);
+        assert!(left.width.abs_diff(right.width) <= 1);
+        let buffer = terminal.backend().buffer();
+        let pencil = (single.x..single.right())
+            .find(|&x| buffer[(x, single.y)].symbol() == "✏️")
+            .unwrap();
+        assert_eq!(buffer[(pencil + 2, single.y)].symbol(), " ");
+        assert_eq!(buffer[(pencil + 3, single.y)].symbol(), "O");
+        assert_eq!(
+            buffer[(pencil, single.y)].bg,
+            buffer[(pencil + 1, single.y)].bg
+        );
+        let previous =
+            ratatui::buffer::Buffer::filled(buffer.area, ratatui::buffer::Cell::new("x"));
+        assert!(
+            !previous
+                .diff(buffer)
+                .iter()
+                .any(|(x, y, _)| *x == pencil + 1 && *y == single.y)
+        );
+        let output = snapshot(&mut app, 80, 24);
+        assert!(output.contains(name));
+        assert!(!output.contains("[✏"));
+        assert!(output.contains("… ↗"));
+
+        // Short single-column keyboards stay compact on wide terminals instead of stretching 100+ cols.
+        app.store.messages[1].info.inline_keyboard = vec![
+            vec![InlineButton {
+                text: "1".into(),
+                kind: InlineButtonKind::Callback("MQ==".into()),
+            }],
+            vec![InlineButton {
+                text: name.into(),
+                kind: InlineButtonKind::Callback("YQ==".into()),
+            }],
+        ];
+        let mut wide = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        wide.draw(|frame| draw(frame, &mut app)).unwrap();
+        let top_btn = app
+            .hit_targets
+            .iter()
+            .find(|(_, target)| *target == Target::InlineButton(2, 0, 0))
+            .unwrap()
+            .0;
+        let bottom_btn = app
+            .hit_targets
+            .iter()
+            .find(|(_, target)| *target == Target::InlineButton(2, 1, 0))
+            .unwrap()
+            .0;
+        assert_eq!(top_btn.width, bottom_btn.width);
+        assert!(top_btn.width <= 36 && top_btn.width >= 26);
+    }
+
+    #[test]
+    fn folded_album_shows_one_caption_and_one_media_hit() {
+        let mut app = fixture();
+        for (index, message) in app.store.messages.iter_mut().enumerate() {
+            message.text = "[图片] 相册共用说明".into();
+            message.info.media_album_id = 22;
+            message.media = Some(MediaRef {
+                kind: MediaKind::Photo,
+                file_id: index as i32 + 10,
+                path: None,
+                detail: None,
+            });
+        }
+        let output = snapshot(&mut app, 80, 24);
+        assert_eq!(output.matches("相册共用说明").count(), 1);
+        assert!(output.contains("[相册 2/2]"));
+        assert!(output.contains("o 大图"));
+        assert_eq!(app.timeline_rows.len(), 1);
+        assert_eq!(app.visible_media, [11]);
+        assert!(
+            !app.hit_targets
+                .iter()
+                .any(|(_, target)| *target == Target::Media(1))
+        );
+    }
+
+    #[test]
+    fn wrapped_quotes_and_code_keep_prefixes_styles_and_text_hits() {
+        let mut app = fixture();
+        let quote = "这一段引用包含足够多的文字可以在小终端里稳定折行，不丢掉左侧竖线。";
+        let code = r#"let 中文 = "✏️";"#;
+        let body = format!("{quote}\n{code}");
+        app.store.messages[1].text = body;
+        app.store.messages[1].info.entities = vec![
+            TextEntity {
+                start: 0,
+                end: quote.len(),
+                kind: EntityKind::BlockQuote,
+            },
+            TextEntity {
+                start: quote.len() + 1,
+                end: quote.len() + 1 + code.len(),
+                kind: EntityKind::Pre("rust".into()),
+            },
+            TextEntity {
+                start: 0,
+                end: "这".len(),
+                kind: EntityKind::Underline,
+            },
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(45, 22)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let first = app
+            .hit_targets
+            .iter()
+            .find(|(_, target)| {
+                *target
+                    == Target::Text(Point {
+                        source: Source::Message(2),
+                        byte: 0,
+                    })
+            })
+            .unwrap()
+            .0;
+        assert_eq!(buffer[(first.x - 2, first.y)].symbol(), "┃");
+        assert_eq!(buffer[(first.x - 2, first.y + 1)].symbol(), "┃");
+        assert!(
+            buffer[(first.x, first.y)]
+                .modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        let code_start = app
+            .hit_targets
+            .iter()
+            .find(|(_, target)| {
+                *target
+                    == Target::Text(Point {
+                        source: Source::Message(2),
+                        byte: quote.len() + 1,
+                    })
+            })
+            .unwrap()
+            .0;
+        assert_eq!(buffer[(code_start.x, code_start.y - 1)].symbol(), "r");
+        assert_eq!(buffer[(code_start.x - 2, code_start.y)].symbol(), "┃");
+        let end_hit = app
+            .hit_targets
+            .iter()
+            .find(|(_, target)| {
+                *target
+                    == Target::Text(Point {
+                        source: Source::Message(2),
+                        byte: quote.len() + 1 + code.len(),
+                    })
+            })
+            .unwrap()
+            .0;
+        assert_eq!(
+            buffer[(end_hit.right() - 1, code_start.y)].bg,
+            palette().surface
+        );
+    }
+
+    #[test]
+    fn composer_tools_stay_inside_the_border_and_shortcuts_follow_modal_context() {
+        for (width, height) in [(80, 24), (120, 36)] {
+            let mut app = fixture();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let composer = app
+                .hit_targets
+                .iter()
+                .find(|(_, target)| *target == Target::Composer)
+                .unwrap()
+                .0;
+            for action in [Action::File, Action::Stickers, Action::Submit] {
+                let rect = app
+                    .hit_targets
+                    .iter()
+                    .find(|(rect, target)| {
+                        *target == Target::Command(action) && rect.y > composer.y
+                    })
+                    .unwrap()
+                    .0;
+                assert_eq!(rect.y, composer.bottom() - 2);
+                assert_eq!(
+                    terminal.backend().buffer()[(rect.x, rect.y + 1)].symbol(),
+                    "─"
+                );
+            }
+            let footer = shortcut_hint(&app, width);
+            assert!(
+                footer.contains("r 回复") && footer.contains("Ctrl+K") && footer.contains("Enter")
+            );
+            assert!(!footer.contains("I 详情"));
+            app.input_mode = InputMode::Search;
+            snapshot(&mut app, width, height);
+            assert!(app.hit_targets.iter().any(|(rect, target)| {
+                *target == Target::Command(Action::CycleMediaFilter)
+                    && rect.y == composer.bottom() - 2
+            }));
+        }
+        let mut app = fixture();
+        app.proxy.open = true;
+        assert!(shortcut_hint(&app, 40).contains("新增"));
+        app.proxy.open = false;
+        app.show_topics = true;
+        assert!(shortcut_hint(&app, 40).contains("话题"));
+        app.show_topics = false;
+        app.link_picker = Some(crate::LinkPicker {
+            items: Vec::new(),
+            selected: 0,
+        });
+        assert!(shortcut_hint(&app, 40).contains("链接"));
+        app.link_picker = None;
+        app.instant_view = Some(crate::instant_view::Reader::new(
+            "https://graph.org/example".into(),
+        ));
+        assert!(shortcut_hint(&app, 40).contains("浏览器"));
     }
 
     #[test]
@@ -5471,7 +6248,7 @@ pub(crate) mod tests {
                 .flat_map(|y| {
                     (0..width).map(move |x| {
                         let cell = &buffer[(x, y)];
-                    json!({"x":x,"y":y,"text":cell.symbol(),"width":UnicodeWidthStr::width(cell.symbol()).max(1),"fg":format!("{:?}",cell.fg),
+                    json!({"x":x,"y":y,"text":cell.symbol(),"width":text_width(cell.symbol()).max(1),"fg":format!("{:?}",cell.fg),
                     "bg":format!("{:?}",cell.bg),"modifiers":cell.modifier.bits()})
                     })
                 })
@@ -5488,7 +6265,7 @@ pub(crate) mod tests {
             while x < width {
                 let symbol = buffer[(x, y)].symbol();
                 output.push_str(symbol);
-                x += (UnicodeWidthStr::width(symbol) as u16).max(1);
+                x += (text_width(symbol) as u16).max(1);
             }
             output.push('\n');
         }
@@ -5844,11 +6621,7 @@ pub(crate) mod tests {
         let text = "中文👨‍👩‍👧‍👦e\u{301} test\n第二行";
         let lines = wrap_text(text, 8);
         assert_eq!(lines.concat(), text.replace('\n', ""));
-        assert!(
-            lines
-                .iter()
-                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 8)
-        );
+        assert!(lines.iter().all(|line| text_width(line.as_str()) <= 8));
         let mut app = fixture();
         app.store.messages[1].text = "这是长消息。".repeat(50);
         app.timeline_anchor = Some((2, 5));
@@ -5970,7 +6743,7 @@ pub(crate) mod tests {
                     found_failed_status = true;
                     break;
                 }
-                x += (UnicodeWidthStr::width(buffer[(x, y)].symbol()) as u16).max(1);
+                x += (text_width(buffer[(x, y)].symbol()) as u16).max(1);
             }
             if found_failed_status {
                 break;
@@ -6181,6 +6954,7 @@ pub(crate) mod tests {
         app.store.messages[0].info.media_album_id = 999;
         app.store.messages[1].info.media_album_id = 999;
         app.store.messages[0].info.link_preview = Some(crate::store::LinkPreview {
+            instant_view_version: 0,
             site_name: "GitHub".into(),
             title: "Teleaf Repo".into(),
             description: "终端客户端仓库".into(),
@@ -6199,10 +6973,12 @@ pub(crate) mod tests {
         app.store.messages[0].info.can_get_thread = true;
         app.store.messages[0].info.reply_count = 7;
         app.timeline_heights.clear();
+        app.selected_message = Some(1);
         let timeline = snapshot(&mut app, 110, 36);
-        assert!(timeline.contains("[相册 1/2]") && timeline.contains("[相册 2/2]"));
+        assert!(timeline.contains("[相册 1/2]"));
+        assert_eq!(app.timeline_rows.len(), 1);
         assert!(timeline.contains("GitHub · Teleaf Repo") && timeline.contains("终端客户端仓库"));
-        assert!(timeline.contains("[官网 ↗]") && timeline.contains("[确认]"));
+        assert!(timeline.contains("官网 ↗") && timeline.contains("确认"));
         assert!(timeline.contains("7 条评论"));
         assert!(
             app.hit_targets

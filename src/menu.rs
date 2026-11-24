@@ -102,6 +102,11 @@ const MESSAGE: &[Item] = &[
         action: Action::OpenMessageLink,
     },
     Item {
+        label: "Bot 按钮",
+        key: 'B',
+        action: Action::InlineButtons,
+    },
+    Item {
         label: "多选消息",
         key: 'V',
         action: Action::ToggleMultiSelect,
@@ -222,6 +227,7 @@ pub fn items(app: &App) -> impl Iterator<Item = Item> + '_ {
             Action::Reply | Action::React | Action::ToggleMultiSelect => message.is_some(),
             Action::JumpToMessage => app.show_search && message.is_some(),
             Action::OpenMessageLink => message.is_some_and(|m| !m.links_and_mentions().is_empty()),
+            Action::InlineButtons => message.is_some_and(|m| m.inline_buttons().next().is_some()),
             Action::QuoteBack => app.quote_back.is_some(),
             Action::ClearSearch => app.show_search,
             Action::QuickSwitch => true,

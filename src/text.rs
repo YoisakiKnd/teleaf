@@ -1,7 +1,78 @@
 //! Byte cursors on grapheme boundaries; terminal columns are display widths.
 use crossterm::event::KeyCode;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+
+pub fn grapheme_width(grapheme: &str) -> usize {
+    use ratatui::buffer::CellWidth;
+
+    if grapheme.chars().any(char::is_control) {
+        return 0;
+    }
+    let width = usize::from(grapheme.cell_width());
+    if width == 1
+        && grapheme.contains('\u{fe0f}')
+        && grapheme.starts_with(|ch: char| !ch.is_ascii())
+    {
+        2
+    } else {
+        width
+    }
+}
+
+pub fn width(text: &str) -> usize {
+    text.graphemes(true).map(grapheme_width).sum()
+}
+
+pub const MAX_WEB_URL_BYTES: usize = 4096;
+
+fn web_host(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || url.len() > MAX_WEB_URL_BYTES
+        || url.contains(|ch: char| ch.is_whitespace() || ch.is_control() || ch == '\\')
+    {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let (host, port) = if let Some(ip) = authority.strip_prefix('[') {
+        let (ip, suffix) = ip.split_once(']')?;
+        ip.parse::<std::net::Ipv6Addr>().ok()?;
+        (
+            ip,
+            if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix.strip_prefix(':')?)
+            },
+        )
+    } else {
+        authority
+            .split_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)))
+    };
+    if host.is_empty()
+        || host.contains(['@', '[', ']'])
+        || port.is_some_and(|port| {
+            port.is_empty()
+                || !port.bytes().all(|byte| byte.is_ascii_digit())
+                || port.parse::<u16>().is_err()
+        })
+    {
+        return None;
+    }
+    Some(host)
+}
+
+pub fn web_url(url: &str) -> bool {
+    web_host(url).is_some()
+}
+
+pub fn is_telegraph(url: &str) -> bool {
+    web_host(url).is_some_and(|host| {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        host.eq_ignore_ascii_case("telegra.ph") || host.eq_ignore_ascii_case("graph.org")
+    })
+}
 
 pub fn cursor(text: &str, position: usize) -> usize {
     if position >= text.len() {
@@ -157,11 +228,11 @@ pub fn move_vertical(text: &str, position: usize, width: usize, delta: isize) ->
     if target == current {
         return pos;
     }
-    let col = UnicodeWidthStr::width(&text[list[current].start..pos.min(list[current].end)]);
+    let col = self::width(&text[list[current].start..pos.min(list[current].end)]);
     let row = list[target];
     let mut used = 0;
     for (i, g) in text[row.start..row.end].grapheme_indices(true) {
-        let size = UnicodeWidthStr::width(g);
+        let size = grapheme_width(g);
         if used + size > col {
             return row.start + i;
         }
@@ -189,7 +260,7 @@ pub fn row_count(text: &str, width: usize) -> usize {
 }
 
 pub fn ellipsize(text: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(text) <= width {
+    if self::width(text) <= width {
         return text.to_owned();
     }
     if width == 0 {
@@ -198,7 +269,7 @@ pub fn ellipsize(text: &str, width: usize) -> String {
     let mut output = String::new();
     let mut used = 0;
     for g in text.graphemes(true) {
-        let size = UnicodeWidthStr::width(g);
+        let size = grapheme_width(g);
         if used + size >= width {
             break;
         }
@@ -209,7 +280,7 @@ pub fn ellipsize(text: &str, width: usize) -> String {
     output
 }
 
-fn scan_rows(text: &str, width: usize, mut emit: impl FnMut(Row)) {
+pub fn scan_rows(text: &str, width: usize, mut emit: impl FnMut(Row)) {
     let width = width.max(1);
     let mut start = 0;
     let mut used = 0;
@@ -219,7 +290,7 @@ fn scan_rows(text: &str, width: usize, mut emit: impl FnMut(Row)) {
             start = i + g.len();
             used = 0;
         } else {
-            let size = UnicodeWidthStr::width(g);
+            let size = grapheme_width(g);
             if used > 0 && used + size > width {
                 emit(Row { start, end: i });
                 start = i;
@@ -238,7 +309,7 @@ fn scan_rows(text: &str, width: usize, mut emit: impl FnMut(Row)) {
 pub fn hit(text: &str, row: Row, column: usize, masked: bool) -> usize {
     let mut used = 0;
     for (i, g) in text[row.start..row.end].grapheme_indices(true) {
-        let size = if masked { 1 } else { UnicodeWidthStr::width(g) };
+        let size = if masked { 1 } else { grapheme_width(g) };
         if column < used + size {
             return row.start + i;
         }
@@ -250,6 +321,63 @@ pub fn hit(text: &str, row: Row, column: usize, masked: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn emoji_presentation_uses_the_same_columns_in_wrap_hit_and_ellipsis() {
+        let pencil = "✏️";
+        let value = "✏️中a";
+        assert_eq!(width(pencil), 2);
+        assert_eq!(width(value), 5);
+        let rows = rows(value, 3);
+        assert_eq!(&value[rows[0].start..rows[0].end], pencil);
+        assert_eq!(&value[rows[1].start..rows[1].end], "中a");
+        assert_eq!(
+            hit(
+                value,
+                Row {
+                    start: 0,
+                    end: value.len()
+                },
+                1,
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            hit(
+                value,
+                Row {
+                    start: 0,
+                    end: value.len()
+                },
+                2,
+                false
+            ),
+            pencil.len()
+        );
+        assert_eq!(ellipsize(value, 3), "✏️…");
+        assert_eq!(width("a\u{fe0f}"), 1);
+    }
+
+    #[test]
+    fn telegraph_capability_matches_the_url_host() {
+        for url in [
+            "HTTPS://Telegra.Ph/article",
+            "http://graph.org:443/article",
+            "https://graph.org./article",
+        ] {
+            assert!(is_telegraph(url));
+        }
+        for url in [
+            "https://telegra.ph.example.com/test",
+            "https://telegra.ph@other.test/test",
+            "https://other.test/?page=https://graph.org",
+            "https://graph.org:bad/test",
+            "file://graph.org/test",
+        ] {
+            assert!(!is_telegraph(url), "{url}");
+        }
+    }
+
     #[test]
     fn unicode_cursor_insert_delete_and_click_use_graphemes() {
         let mut text = "中👨‍👩‍👧‍👦e\u{301}文".to_owned();

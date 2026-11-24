@@ -71,6 +71,27 @@ fn zoomable(app: &App) -> bool {
         })
 }
 
+fn open_message_url(app: &mut App, url: &str) -> bool {
+    let allowed = text::web_url(url)
+        || (["tg://", "mailto:", "tel:"]
+            .iter()
+            .any(|scheme| url.starts_with(scheme))
+            && !url.contains(|ch: char| ch.is_whitespace() || ch.is_control()));
+    let result = if allowed {
+        crate::open_url(url)
+    } else {
+        Err("链接地址无效".into())
+    };
+    match result {
+        Ok(()) => app.notice = Some(format!("已打开链接：{url}")),
+        Err(error) => {
+            app.notice = Some(error);
+            app.notice_error = true;
+        }
+    }
+    true
+}
+
 pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
     if app.show_settings
         && matches!(
@@ -369,16 +390,36 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
             } else if items.len() == 1
                 && let crate::store::LinkItem::Url(url) = &items[0]
             {
-                match crate::open_url(url) {
-                    Ok(()) => app.notice = Some(format!("已打开链接：{url}")),
-                    Err(error) => {
-                        app.notice = Some(error);
-                        app.notice_error = true;
-                    }
-                }
+                open_message_url(app, url);
             } else {
                 app.close_overlays();
                 app.link_picker = Some(crate::LinkPicker { items, selected: 0 });
+            }
+        }
+        Action::InlineButtons => {
+            if let Some(message) = app
+                .selected_message()
+                .filter(|message| message.inline_buttons().next().is_some())
+            {
+                let id = message.id;
+                app.close_overlays();
+                app.inline_picker = Some(crate::InlinePicker {
+                    message: id,
+                    selected: 0,
+                });
+            } else {
+                app.notice = Some("当前消息没有 Bot 按钮".into());
+            }
+        }
+        Action::OpenInstantViewBrowser => {
+            if let Some(url) = app.instant_view.as_ref().map(|reader| reader.url.clone()) {
+                return open_message_url(app, &url);
+            }
+            return false;
+        }
+        Action::CloseInstantView => {
+            if app.instant_view.is_some() {
+                app.close_overlays();
             }
         }
         Action::SaveFileAs => app.save_selected_file(),
@@ -838,7 +879,9 @@ pub fn pan_key(app: &mut App, key: KeyCode) -> bool {
     before != app.preview_view
 }
 fn scroll_modal(app: &mut App, top: usize) -> bool {
-    if let Some(sw) = &mut app.quick_switcher {
+    if let Some(reader) = &mut app.instant_view {
+        reader.set_scroll(top)
+    } else if let Some(sw) = &mut app.quick_switcher {
         let count = app.store.quick_switch_entries(&sw.query).len();
         let next = top.min(count.saturating_sub(1));
         let changed = sw.selected != next;
@@ -1049,6 +1092,7 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                         | Target::Folder(_)
                         | Target::FolderPage(_)
                         | Target::MessageAction(_, _)
+                        | Target::InlineButton(_, _, _)
                         | Target::Media(_)
                         | Target::Chat(_)
                 )
@@ -1126,6 +1170,53 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                 1
             };
             let delta = direction * crate::terminal::scroll_lines();
+            if let Some(reader) = &mut app.instant_view {
+                return target.is_some_and(|target| target != Target::Backdrop)
+                    && reader.scroll_by(delta);
+            }
+            if let Some(message) = app.inline_picker.as_ref().map(|picker| picker.message) {
+                if !target.is_some_and(|target| target != Target::Backdrop) {
+                    return false;
+                }
+                let count = app
+                    .active_messages()
+                    .iter()
+                    .find(|item| item.id == message)
+                    .map_or(0, |item| item.inline_buttons().count());
+                if let Some(picker) = &mut app.inline_picker {
+                    let before = picker.selected;
+                    picker.selected = before
+                        .saturating_add_signed(direction)
+                        .min(count.saturating_sub(1));
+                    return before != picker.selected;
+                }
+                return false;
+            }
+            if let Some(picker) = &mut app.link_picker {
+                if !target.is_some_and(|target| target != Target::Backdrop) {
+                    return false;
+                }
+                let before = picker.selected;
+                picker.selected = before
+                    .saturating_add_signed(direction)
+                    .min(picker.items.len().saturating_sub(1));
+                return before != picker.selected;
+            }
+            if app.show_topics {
+                if !target.is_some_and(|target| target != Target::Backdrop) {
+                    return false;
+                }
+                let count = app
+                    .store
+                    .active_chat
+                    .and_then(|id| app.store.chat(id))
+                    .map_or(0, |chat| chat.topics.len());
+                let before = app.topic_cursor;
+                app.topic_cursor = before
+                    .saturating_add_signed(direction)
+                    .min(count.saturating_sub(1));
+                return before != app.topic_cursor;
+            }
             match target {
                 Some(Target::AttachmentQueue | Target::AttachmentRemove(_))
                     if app.attachments.is_some() =>
@@ -1192,6 +1283,11 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                     | Target::ReferencedMessage(_)
                     | Target::Quote(_, _)
                     | Target::Reaction(_, _)
+                    | Target::AlbumItem(_)
+                    | Target::PreviewLink(_)
+                    | Target::InstantViewLink(_)
+                    | Target::InlineButton(_, _, _)
+                    | Target::CommentThread(_)
                     | Target::Command(Action::Bottom),
                 ) => {
                     let changed = ui::scroll_timeline(app, delta);
@@ -1325,9 +1421,35 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
         | Target::Quote(id, _)
         | Target::InlineButton(id, _, _)
         | Target::CommentThread(id)
+        | Target::PreviewLink(id)
+        | Target::InstantViewLink(id)
             if !app.multi_select.is_empty() =>
         {
             activate(app, worker, Target::Message(id))
+        }
+        Target::AlbumItem(id) => {
+            if !app.active_messages().iter().any(|message| message.id == id) {
+                return false;
+            }
+            app.selected_message = Some(id);
+            app.focus_messages = true;
+            app.composer_focus = false;
+            app.selection = None;
+            true
+        }
+        Target::PreviewLink(id) | Target::InstantViewLink(id) => {
+            let link = app
+                .active_messages()
+                .iter()
+                .find(|message| message.id == id)
+                .and_then(|message| message.info.link_preview.as_ref());
+            match (target, link) {
+                (Target::PreviewLink(_), Some(link)) => open_message_url(app, &link.url.clone()),
+                (Target::InstantViewLink(_), Some(link)) if link.has_instant_view() => {
+                    app.open_instant_view(worker, link.url.clone())
+                }
+                _ => false,
+            }
         }
         Target::Media(id) if app.show_search => app.jump_to(worker, id),
         Target::Media(id) | Target::MessageAction(id, Action::Preview) => {
@@ -1539,15 +1661,9 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                 .cloned();
             app.link_picker = None;
             match item {
-                Some(crate::store::LinkItem::Url(url)) => {
-                    match crate::open_url(&url) {
-                        Ok(()) => app.notice = Some(format!("已打开链接：{url}")),
-                        Err(error) => {
-                            app.notice = Some(error);
-                            app.notice_error = true;
-                        }
-                    }
-                    true
+                Some(crate::store::LinkItem::Url(url)) => open_message_url(app, &url),
+                Some(crate::store::LinkItem::InstantView(url)) => {
+                    app.open_instant_view(worker, url)
                 }
                 Some(crate::store::LinkItem::Mention(handle)) => {
                     app.search_mention(worker, &handle);
@@ -1582,16 +1698,12 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
             let Some(button) = button else {
                 return false;
             };
+            if app.inline_picker.is_some() {
+                app.close_overlays();
+            }
             match button.kind {
                 crate::store::InlineButtonKind::Url(url) if !url.is_empty() => {
-                    match crate::open_url(&url) {
-                        Ok(()) => app.notice = Some(format!("已打开按钮链接：{url}")),
-                        Err(error) => {
-                            app.notice = Some(error);
-                            app.notice_error = true;
-                        }
-                    }
-                    true
+                    open_message_url(app, &url)
                 }
                 crate::store::InlineButtonKind::Callback(data) => {
                     app.request_callback(worker, message_id, &data)
@@ -1658,6 +1770,9 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
                 || app.show_help
                 || app.show_settings
                 || app.quick_switcher.is_some()
+                || app.link_picker.is_some()
+                || app.inline_picker.is_some()
+                || app.instant_view.is_some()
                 || (app.show_chat_info && app.chat_info_modal)
                 || app.preview_message.is_some()
                 || app.show_folders
@@ -1728,6 +1843,197 @@ mod tests {
             .collect();
         app.selected_message = Some(60);
         app
+    }
+
+    #[test]
+    fn keyboard_and_mouse_activate_the_same_bot_callback() {
+        use crate::store::{InlineButton, InlineButtonKind};
+        let mut app = ui::tests::fixture();
+        let (worker, requests) = TdWorker::test_pair();
+        app.store.messages[1].info.inline_keyboard = vec![vec![
+            InlineButton {
+                text: "确认".into(),
+                kind: InlineButtonKind::Callback("YQ==".into()),
+            },
+            InlineButton {
+                text: "✏️ Other (type answer)".into(),
+                kind: InlineButtonKind::Callback("Yg==".into()),
+            },
+        ]];
+        handle_ready_key(&mut app, &worker, KeyCode::Enter);
+        assert!(crate::menu::items(&app).any(|item| item.action == Action::InlineButtons));
+        handle_ready_key(&mut app, &worker, KeyCode::Char('B'));
+        assert!(app.inline_picker.is_some());
+        handle_ready_key(&mut app, &worker, KeyCode::Down);
+        handle_ready_key(&mut app, &worker, KeyCode::Enter);
+        assert!(app.inline_picker.is_none());
+        let TdCommand::Request(keyboard) = requests.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(keyboard["@type"], "getCallbackQueryAnswer");
+        assert_eq!(keyboard["message_id"], 2);
+        assert_eq!(keyboard["payload"]["data"], "Yg==");
+        app.apply(TdEvent::Update(json!({
+            "@type":"callbackQueryAnswer","@extra":keyboard["@extra"],"text":"完成"
+        })));
+        draw(&mut app, 80, 24);
+        assert!(click(&mut app, &worker, Target::InlineButton(2, 0, 1)));
+        let TdCommand::Request(mouse) = requests.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(mouse["payload"], keyboard["payload"]);
+        assert_eq!(mouse["message_id"], keyboard["message_id"]);
+    }
+
+    #[test]
+    fn album_navigation_switches_one_preview_and_preserves_real_message_actions() {
+        use crate::store::{MediaKind, MediaRef};
+        let mut app = ui::tests::fixture();
+        let (worker, requests) = TdWorker::test_pair();
+        for (id, text) in [(3, "同一条相册说明"), (4, "同一条相册说明"), (5, "")] {
+            let mut message = Message {
+                id,
+                text: format!("[图片] {text}"),
+                media: Some(MediaRef {
+                    file_id: id as i32 + 100,
+                    path: None,
+                    kind: MediaKind::Photo,
+                    detail: None,
+                }),
+                ..Message::default()
+            };
+            message.info.media_album_id = 9;
+            app.store.messages.push(message);
+        }
+        app.store.messages.push(Message {
+            id: 6,
+            text: "相册后的消息".into(),
+            ..Message::default()
+        });
+        app.selected_message = Some(2);
+        handle_ready_key(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.selected_message, Some(3));
+        draw(&mut app, 80, 24);
+        assert_eq!(
+            app.timeline_rows
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 6]
+        );
+        assert_eq!(app.visible_media, [103]);
+        assert!(click(&mut app, &worker, Target::AlbumItem(5)));
+        assert_eq!(app.selected_message, Some(5));
+        draw(&mut app, 80, 24);
+        assert_eq!(app.visible_media, [105]);
+        handle_ready_key(&mut app, &worker, KeyCode::Char('['));
+        assert_eq!(app.selected_message, Some(4));
+        handle_ready_key(&mut app, &worker, KeyCode::Char('o'));
+        assert_eq!(app.preview_message, Some(4));
+        let TdCommand::Request(preview) = requests.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(preview["file_id"], 104);
+        handle_ready_key(&mut app, &worker, KeyCode::Esc);
+        handle_ready_key(&mut app, &worker, KeyCode::Char('r'));
+        assert!(matches!(app.input_mode, InputMode::Reply(4)));
+        handle_ready_key(&mut app, &worker, KeyCode::Esc);
+        handle_ready_key(&mut app, &worker, KeyCode::Char('V'));
+        handle_ready_key(&mut app, &worker, KeyCode::Char(']'));
+        handle_ready_key(&mut app, &worker, KeyCode::Char(' '));
+        assert_eq!(app.multi_select, [4, 5]);
+        handle_ready_key(&mut app, &worker, KeyCode::Char('j'));
+        assert_eq!(app.selected_message, Some(6));
+        handle_ready_key(&mut app, &worker, KeyCode::Char('k'));
+        assert_eq!(app.selected_message, Some(3));
+    }
+
+    #[test]
+    fn instant_view_card_and_text_links_open_a_scrollable_modal() {
+        let mut app = ui::tests::fixture();
+        let (worker, requests) = TdWorker::test_pair();
+        let url = "https://telegra.ph/long-page";
+        app.store.messages[1].info.link_preview = Some(crate::store::LinkPreview {
+            url: url.into(),
+            ..Default::default()
+        });
+        draw(&mut app, 80, 24);
+        let card = target(&app, Target::InstantViewLink(2));
+        let browser = target(&app, Target::PreviewLink(2));
+        assert!(browser.y > card.y);
+        assert!(click(&mut app, &worker, Target::InstantViewLink(2)));
+        let TdCommand::Request(request) = requests.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(request["@type"], "getWebPageInstantView");
+        assert_eq!(request["url"], url);
+        assert_eq!(request["only_local"], false);
+        assert!(matches!(
+            app.instant_view.as_ref().unwrap().state,
+            crate::instant_view::State::Loading
+        ));
+        let paragraphs = (0..40)
+            .map(|i| json!({"@type":"pageBlockParagraph","text":format!("段落 {i}")}))
+            .collect::<Vec<_>>();
+        assert!(
+            app.apply(TdEvent::Update(json!({
+                "@type":"webPageInstantView","@extra":request["@extra"],"blocks":paragraphs
+            })))
+            .1
+        );
+        draw(&mut app, 80, 24);
+        assert!(
+            !app.hit_targets
+                .iter()
+                .any(|(_, target)| matches!(target, Target::Message(_)))
+        );
+        let page = app.instant_view.as_ref().unwrap().page;
+        handle_ready_key(&mut app, &worker, KeyCode::PageDown);
+        assert_eq!(app.instant_view.as_ref().unwrap().scroll, page - 1);
+        handle_ready_key(&mut app, &worker, KeyCode::End);
+        let reader = app.instant_view.as_ref().unwrap();
+        assert_eq!(reader.scroll, reader.max_scroll);
+        handle_ready_key(&mut app, &worker, KeyCode::Home);
+        assert_eq!(app.instant_view.as_ref().unwrap().scroll, 0);
+        let modal = target(&app, Target::Modal);
+        assert!(event(&mut app, &worker, MouseEventKind::ScrollDown, modal));
+        assert!(app.instant_view.as_ref().unwrap().scroll > 0);
+        handle_ready_key(&mut app, &worker, KeyCode::Char('q'));
+        assert!(app.instant_view.is_none());
+
+        app.store.messages[1].info.link_preview = None;
+        app.store.messages[1].info.entities = vec![crate::store::TextEntity {
+            start: 0,
+            end: "好".len(),
+            kind: crate::store::EntityKind::TextUrl(url.into()),
+        }];
+        handle_ready_key(&mut app, &worker, KeyCode::Char('L'));
+        assert_eq!(
+            app.link_picker.as_ref().unwrap().items,
+            [
+                crate::store::LinkItem::InstantView(url.into()),
+                crate::store::LinkItem::Url(url.into())
+            ]
+        );
+        handle_ready_key(&mut app, &worker, KeyCode::Enter);
+        assert!(app.instant_view.is_some());
+        let TdCommand::Request(request) = requests.try_recv().unwrap() else {
+            panic!()
+        };
+        app.apply(TdEvent::Update(
+            json!({"@type":"error","@extra":request["@extra"],"code":404}),
+        ));
+        draw(&mut app, 40, 16);
+        assert!(matches!(
+            app.instant_view.as_ref().unwrap().state,
+            crate::instant_view::State::Failed
+        ));
+        assert!(click(
+            &mut app,
+            &worker,
+            Target::Command(Action::CloseInstantView)
+        ));
+        assert!(app.instant_view.is_none());
     }
 
     #[test]

@@ -256,6 +256,21 @@ pub struct LinkPreview {
     pub title: String,
     pub description: String,
     pub url: String,
+    pub instant_view_version: i32,
+}
+
+impl LinkPreview {
+    pub fn has_instant_view(&self) -> bool {
+        crate::text::web_url(&self.url)
+            && (self.instant_view_version > 0 || crate::text::is_telegraph(&self.url))
+    }
+
+    pub fn row_count(&self) -> usize {
+        usize::from(!self.title.is_empty() || !self.site_name.is_empty())
+            + usize::from(!self.description.is_empty())
+            + usize::from(!self.url.is_empty())
+            + usize::from(self.has_instant_view())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,6 +289,7 @@ pub struct InlineButton {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkItem {
     Url(String),
+    InstantView(String),
     Mention(String),
 }
 
@@ -289,13 +305,20 @@ pub struct Reaction {
 pub enum EntityKind {
     Bold,
     Italic,
+    Underline,
     Code,
-    Pre,
+    Pre(String),
+    BlockQuote,
     Strike,
     Spoiler,
     Url,
     TextUrl(String),
     Mention,
+    BotCommand,
+    Hashtag,
+    Cashtag,
+    EmailAddress,
+    PhoneNumber,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,6 +361,20 @@ pub struct Reply {
     pub excerpt: String,
 }
 
+pub fn album_range(messages: &[Message], index: usize) -> std::ops::Range<usize> {
+    let message = &messages[index];
+    let before = messages[..index]
+        .iter()
+        .rev()
+        .take_while(|item| message.same_album(item))
+        .count();
+    let after = messages[index + 1..]
+        .iter()
+        .take_while(|item| message.same_album(item))
+        .count();
+    index - before..index + 1 + after
+}
+
 impl Message {
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
@@ -377,7 +414,7 @@ impl Message {
                 .entities
                 .iter()
                 .map(|e| match &e.kind {
-                    EntityKind::TextUrl(url) => url.capacity(),
+                    EntityKind::TextUrl(text) | EntityKind::Pre(text) => text.capacity(),
                     _ => 0,
                 })
                 .sum::<usize>()
@@ -413,6 +450,23 @@ impl Message {
                 })
                 .sum::<usize>()
     }
+    pub fn same_album(&self, other: &Self) -> bool {
+        self.info.media_album_id != 0 && self.info.media_album_id == other.info.media_album_id
+    }
+
+    pub fn inline_buttons(&self) -> impl Iterator<Item = (usize, usize, &InlineButton)> {
+        self.info
+            .inline_keyboard
+            .iter()
+            .enumerate()
+            .flat_map(|(row, buttons)| {
+                buttons
+                    .iter()
+                    .enumerate()
+                    .map(move |(col, button)| (row, col, button))
+            })
+    }
+
     pub fn links_and_mentions(&self) -> Vec<LinkItem> {
         let mut items: Vec<LinkItem> = Vec::new();
         let mut push = |item: LinkItem| {
@@ -420,19 +474,30 @@ impl Message {
                 items.push(item);
             }
         };
+        let preview = self.info.link_preview.as_ref();
+        let add_url = |url: &str, push: &mut dyn FnMut(LinkItem)| {
+            if crate::text::is_telegraph(url)
+                || preview.is_some_and(|lp| lp.url == url && lp.has_instant_view())
+            {
+                push(LinkItem::InstantView(url.to_owned()));
+            }
+            push(LinkItem::Url(url.to_owned()));
+        };
         for entity in &self.info.entities {
             match &entity.kind {
-                EntityKind::TextUrl(url) if !url.is_empty() => push(LinkItem::Url(url.clone())),
+                EntityKind::TextUrl(url) if !url.is_empty() => add_url(url, &mut push),
                 EntityKind::Url => {
                     if let Some(raw) = self.text.get(entity.start..entity.end).map(str::trim)
                         && !raw.is_empty()
                     {
-                        let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+                        let url = if raw.contains("://") {
                             raw.to_owned()
                         } else {
                             format!("https://{raw}")
                         };
-                        push(LinkItem::Url(url));
+                        if url.len() <= crate::text::MAX_WEB_URL_BYTES {
+                            add_url(&url, &mut push);
+                        }
                     }
                 }
                 EntityKind::Mention => {
@@ -446,10 +511,10 @@ impl Message {
                 _ => {}
             }
         }
-        if let Some(lp) = &self.info.link_preview
+        if let Some(lp) = preview
             && !lp.url.is_empty()
         {
-            push(LinkItem::Url(lp.url.clone()));
+            add_url(&lp.url, &mut push);
         }
         items
     }
@@ -1543,10 +1608,20 @@ impl Store {
                     {
                         if update_kind == "updateMessageEdited" {
                             message.info.edited = integer(update.get("edit_date")) > 0;
+                            if let Some(markup) = update.get("reply_markup") {
+                                message.info.inline_keyboard = parse_inline_keyboard(Some(markup));
+                            }
                         } else {
                             message.info.pinned = update["is_pinned"] == true;
                         }
                     }
+                }
+                if update_kind == "updateMessageEdited"
+                    && Some(chat_id) == self.active_chat
+                    && update.get("reply_markup").is_some()
+                {
+                    trim_messages(&mut self.messages, 6 * 1024 * 1024, false);
+                    trim_messages(&mut self.search_results, 2 * 1024 * 1024, true);
                 }
                 if update_kind == "updateMessageIsPinned"
                     && let Some(chat) = self.chats.get_mut(&chat_id)
@@ -1596,6 +1671,7 @@ impl Store {
                         message.text = content_text(new_content);
                         message.info.text_message = kind(&update["new_content"]) == "messageText";
                         message.info.entities = parse_entities(new_content, &message.text);
+                        message.info.link_preview = new_content.and_then(parse_link_preview);
                         message.info.media_meta = new_content.and_then(parse_media_meta);
                         message.media = new_content.and_then(media_ref);
                     }
@@ -2135,8 +2211,9 @@ fn parse_link_preview(content: &Value) -> Option<LinkPreview> {
             .or_else(|| lp.get("description")),
         180,
     );
-    let url = bounded_text(lp.get("url"), 256);
-    if site_name.is_empty() && title.is_empty() && description.is_empty() {
+    let url = link_url(lp.get("url"), crate::text::MAX_WEB_URL_BYTES);
+    let instant_view_version = i32::try_from(integer(lp.get("instant_view_version"))).unwrap_or(0);
+    if site_name.is_empty() && title.is_empty() && description.is_empty() && url.is_empty() {
         return None;
     }
     Some(LinkPreview {
@@ -2144,7 +2221,16 @@ fn parse_link_preview(content: &Value) -> Option<LinkPreview> {
         title,
         description,
         url,
+        instant_view_version,
     })
+}
+
+fn link_url(value: Option<&Value>, max_bytes: usize) -> String {
+    value
+        .and_then(Value::as_str)
+        .filter(|url| url.len() <= max_bytes)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn parse_inline_keyboard(markup: Option<&Value>) -> Vec<Vec<InlineButton>> {
@@ -2169,7 +2255,7 @@ fn parse_inline_keyboard(markup: Option<&Value>) -> Vec<Vec<InlineButton>> {
                     let btype = &btn["type"];
                     let kind = match kind(btype) {
                         "inlineKeyboardButtonTypeUrl" => {
-                            InlineButtonKind::Url(bounded_text(btype.get("url"), 256))
+                            InlineButtonKind::Url(link_url(btype.get("url"), 256))
                         }
                         "inlineKeyboardButtonTypeCallback" => {
                             InlineButtonKind::Callback(bounded_text(btype.get("data"), 256))
@@ -2226,26 +2312,39 @@ fn parse_reactions(interaction_info: Option<&Value>) -> Vec<Reaction> {
         .collect()
 }
 
-fn utf16_to_byte(text: &str, utf16_offset: usize) -> usize {
+fn utf16_to_byte(text: &str, utf16_offset: usize) -> Option<usize> {
     let mut units = 0usize;
     for (byte_idx, ch) in text.char_indices() {
         if units >= utf16_offset {
-            return byte_idx;
+            return (units == utf16_offset).then_some(byte_idx);
         }
         units += ch.len_utf16();
     }
-    text.len()
+    (units == utf16_offset).then_some(text.len())
+}
+
+fn caption_prefix(content_kind: &str) -> Option<&'static str> {
+    Some(match content_kind {
+        "messagePhoto" => "[图片] ",
+        "messageVideo" => "[视频] ",
+        "messageDocument" => "[文件] ",
+        "messageAudio" => "[音频] ",
+        "messageAnimation" => "[动画] ",
+        "messageVoiceNote" => "[语音消息] ",
+        _ => return None,
+    })
 }
 
 fn parse_entities(content: Option<&Value>, full_text: &str) -> Vec<TextEntity> {
     let Some(content) = content else {
         return Vec::new();
     };
-    let (formatted, prefix_bytes) = match kind(content) {
-        "messageText" => (content.get("text"), 0usize),
-        "messagePhoto" => (content.get("caption"), "[图片] ".len()),
-        "messageVideo" => (content.get("caption"), "[视频] ".len()),
-        _ => return Vec::new(),
+    let (formatted, prefix_bytes) = if kind(content) == "messageText" {
+        (content.get("text"), 0)
+    } else if let Some(prefix) = caption_prefix(kind(content)) {
+        (content.get("caption"), prefix.len())
+    } else {
+        return Vec::new();
     };
     let Some(formatted) = formatted else {
         return Vec::new();
@@ -2261,8 +2360,12 @@ fn parse_entities(content: Option<&Value>, full_text: &str) -> Vec<TextEntity> {
         if length == 0 {
             continue;
         }
-        let start = prefix_bytes + utf16_to_byte(raw, offset);
-        let end = prefix_bytes + utf16_to_byte(raw, offset + length);
+        let Some((start, end)) =
+            utf16_to_byte(raw, offset).zip(utf16_to_byte(raw, offset.saturating_add(length)))
+        else {
+            continue;
+        };
+        let (start, end) = (prefix_bytes + start, prefix_bytes + end);
         if start >= end || end > full_text.len() {
             continue;
         }
@@ -2273,13 +2376,26 @@ fn parse_entities(content: Option<&Value>, full_text: &str) -> Vec<TextEntity> {
             "textEntityTypeBold" => EntityKind::Bold,
             "textEntityTypeItalic" => EntityKind::Italic,
             "textEntityTypeCode" => EntityKind::Code,
-            "textEntityTypePre" | "textEntityTypePreCode" => EntityKind::Pre,
+            "textEntityTypeUnderline" => EntityKind::Underline,
+            "textEntityTypePre" => EntityKind::Pre(String::new()),
+            "textEntityTypePreCode" => {
+                EntityKind::Pre(bounded_text(entity_type.get("language"), 32))
+            }
+            "textEntityTypeBlockQuote" | "textEntityTypeExpandableBlockQuote" => {
+                EntityKind::BlockQuote
+            }
+            "textEntityTypeBotCommand" => EntityKind::BotCommand,
+            "textEntityTypeHashtag" => EntityKind::Hashtag,
+            "textEntityTypeCashtag" => EntityKind::Cashtag,
+            "textEntityTypeEmailAddress" => EntityKind::EmailAddress,
+            "textEntityTypePhoneNumber" => EntityKind::PhoneNumber,
             "textEntityTypeStrikethrough" => EntityKind::Strike,
             "textEntityTypeSpoiler" => EntityKind::Spoiler,
             "textEntityTypeUrl" => EntityKind::Url,
-            "textEntityTypeTextUrl" => {
-                EntityKind::TextUrl(bounded_text(entity_type.get("url"), 256))
-            }
+            "textEntityTypeTextUrl" => EntityKind::TextUrl(link_url(
+                entity_type.get("url"),
+                crate::text::MAX_WEB_URL_BYTES,
+            )),
             "textEntityTypeMention" | "textEntityTypeMentionName" => EntityKind::Mention,
             _ => continue,
         };
@@ -2464,12 +2580,21 @@ fn content_text(content: Option<&Value>) -> String {
     let Some(content) = content else {
         return String::new();
     };
-    match kind(content) {
+    let content_kind = kind(content);
+    if let Some(prefix) = caption_prefix(content_kind)
+        && let Some(caption) = content.pointer("/caption/text").and_then(Value::as_str)
+        && !caption.is_empty()
+    {
+        return format!("{prefix}{caption}");
+    }
+    match content_kind {
         "messageText" => string(content.pointer("/text/text")),
-        "messagePhoto" => format!("[图片] {}", string(content.pointer("/caption/text"))),
+        "messagePhoto" => "[图片] ".into(),
         "messageSticker" => format!("[贴纸] {}", string(content.pointer("/sticker/emoji"))),
-        "messageVideo" => format!("[视频] {}", string(content.pointer("/caption/text"))),
+        "messageVideo" => "[视频] ".into(),
         "messageVoiceNote" => "[语音消息]".into(),
+        "messageAudio" => "[音频]".into(),
+        "messageAnimation" => "[动画]".into(),
         "messageDocument" => format!("[文件] {}", string(content.pointer("/document/file_name"))),
         other if !other.is_empty() => format!("[{other}]"),
         _ => "[未知消息]".into(),
@@ -2480,6 +2605,123 @@ fn content_text(content: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn media_captions_use_utf16_offsets_after_the_display_prefix() {
+        for content_type in [
+            "messagePhoto",
+            "messageVideo",
+            "messageDocument",
+            "messageAudio",
+            "messageAnimation",
+            "messageVoiceNote",
+        ] {
+            let value = json!({"id":1,"content":{"@type":content_type,"caption":{
+                "text":"中😀 ✏️ 文",
+                "entities":[
+                    {"offset":4,"length":2,"type":{"@type":"textEntityTypeUnderline"}},
+                    {"offset":2,"length":1,"type":{"@type":"textEntityTypeBold"}},
+                    {"offset":0,"length":999,"type":{"@type":"textEntityTypeItalic"}}
+                ]
+            }}});
+            let message = parse_message(&value).unwrap();
+            assert!(message.text.ends_with("中😀 ✏️ 文"));
+            assert_eq!(message.info.entities.len(), 1);
+            let entity = &message.info.entities[0];
+            assert_eq!(&message.text[entity.start..entity.end], "✏️");
+            assert_eq!(entity.kind, EntityKind::Underline);
+        }
+    }
+
+    #[test]
+    fn retains_block_languages_and_semantic_entity_kinds() {
+        let types = [
+            ("textEntityTypeBlockQuote", EntityKind::BlockQuote),
+            ("textEntityTypeExpandableBlockQuote", EntityKind::BlockQuote),
+            ("textEntityTypePre", EntityKind::Pre(String::new())),
+            ("textEntityTypePreCode", EntityKind::Pre("rust".into())),
+            ("textEntityTypeBotCommand", EntityKind::BotCommand),
+            ("textEntityTypeHashtag", EntityKind::Hashtag),
+            ("textEntityTypeCashtag", EntityKind::Cashtag),
+            ("textEntityTypeEmailAddress", EntityKind::EmailAddress),
+            ("textEntityTypePhoneNumber", EntityKind::PhoneNumber),
+        ];
+        let entities: Vec<_> = types
+            .iter()
+            .enumerate()
+            .map(|(index, (kind, _))| {
+                json!({
+                    "offset":index,"length":1,"type":{"@type":kind,"language":"rust"}
+                })
+            })
+            .collect();
+        let message = parse_message(&json!({"id":1,"content":{"@type":"messageText",
+            "text":{"text":"123456789","entities":entities}}}))
+        .unwrap();
+        assert_eq!(
+            message
+                .info
+                .entities
+                .into_iter()
+                .map(|entity| entity.kind)
+                .collect::<Vec<_>>(),
+            types.map(|(_, kind)| kind)
+        );
+    }
+
+    #[test]
+    fn link_previews_keep_full_urls_and_text_only_telegraph_links_offer_both_actions() {
+        let long_url = format!("https://telegra.ph/{}", "path".repeat(150));
+        let mut message = parse_message(&json!({"id":1,"content":{
+            "@type":"messageText",
+            "text":{"text":"详情","entities":[{"offset":0,"length":2,"type":{"@type":"textEntityTypeTextUrl","url":long_url}}]}
+        }})).unwrap();
+        assert_eq!(
+            message.links_and_mentions(),
+            [
+                LinkItem::InstantView(long_url.clone()),
+                LinkItem::Url(long_url.clone())
+            ]
+        );
+        let url_only = parse_link_preview(&json!({"link_preview":{"url":long_url}})).unwrap();
+        assert_eq!(url_only.url, long_url);
+        assert_eq!(url_only.row_count(), 2);
+        let preview = parse_link_preview(&json!({
+            "link_preview":{"url":"https://example.org/article","instant_view_version":2}
+        }))
+        .unwrap();
+        assert_eq!(preview.instant_view_version, 2);
+        assert!(preview.has_instant_view());
+        message.info.link_preview = Some(preview);
+        assert_eq!(
+            message.links_and_mentions()[2],
+            LinkItem::InstantView("https://example.org/article".into())
+        );
+    }
+
+    #[test]
+    fn edited_messages_refresh_and_remove_inline_markup() {
+        let mut store = Store {
+            active_chat: Some(1),
+            ..Store::default()
+        };
+        store.messages.push(Message {
+            id: 5,
+            ..Message::default()
+        });
+        store.apply(&json!({"@type":"updateMessageEdited","chat_id":1,"message_id":5,
+            "reply_markup":{"@type":"replyMarkupInlineKeyboard","rows":[[
+                {"text":"✏️ Other","type":{"@type":"inlineKeyboardButtonTypeCallback","data":"YQ=="}}
+            ]]}}));
+        assert_eq!(
+            store.messages[0].info.inline_keyboard[0][0].text,
+            "✏️ Other"
+        );
+        store.apply(
+            &json!({"@type":"updateMessageEdited","chat_id":1,"message_id":5,"reply_markup":null}),
+        );
+        assert!(store.messages[0].info.inline_keyboard.is_empty());
+    }
 
     #[test]
     fn forwarded_origins_use_bounded_names_or_existing_sender_lookup() {
