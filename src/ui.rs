@@ -5634,7 +5634,11 @@ pub(crate) mod tests {
             ],
         ];
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap()
+            .buffer
+            .clone();
         let get = |r, c| {
             app.hit_targets
                 .iter()
@@ -5648,7 +5652,6 @@ pub(crate) mod tests {
         assert_eq!(single.width, left.width + right.width + 1);
         assert_eq!(left.right() + 1, right.x);
         assert!(left.width.abs_diff(right.width) <= 1);
-        let buffer = terminal.backend().buffer();
         let pencil = (single.x..single.right())
             .find(|&x| buffer[(x, single.y)].symbol() == "✏️")
             .unwrap();
@@ -5658,11 +5661,15 @@ pub(crate) mod tests {
             buffer[(pencil, single.y)].bg,
             buffer[(pencil + 1, single.y)].bg
         );
+        assert_eq!(
+            buffer[(pencil, single.y)].bg,
+            buffer[(pencil + 2, single.y)].bg
+        );
         let previous =
             ratatui::buffer::Buffer::filled(buffer.area, ratatui::buffer::Cell::new("x"));
         assert!(
             !previous
-                .diff(buffer)
+                .diff(&buffer)
                 .iter()
                 .any(|(x, y, _)| *x == pencil + 1 && *y == single.y)
         );
