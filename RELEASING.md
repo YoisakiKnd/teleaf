@@ -159,9 +159,23 @@ Windows CI 在一次性桌面写入合成剪贴板，ConPTY 验证 CF_DIB 截图
 - `teleaf-0.3.2-linux-x86_64.tar.gz` SHA-256：`29a32f82ee2fc4a3bb2edd299918e57b4eb215c216bc40ef61c5af2c4734233f`
 - `teleaf-0.3.2-windows-x86_64.zip` SHA-256：`299a172569efa609c41a7cf874713a81beed2990850dd4bc99278c41dd2f1283`
 
+## 0.3.3 发布验证
+
+2026-11-27（北京时间）已发布 [v0.3.3](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.3.3)，标签对应 `b381a808a0da019abf9776bcae4fff68346bf634`。本版新增后台线程图片压缩（长边 `> 1600px` 等比缩放、白底合成透明通道、EXIF 方向修正、JPEG 85 编码及上传后自动清理暂存）与重构后的附件窗口（`[图片]` / `[文件]` / `[贴纸]` 分离、分段切换模式、大小与尺寸预估、剪贴板图片回车快速确认）；新增动图与 WebM 视频贴纸支持（时间线缩略图、原生多帧 GIF 及按需 `ffmpeg` 解帧播放、`8 MiB` 有界帧池、独立 Kitty 槽位、`Space` 暂停与关窗/切会话/失焦即刻释放）；新增实时在线状态（有界用户状态缓存、会话列表绿色 `●`、聊天标题栏/详情在线与群在线人数及精准到期刷新）；新增视口稳定触底自动清除 `@` 提及角标与 `Space` 手动清除入口；修复 `updateMessageEdited` 省略 `reply_markup` 时 Bot 内联按钮未清除及高度缓存未失效的问题；精简会话列表底部 `[更多会话]` 按钮（改为触底自动分页）与默认写消息框多余标题和 `[×]`，详见 `CHANGELOG.md`、`docs/USAGE.md` 与 `MEMORY_BUDGET.md`。
+
+[分支 CI 45928622474](https://github.com/YoisakiKnd/teleaf/actions/runs/45928622474)、[标签 CI 45928622453](https://github.com/YoisakiKnd/teleaf/actions/runs/45928622453) 与 [正式发布 45928622475](https://github.com/YoisakiKnd/teleaf/actions/runs/45928622475) 五个平台一次全部通过（`cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、224 项本机全量单元测试含 `TERM=xterm-256color` 与 macOS 私有剪贴板测试、8 项打包测试、9 组 macOS PTY 回归、TDLib 1.8.61 加载及发布前内置凭据登录验证；Windows CI 通过 ConPTY 键鼠/剪贴板与原生 WinRT 通知回归）。
+
+已核对 `v0.3.3` Release 五个平台归档、GitHub 资产摘要、`SHA256SUMS`、`teleaf.rb`、`teleaf.json` 与 MIT 许可证元数据。Homebrew 分发在 `YoisakiKnd/homebrew-tap` 通过 [同步任务 45929510483](https://github.com/YoisakiKnd/homebrew-tap/actions/runs/45929510483) 更新 `Formula/teleaf.rb`（提交 `162b127f73cd2e26de2a42cd53f806a6f2f066f3`）并通过全部四平台 [配方安装测试 45929541958](https://github.com/YoisakiKnd/homebrew-tap/actions/runs/45929541958)；本机 macOS ARM64 另下载校验正式归档，`--version` 输出 `Teleaf 0.3.3`，`--check` 正常加载随包 `TDLib 1.8.61`。自有 Scoop 在 `YoisakiKnd/scoop-bucket` 通过 [同步任务 45929517338](https://github.com/YoisakiKnd/scoop-bucket/actions/runs/45929517338) 更新 `bucket/teleaf.json`（提交 `2a802ca85c9eb9f9d33340cca9b9fc72b945688d`）。两份安装清单与 Release 附带文件逐字节一致，许可证均为 `MIT`。主仓库未重建有效 `Formula/teleaf.rb` 并保留 `tap_migrations.json`，未在 `Mythos-404/eimer` 创建或更新 PR。
+
+- `teleaf-0.3.3-macos-aarch64.tar.gz` SHA-256：`38a5417746634e019083ed8321b38517f34c4b60bfd76206093f36059fbd2145`
+- `teleaf-0.3.3-macos-x86_64.tar.gz` SHA-256：`cfddc233a041b49ab27a0976aa78caa0d19762f0c44a02d3d9791c459bee8ba2`
+- `teleaf-0.3.3-linux-aarch64.tar.gz` SHA-256：`04b14660ccb6fbae205544f589e6ea988b7330c4a53631e83978e30d00942631`
+- `teleaf-0.3.3-linux-x86_64.tar.gz` SHA-256：`07266889da0360563b21a63aadb57bccd6213260eec61b0d4394c298528b519c`
+- `teleaf-0.3.3-windows-x86_64.zip` SHA-256：`2a037a77e8dc4af06ab8489a2055f9ba37a5f34ba22b9c27b52ab60c536eebb5`
+
 ## 用户安装
 
-[v0.3.2](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.3.2) 及安装清单已发布：
+[v0.3.3](https://github.com/YoisakiKnd/teleaf/releases/tag/v0.3.3) 及安装清单已发布：
 
 ```sh
 brew tap YoisakiKnd/tap
