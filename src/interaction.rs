@@ -257,16 +257,34 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                 if let Some(sticker) = app.sticker_items().get(app.sticker_cursor)
                     && let Some(chat) = app.store.active_chat
                 {
-                    let request = actions::send_sticker(
-                        chat,
-                        sticker.file_id,
-                        &sticker.emoji,
-                        sticker.width,
-                        sticker.height,
-                    );
+                    let (request, notice, refresh) = if sticker.is_animation {
+                        (
+                            actions::send_animation(
+                                chat,
+                                sticker.file_id,
+                                sticker.width,
+                                sticker.height,
+                                sticker.duration,
+                            ),
+                            "GIF 已提交",
+                            actions::saved_animations(),
+                        )
+                    } else {
+                        (
+                            actions::send_sticker(
+                                chat,
+                                sticker.file_id,
+                                &sticker.emoji,
+                                sticker.width,
+                                sticker.height,
+                            ),
+                            "贴纸已提交",
+                            actions::recent_stickers(),
+                        )
+                    };
                     if send_request(app, worker, request) {
-                        app.notice = Some("贴纸已提交".into());
-                        send_request(app, worker, actions::recent_stickers());
+                        app.notice = Some(notice.into());
+                        send_request(app, worker, refresh);
                     }
                 }
             } else if app.auth.setup.is_some() || app.auth.state != "authorizationStateReady" {
@@ -2504,6 +2522,8 @@ mod tests {
             detail: Some(crate::store::MediaFile {
                 file_id: 43,
                 path: None,
+                size: 0,
+                is_gif: false,
             }),
         });
         app.selected_message = Some(2);

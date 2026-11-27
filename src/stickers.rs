@@ -9,6 +9,7 @@ pub enum Tab {
     #[default]
     Recent,
     Favorites,
+    Gifs,
     Set(i64),
     Search,
 }
@@ -32,6 +33,7 @@ impl App {
         match self.sticker_panel.tab {
             Tab::Recent => &self.store.recent_stickers,
             Tab::Favorites => &self.store.favorite_stickers,
+            Tab::Gifs => &self.store.saved_animations,
             Tab::Set(id) => self
                 .store
                 .sticker_sets
@@ -46,6 +48,7 @@ impl App {
         let mut tabs = vec![
             (Tab::Recent, "最近".into()),
             (Tab::Favorites, "收藏".into()),
+            (Tab::Gifs, "GIF".into()),
         ];
         tabs.extend(
             self.store
@@ -75,6 +78,7 @@ pub fn open(app: &mut App, worker: &TdWorker) {
         worker,
         json!({"@type":"getFavoriteStickers","@extra":"favorite-stickers"}),
     );
+    send_request(app, worker, actions::saved_animations());
     send_request(
         app,
         worker,
@@ -203,7 +207,7 @@ pub fn download_visible(app: &mut App, worker: &TdWorker) {
     }
     let start = app.sticker_panel.top * app.sticker_panel.columns.max(1);
     let count = app.sticker_panel.rows.max(1) * app.sticker_panel.columns.max(1);
-    let ids: Vec<_> = app
+    let mut ids: Vec<i32> = app
         .sticker_items()
         .iter()
         .skip(start)
@@ -211,6 +215,20 @@ pub fn download_visible(app: &mut App, worker: &TdWorker) {
         .filter(|s| s.preview.path.is_none() && s.preview.file_id > 0)
         .map(|s| s.preview.file_id)
         .collect();
+    // Only download the full animation for the single currently selected tile.
+    if app.terminal_focused
+        && !app.sticker_panel.search_focus
+        && let Some(selected) = app.sticker_items().get(app.sticker_cursor)
+        && selected.preview.kind == crate::store::MediaKind::Animation
+        && let Some(detail) = &selected.preview.detail
+        && detail.path.is_none()
+        && detail.file_id > 0
+        && detail.size <= crate::AUTO_ANIMATION_MAX_BYTES
+        && (detail.is_gif || crate::animation::has_ffmpeg())
+        && !ids.contains(&detail.file_id)
+    {
+        ids.insert(0, detail.file_id);
+    }
     for id in ids {
         if app.requested_files.len() >= 4 {
             break;
@@ -241,11 +259,12 @@ pub fn on_response(app: &mut App, value: &Value) {
 }
 
 pub fn favorite(app: &mut App, worker: &TdWorker) {
-    if let Some(id) = app
-        .sticker_items()
-        .get(app.sticker_cursor)
-        .map(|s| s.file_id)
-    {
+    if let Some(item) = app.sticker_items().get(app.sticker_cursor) {
+        let id = item.file_id;
+        if item.is_animation {
+            send_request(app, worker, actions::remove_saved_animation(id));
+            return;
+        }
         let remove = app.store.favorite_stickers.iter().any(|s| s.file_id == id);
         let request = json!({"@type":if remove { "removeFavoriteSticker" } else { "addFavoriteSticker" },"sticker":{"@type":"inputFileId","id":id},"@extra":"refresh-favorites"});
         send_request(app, worker, request);
@@ -254,6 +273,7 @@ pub fn favorite(app: &mut App, worker: &TdWorker) {
 
 pub fn close(app: &mut App) {
     app.sticker_picker = false;
+    app.media.stop_animation();
     if app.store.active_chat.is_some() {
         if app.input_mode == crate::InputMode::Off {
             app.input_mode = crate::InputMode::Send;
@@ -290,6 +310,7 @@ mod tests {
             vec![
                 "getRecentStickers",
                 "getFavoriteStickers",
+                "getSavedAnimations",
                 "getInstalledStickerSets"
             ]
         );
@@ -331,6 +352,62 @@ mod tests {
         assert!(
             requests.try_recv().is_err(),
             "cached pack should not fetch again"
+        );
+    }
+
+    #[test]
+    fn saved_gifs_tab_only_downloads_animation_detail_for_selected_tile() {
+        let mut app = crate::ui::tests::fixture();
+        let (worker, requests) = TdWorker::test_pair();
+        open(&mut app, &worker);
+        while requests.try_recv().is_ok() {}
+        app.apply(TdEvent::Update(json!({
+            "@type": "animations",
+            "@extra": "saved-animations",
+            "animations": [
+                {
+                    "width": 160,
+                    "height": 120,
+                    "duration": 2,
+                    "mime_type": "image/gif",
+                    "thumbnail": {"format": {"@type": "thumbnailFormatJpeg"}, "file": {"id": 501, "local": {"is_downloading_completed": true, "path": "/t1.jpg"}}},
+                    "animation": {"id": 601, "size": 10000, "local": {"is_downloading_completed": false}}
+                },
+                {
+                    "width": 160,
+                    "height": 120,
+                    "duration": 2,
+                    "mime_type": "image/gif",
+                    "thumbnail": {"format": {"@type": "thumbnailFormatJpeg"}, "file": {"id": 502, "local": {"is_downloading_completed": true, "path": "/t2.jpg"}}},
+                    "animation": {"id": 602, "size": 10000, "local": {"is_downloading_completed": false}}
+                }
+            ]
+        })));
+        select_tab(&mut app, &worker, Tab::Gifs);
+        app.sticker_panel.columns = 3;
+        app.sticker_panel.rows = 2;
+        app.sticker_panel.preview_visible = true;
+        app.sticker_cursor = 1;
+        download_visible(&mut app, &worker);
+        let ids: Vec<_> = requests
+            .try_iter()
+            .filter_map(|r| match r {
+                TdCommand::Request(v) if v["@type"] == "downloadFile" => v["file_id"].as_i64(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![602],
+            "only the selected GIF detail should download"
+        );
+        app.apply(TdEvent::Update(json!({
+            "@type": "updateFile",
+            "file": {"id": 602, "local": {"is_downloading_completed": true, "path": "/gif2.gif"}}
+        })));
+        assert_eq!(
+            app.store.saved_animations[1].preview.detail_file(),
+            (602, Some("/gif2.gif"))
         );
     }
     #[test]

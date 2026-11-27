@@ -368,8 +368,8 @@ impl Picker {
     }
 }
 
-const PHOTO_EDGE: u32 = 1600;
-const DIRECT_JPEG_BYTES: u64 = 512 * 1024;
+const PHOTO_EDGE: u32 = 2560;
+const DIRECT_JPEG_BYTES: u64 = 1536 * 1024;
 const PHOTO_PIXELS: u64 = 24_000_000;
 const PHOTO_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const PHOTO_HEADER_BYTES: u64 = 512 * 1024;
@@ -516,7 +516,7 @@ fn prepare_photos(
             file,
             remaining: bytes,
         };
-        image::codecs::jpeg::JpegEncoder::new_with_quality(writer, 85)
+        image::codecs::jpeg::JpegEncoder::new_with_quality(writer, 90)
             .encode(&rgb, width, height, ColorType::Rgb8.into())
             .map_err(|e| format!("无法编码 JPEG：{e}"))?;
         staged.bytes = fs::metadata(&staged.path).map_err(|e| e.to_string())?.len();
@@ -820,7 +820,7 @@ mod tests {
         let folder = fixture("compression");
         let png = folder.join("transparent.png");
         let jpeg = folder.join("small.jpg");
-        image::RgbaImage::from_pixel(2000, 1000, image::Rgba([0, 40, 80, 0]))
+        image::RgbaImage::from_pixel(3000, 1500, image::Rgba([0, 40, 80, 0]))
             .save(&png)
             .unwrap();
         image::RgbImage::from_pixel(40, 20, image::Rgb([0, 40, 80]))
@@ -839,10 +839,10 @@ mod tests {
         let staged = &prepared[0].staged.as_ref().unwrap().path;
         assert!(prepared[1].staged.is_none());
         let image = image::open(staged).unwrap().to_rgb8();
-        assert_eq!(image.dimensions(), (1600, 800));
+        assert_eq!(image.dimensions(), (2560, 1280));
         assert!(
             image
-                .get_pixel(800, 400)
+                .get_pixel(1280, 640)
                 .0
                 .iter()
                 .all(|value| *value >= 250)
@@ -854,7 +854,7 @@ mod tests {
                 contents[0]["width"].as_u64(),
                 contents[0]["height"].as_u64()
             ),
-            (Some(1600), Some(800))
+            (Some(2560), Some(1280))
         );
         assert_eq!(
             contents[1]["photo"]["path"],

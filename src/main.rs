@@ -51,6 +51,8 @@ use media::MediaManager;
 use store::{Message, Store};
 use tdlib::{TdEvent, TdWorker};
 
+const AUTO_ANIMATION_MAX_BYTES: u64 = 6 * 1024 * 1024;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Off,
@@ -248,6 +250,7 @@ struct App {
     folder_cursor: usize,
     show_folders: bool,
     visible_media: Vec<i32>,
+    visible_animations: Vec<(i32, u64, bool)>,
     visible_read_ids: Vec<i64>,
     selection: Option<selection::Selection>,
     drag: Option<interaction::Drag>,
@@ -348,6 +351,7 @@ impl App {
             folder_cursor: 0,
             show_folders: false,
             visible_media: Vec::new(),
+            visible_animations: Vec::new(),
             visible_read_ids: Vec::new(),
             mouse_press: None,
             selection: None,
@@ -592,11 +596,15 @@ impl App {
                         true,
                     );
                 }
+                if value["@extra"].as_str() == Some("refresh-saved-animations") {
+                    return (Some(actions::saved_animations()), true);
+                }
                 if self.sticker_picker {
                     let request = match self.last_update.as_str() {
                         "updateFavoriteStickers" => Some(
                             json!({"@type":"getFavoriteStickers","@extra":"favorite-stickers"}),
                         ),
+                        "updateSavedAnimations" => Some(actions::saved_animations()),
                         "updateRecentStickers" if value["is_attached"] != true => {
                             Some(actions::recent_stickers())
                         }
@@ -966,7 +974,7 @@ impl App {
         self.terminal_focused = focused;
         self.sync_notification_view();
         if !focused {
-            return self.media.stop_animation();
+            return self.media.stop_all_animations();
         }
         self.preview_message
             .and_then(|id| {
@@ -976,6 +984,18 @@ impl App {
             })
             .and_then(|message| message.media.as_ref())
             .is_some_and(|media| media.kind == store::MediaKind::Animation)
+            || (self.sticker_picker
+                && self
+                    .sticker_items()
+                    .get(self.sticker_cursor)
+                    .is_some_and(|item| item.preview.kind == store::MediaKind::Animation))
+            || (!self.has_overlay()
+                && self.active_messages().iter().any(|message| {
+                    message
+                        .media
+                        .as_ref()
+                        .is_some_and(|media| media.kind == store::MediaKind::Animation)
+                }))
     }
 
     fn close_preview(&mut self) {
@@ -1015,7 +1035,10 @@ impl App {
             .find(|item| item.id == message)?
             .media
             .as_ref()?;
-        if media.kind != store::MediaKind::Animation {
+        if !matches!(
+            media.kind,
+            store::MediaKind::Photo | store::MediaKind::Animation
+        ) {
             return None;
         }
         let (id, path) = media.detail_file();
@@ -1035,17 +1058,45 @@ impl App {
         if self.requested_files.len() >= 4 {
             return None;
         }
-        let id = self.visible_media.iter().copied().find(|id| {
-            *id > 0
-                && !self.requested_files.contains(id)
-                && !self.failed_files.contains(id)
-                && self.active_messages().iter().any(|message| {
-                    message
-                        .media
-                        .as_ref()
-                        .is_some_and(|media| media.file_id == *id && media.path.is_none())
-                })
-        })?;
+        let id = self
+            .visible_media
+            .iter()
+            .copied()
+            .find(|id| {
+                *id > 0
+                    && !self.requested_files.contains(id)
+                    && !self.failed_files.contains(id)
+                    && self.active_messages().iter().any(|message| {
+                        message
+                            .media
+                            .as_ref()
+                            .is_some_and(|media| media.file_id == *id && media.path.is_none())
+                    })
+            })
+            .or_else(|| {
+                if self.has_overlay() || !self.terminal_focused {
+                    return None;
+                }
+                self.visible_animations
+                    .iter()
+                    .copied()
+                    .find(|(id, size, is_gif)| {
+                        *id > 0
+                            && *size <= AUTO_ANIMATION_MAX_BYTES
+                            && (*is_gif || animation::has_ffmpeg())
+                            && !self.requested_files.contains(id)
+                            && !self.failed_files.contains(id)
+                            && self.active_messages().iter().any(|message| {
+                                message.media.as_ref().is_some_and(|media| {
+                                    media
+                                        .detail
+                                        .as_ref()
+                                        .is_some_and(|d| d.file_id == *id && d.path.is_none())
+                                })
+                            })
+                    })
+                    .map(|(id, _, _)| id)
+            })?;
         self.requested_files
             .insert(id)
             .then(|| actions::download(id))
@@ -2223,7 +2274,7 @@ fn run(demo: bool) -> io::Result<()> {
         stickers::download_visible(&mut app, &worker);
         app.media.prune_idle(Instant::now());
         dirty |= app.media.poll();
-        dirty |= app.media.animation.poll(Instant::now());
+        dirty |= app.media.poll_animations(Instant::now());
         dirty |= interaction::poll_attachments(&mut app, &worker);
         if let Some((chat, mode, result)) = app.clipboard.poll() {
             accept_clipboard(&mut app, chat, mode, result);
@@ -2284,7 +2335,7 @@ fn run(demo: bool) -> io::Result<()> {
             .next_sync_deadline(!dirty)
             .into_iter()
             .chain(app.presence_deadline)
-            .chain(app.media.animation.deadline())
+            .chain(app.media.animation_deadline())
             .min()
             .map_or(timeout, |deadline| {
                 timeout.min(deadline.saturating_duration_since(Instant::now()))
@@ -2836,6 +2887,105 @@ mod interaction_tests {
             assert!(app.media.animation.image().is_none());
             assert!(app.media.animation.deadline().is_none());
         }
+    }
+
+    #[test]
+    fn inline_timeline_animation_stops_offscreen_and_tray_animates_selected_only() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let gif = crate::animation::tests::gif_fixture();
+        let gif_path = gif.path.to_str().unwrap().to_owned();
+        let mut app = ui::tests::fixture();
+        app.store.messages[1].media = Some(store::MediaRef {
+            file_id: 0,
+            path: None,
+            kind: store::MediaKind::Animation,
+            detail: Some(store::MediaFile {
+                file_id: 77,
+                path: Some(gif_path.clone()),
+                size: 1024,
+                is_gif: true,
+            }),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(110, 32)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(app.media.inline_animations.active_count(), 1);
+        let timeout = Instant::now() + Duration::from_secs(3);
+        while app.media.animation_deadline().is_none() {
+            assert!(Instant::now() < timeout);
+            app.media.poll_animations(Instant::now());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Opening sticker tray stops inline timeline animations and only animates the selected GIF.
+        app.sticker_picker = true;
+        app.sticker_panel.tab = stickers::Tab::Gifs;
+        app.store.saved_animations = vec![
+            store::Sticker {
+                file_id: 81,
+                emoji: "[GIF]".into(),
+                width: 24,
+                height: 12,
+                duration: 1,
+                is_animation: true,
+                preview: store::MediaRef {
+                    file_id: 0,
+                    path: None,
+                    kind: store::MediaKind::Animation,
+                    detail: Some(store::MediaFile {
+                        file_id: 81,
+                        path: Some(gif_path),
+                        size: 1024,
+                        is_gif: true,
+                    }),
+                },
+            },
+            store::Sticker {
+                file_id: 82,
+                emoji: "😊".into(),
+                width: 128,
+                height: 128,
+                duration: 0,
+                is_animation: false,
+                preview: store::MediaRef {
+                    file_id: 82,
+                    path: None,
+                    kind: store::MediaKind::Sticker,
+                    detail: None,
+                },
+            },
+        ];
+        app.sticker_cursor = 0;
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(app.media.inline_animations.active_count(), 0);
+        assert!(app.media.animation.is_requested());
+        // Moving cursor to a static item immediately stops the tray animation.
+        app.sticker_cursor = 1;
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert!(!app.media.animation.is_requested());
+        assert!(app.media.animation_deadline().is_none());
+    }
+
+    #[test]
+    fn photo_preview_retries_missing_detail_download_when_quota_frees() {
+        let mut app = ui::tests::fixture();
+        app.store.messages[1].media = Some(store::MediaRef {
+            file_id: 41,
+            path: Some("/thumb.jpg".into()),
+            kind: store::MediaKind::Photo,
+            detail: Some(store::MediaFile {
+                file_id: 42,
+                path: None,
+                size: 500_000,
+                is_gif: false,
+            }),
+        });
+        app.preview_message = Some(2);
+        app.requested_files.extend([1, 2, 3, 4]);
+        assert!(app.pending_preview_download().is_none());
+        app.requested_files.remove(&1);
+        let request = app.pending_preview_download().unwrap();
+        assert_eq!(request["@type"], "downloadFile");
+        assert_eq!(request["file_id"], 42);
     }
 
     #[test]

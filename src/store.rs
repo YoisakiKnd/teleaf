@@ -736,6 +736,8 @@ pub struct MediaRef {
 pub struct MediaFile {
     pub file_id: i32,
     pub path: Option<String>,
+    pub size: u64,
+    pub is_gif: bool,
 }
 
 impl MediaRef {
@@ -753,6 +755,8 @@ pub struct Sticker {
     pub emoji: String,
     pub width: i32,
     pub height: i32,
+    pub duration: i32,
+    pub is_animation: bool,
     pub preview: MediaRef,
 }
 
@@ -781,6 +785,7 @@ pub struct Store {
     pub global_chat_results: Vec<ChatSummary>,
     pub recent_stickers: Vec<Sticker>,
     pub favorite_stickers: Vec<Sticker>,
+    pub saved_animations: Vec<Sticker>,
     pub installed_sticker_sets: Vec<(i64, String)>,
     pub sticker_sets: VecDeque<(i64, Vec<Sticker>)>,
     pub sticker_results: Vec<Sticker>,
@@ -1569,6 +1574,7 @@ impl Store {
                 | "stickers"
                 | "stickerSets"
                 | "stickerSet"
+                | "animations"
         );
         match update_kind {
             "updateUser" | "user" => {
@@ -2047,6 +2053,15 @@ impl Store {
                     _ => return false,
                 }
             }
+            "animations" if update["@extra"].as_str() == Some("saved-animations") => {
+                self.saved_animations = update["animations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(parse_saved_animation)
+                    .take(256)
+                    .collect();
+            }
             "stickerSets" if update["@extra"].as_str() == Some("installed-sticker-sets") => {
                 self.installed_sticker_sets = update["sets"]
                     .as_array()
@@ -2328,11 +2343,19 @@ impl Store {
             .recent_stickers
             .iter_mut()
             .chain(&mut self.favorite_stickers)
+            .chain(&mut self.saved_animations)
             .chain(&mut self.sticker_results)
             .chain(self.sticker_sets.iter_mut().flat_map(|(_, items)| items))
         {
             if sticker.preview.file_id == id && sticker.preview.path != path {
                 sticker.preview.path = path.clone();
+                changed = true;
+            }
+            if let Some(detail) = &mut sticker.preview.detail
+                && detail.file_id == id
+                && detail.path != path
+            {
+                detail.path = path.clone();
                 changed = true;
             }
         }
@@ -2750,6 +2773,36 @@ fn trim_messages(messages: &mut Vec<Message>, budget: usize, keep_oldest: bool) 
     }
 }
 
+fn file_size(file: &Value) -> u64 {
+    integer(file.get("size"))
+        .max(integer(file.get("expected_size")))
+        .max(0) as u64
+}
+
+fn static_thumbnail(parent: &Value) -> Option<&Value> {
+    let format = parent
+        .pointer("/thumbnail/format/@type")
+        .and_then(Value::as_str);
+    if matches!(
+        format,
+        Some("thumbnailFormatMpeg4" | "thumbnailFormatWebm" | "thumbnailFormatTgs")
+    ) {
+        return None;
+    }
+    parent.pointer("/thumbnail/file")
+}
+
+fn animation_is_gif(animation: &Value) -> bool {
+    animation
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .is_some_and(|mime| mime.eq_ignore_ascii_case("image/gif"))
+        || animation
+            .get("file_name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.to_ascii_lowercase().ends_with(".gif"))
+}
+
 fn media_ref(content: &Value) -> Option<MediaRef> {
     let detail_file = match kind(content) {
         "messagePhoto" => content
@@ -2769,9 +2822,13 @@ fn media_ref(content: &Value) -> Option<MediaRef> {
         }
         _ => None,
     };
+    let is_gif = kind(content) == "messageAnimation"
+        && content.get("animation").is_some_and(animation_is_gif);
     let detail = detail_file.map(|file| MediaFile {
         file_id: integer(file.get("id")) as i32,
         path: local_path(file),
+        size: file_size(file),
+        is_gif,
     });
     let no_thumbnail = Value::Null;
     let (kind, file) = match kind(content) {
@@ -2790,13 +2847,13 @@ fn media_ref(content: &Value) -> Option<MediaRef> {
             if format == Some("stickerFormatWebm") {
                 (
                     MediaKind::Animation,
-                    sticker.pointer("/thumbnail/file").unwrap_or(&no_thumbnail),
+                    static_thumbnail(sticker).unwrap_or(&no_thumbnail),
                 )
             } else {
                 let file = if format == Some("stickerFormatWebp") {
                     sticker.get("sticker")?
                 } else {
-                    sticker.pointer("/thumbnail/file")?
+                    static_thumbnail(sticker)?
                 };
                 (MediaKind::Sticker, file)
             }
@@ -2804,7 +2861,8 @@ fn media_ref(content: &Value) -> Option<MediaRef> {
         "messageAnimation" => (
             MediaKind::Animation,
             content
-                .pointer("/animation/thumbnail/file")
+                .get("animation")
+                .and_then(static_thumbnail)
                 .unwrap_or(&no_thumbnail),
         ),
         "messageDocument" => (MediaKind::Document, content.pointer("/document/document")?),
@@ -2827,21 +2885,71 @@ fn parse_sticker(value: &Value) -> Option<Sticker> {
         return None;
     }
     let format = value.pointer("/format/@type").and_then(Value::as_str);
-    let preview_file = if format == Some("stickerFormatWebp") {
-        file
+    let no_thumbnail = Value::Null;
+    let (preview_kind, preview_file, detail) = if format == Some("stickerFormatWebm") {
+        let thumb = static_thumbnail(value).unwrap_or(&no_thumbnail);
+        let thumb_id = integer(thumb.get("id")) as i32;
+        (
+            MediaKind::Animation,
+            thumb,
+            (thumb_id != file_id).then(|| MediaFile {
+                file_id,
+                path: local_path(file),
+                size: file_size(file),
+                is_gif: false,
+            }),
+        )
+    } else if format == Some("stickerFormatWebp") {
+        (MediaKind::Sticker, file, None)
     } else {
-        value.pointer("/thumbnail/file").unwrap_or(file)
+        (
+            MediaKind::Sticker,
+            static_thumbnail(value).unwrap_or(&no_thumbnail),
+            None,
+        )
     };
     Some(Sticker {
         file_id,
         emoji: string(value.get("emoji")),
         width: integer(value.get("width")) as i32,
         height: integer(value.get("height")) as i32,
+        duration: 0,
+        is_animation: false,
         preview: MediaRef {
             file_id: integer(preview_file.get("id")) as i32,
             path: local_path(preview_file),
-            kind: MediaKind::Sticker,
-            detail: None,
+            kind: preview_kind,
+            detail,
+        },
+    })
+}
+
+fn parse_saved_animation(value: &Value) -> Option<Sticker> {
+    let file = value.get("animation")?;
+    let file_id = integer(file.get("id")) as i32;
+    if file_id <= 0 {
+        return None;
+    }
+    let no_thumbnail = Value::Null;
+    let thumb = static_thumbnail(value).unwrap_or(&no_thumbnail);
+    let thumb_id = integer(thumb.get("id")) as i32;
+    Some(Sticker {
+        file_id,
+        emoji: "[GIF]".into(),
+        width: integer(value.get("width")) as i32,
+        height: integer(value.get("height")) as i32,
+        duration: integer(value.get("duration")) as i32,
+        is_animation: true,
+        preview: MediaRef {
+            file_id: thumb_id,
+            path: local_path(thumb),
+            kind: MediaKind::Animation,
+            detail: (thumb_id != file_id).then(|| MediaFile {
+                file_id,
+                path: local_path(file),
+                size: file_size(file),
+                is_gif: animation_is_gif(value),
+            }),
         },
     })
 }
@@ -3113,6 +3221,19 @@ mod tests {
         assert!(sticker.kind == MediaKind::Animation);
         assert_eq!(sticker.file_id, 0);
         assert_eq!(sticker.detail_file(), (53, None));
+
+        // MPEG4 thumbnails must not be handed to the static image decoder.
+        let mpeg4_thumb = media_ref(&json!({"@type":"messageAnimation","animation":{
+            "mime_type":"image/gif",
+            "thumbnail":{"format":{"@type":"thumbnailFormatMpeg4"},"file":{"id":60,"local":{"is_downloading_completed":true,"path":"/thumb.mp4"}}},
+            "animation":{"id":61,"size":2048}
+        }}))
+        .unwrap();
+        assert_eq!(mpeg4_thumb.file_id, 0);
+        assert!(mpeg4_thumb.path.is_none());
+        assert_eq!(mpeg4_thumb.detail.as_ref().unwrap().file_id, 61);
+        assert_eq!(mpeg4_thumb.detail.as_ref().unwrap().size, 2048);
+        assert!(mpeg4_thumb.detail.as_ref().unwrap().is_gif);
     }
 
     #[test]

@@ -489,6 +489,9 @@ pub(crate) fn serve(events: SyncSender<TdEvent>, commands: Receiver<TdCommand>) 
             "getRecentStickers" | "getFavoriteStickers" | "searchStickers" => {
                 json!({"@type":"stickers","@extra":extra,"stickers":demo_stickers(&path,6)})
             }
+            "getSavedAnimations" => {
+                json!({"@type":"animations","@extra":extra,"animations":[]})
+            }
             "getInstalledStickerSets" => {
                 json!({"@type":"stickerSets","@extra":extra,"sets":[{"id":"1001","title":"演示贴纸包"},{"id":"1002","title":"问候"}]})
             }
@@ -515,6 +518,9 @@ fn demo_stickers(path: &str, count: usize) -> Vec<Value> {
 fn demo_attachment(content: &Value) -> String {
     if content["@type"] == "inputMessageSticker" {
         return format!("[演示贴纸] {}", content["emoji"].as_str().unwrap_or(""));
+    }
+    if content["@type"] == "inputMessageAnimation" {
+        return "[演示 GIF]".into();
     }
     let path = content
         .pointer("/photo/path")

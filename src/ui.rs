@@ -1079,6 +1079,7 @@ fn shortcut_hint(app: &App, width: u16) -> &'static str {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.media.begin_frame();
     app.visible_media.clear();
+    app.visible_animations.clear();
     app.visible_read_ids.clear();
     app.presence_deadline = None;
     app.hit_targets.clear();
@@ -1500,6 +1501,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.proxy.open {
         proxy_dialog(frame, app, area);
+    }
+    if app.preview_message.is_none() && !app.sticker_picker {
+        app.media.stop_animation();
     }
     app.media.end_frame();
 }
@@ -3236,8 +3240,23 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         app.hit_targets.push((rect, Target::Message(id)));
         if let Some((media, area, skip)) = inline {
-            if media.path.is_none() && !app.visible_media.contains(&media.file_id) {
+            if media.path.is_none()
+                && media.file_id > 0
+                && !app.visible_media.contains(&media.file_id)
+            {
                 app.visible_media.push(media.file_id);
+            }
+            if media.kind == MediaKind::Animation
+                && let Some(detail) = &media.detail
+                && detail.path.is_none()
+                && detail.file_id > 0
+                && !app
+                    .visible_animations
+                    .iter()
+                    .any(|(id, _, _)| *id == detail.file_id)
+            {
+                app.visible_animations
+                    .push((detail.file_id, detail.size, detail.is_gif));
             }
             inline_media_view(frame, app, area, &media, media_height as u16, skip);
             app.hit_targets.push((area, Target::Media(id)));
@@ -3574,17 +3593,41 @@ fn inline_media_view(
     {
         return;
     }
+    let size = Size::new(area.width, full_height);
+    if media.kind == MediaKind::Animation
+        && app.terminal_focused
+        && !app.has_overlay()
+        && let (detail_id, Some(detail_path)) = media.detail_file()
+        && detail_id > 0
+        && let Some(image) = app
+            .media
+            .inline_animation_view(detail_id, detail_path, size)
+    {
+        frame.render_widget(
+            SlicedImage::new(image, SignedPosition::from((0, -(skip as i16)))),
+            area,
+        );
+        finish_sixel(frame, area, &app.media.protocol_name);
+        return;
+    }
     let Some(path) = &media.path else {
         let label = match media.kind {
             MediaKind::Sticker => "[贴纸]",
             MediaKind::Animation => "[GIF]",
             _ => "[图片]",
         };
+        let detail_id = media.detail.as_ref().map_or(0, |detail| detail.file_id);
         frame.render_widget(
             Paragraph::new(format!(
                 "{label} {}",
                 if media.file_id == 0 {
-                    "点击预览动图"
+                    if detail_id > 0 && app.requested_files.contains(&detail_id) {
+                        "↓ 正在下载动图…"
+                    } else if detail_id > 0 && app.failed_files.contains(&detail_id) {
+                        "下载失败 · 点击重试"
+                    } else {
+                        "点击预览动图"
+                    }
                 } else if app.failed_files.contains(&media.file_id) {
                     "下载失败 · 点击重试"
                 } else if app.requested_files.contains(&media.file_id) {
@@ -3599,7 +3642,6 @@ fn inline_media_view(
         );
         return;
     };
-    let size = Size::new(area.width, full_height);
     app.media.request_inline(media.file_id, path, size);
     if let Some(image) = app.media.get_inline(media.file_id, size) {
         frame.render_widget(
@@ -3875,7 +3917,7 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         width,
         height,
     );
-    let inner = modal(frame, app, tray, "贴纸 · 点击发送");
+    let inner = modal(frame, app, tray, "贴纸 / GIF · 点击发送");
     let parts = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(if inner.height >= 9 { 1 } else { 0 }),
@@ -3932,6 +3974,7 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = match app.sticker_panel.tab {
         crate::stickers::Tab::Recent => "最近使用".into(),
         crate::stickers::Tab::Favorites => "收藏的贴纸".into(),
+        crate::stickers::Tab::Gifs => "已保存的 GIF".into(),
         crate::stickers::Tab::Set(id) => app
             .store
             .installed_sticker_sets
@@ -3980,16 +4023,17 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     if total == 0 {
         let loading = app.sticker_panel.loading
             || matches!(app.sticker_panel.tab,crate::stickers::Tab::Set(id) if app.sticker_panel.requested_sets.contains(&id));
-        empty(
-            frame,
-            grid,
-            if loading {
-                "正在加载贴纸…"
-            } else {
-                "这里还没有贴纸"
-            },
-            "可切换贴纸包，或在下面搜索",
-        );
+        let (empty_title, empty_hint) = if app.sticker_panel.tab == crate::stickers::Tab::Gifs {
+            (
+                "这里还没有已保存的 GIF",
+                "在 Telegram 保存的 GIF 会显示在这里",
+            )
+        } else if loading {
+            ("正在加载贴纸…", "可切换贴纸包，或在下面搜索")
+        } else {
+            ("这里还没有贴纸", "可切换贴纸包，或在下面搜索")
+        };
+        empty(frame, grid, empty_title, empty_hint);
     }
     let start = app.sticker_panel.top * columns;
     let stickers: Vec<_> = app
@@ -3999,6 +4043,7 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         .take(columns * rows)
         .cloned()
         .collect();
+    let mut animated_selected = false;
     for (i, sticker) in stickers.into_iter().enumerate() {
         let index = start + i;
         let tile = Rect::new(
@@ -4034,32 +4079,46 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
             }));
         let image_area = block.inner(tile);
         frame.render_widget(block, tile);
-        if let Some(path) = &sticker.preview.path {
-            app.media.request(
-                sticker.preview.file_id,
-                path,
-                Size::new(image_area.width, image_area.height),
-            );
-            if let Some(image) = app.media.get(
-                sticker.preview.file_id,
-                Size::new(image_area.width, image_area.height),
-            ) {
+        let tile_size = Size::new(image_area.width, image_area.height);
+        let mut rendered = false;
+        if tile_selected
+            && sticker.preview.kind == MediaKind::Animation
+            && app.terminal_focused
+            && let (detail_id, Some(detail_path)) = sticker.preview.detail_file()
+            && detail_id > 0
+        {
+            animated_selected = true;
+            if let Some(image) = app.media.animation_view(detail_id, detail_path, tile_size) {
                 let image_area = centered(image_area, image.size().width, image.size().height);
                 frame.render_widget(Image::new(image).allow_clipping(true), image_area);
                 finish_sixel(frame, image_area, &app.media.protocol_name);
+                rendered = true;
+            }
+        }
+        if !rendered {
+            if let Some(path) = &sticker.preview.path {
+                app.media.request(sticker.preview.file_id, path, tile_size);
+                if let Some(image) = app.media.get(sticker.preview.file_id, tile_size) {
+                    let image_area = centered(image_area, image.size().width, image.size().height);
+                    frame.render_widget(Image::new(image).allow_clipping(true), image_area);
+                    finish_sixel(frame, image_area, &app.media.protocol_name);
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(sticker.emoji).alignment(Alignment::Center),
+                        image_area,
+                    );
+                }
             } else {
                 frame.render_widget(
                     Paragraph::new(sticker.emoji).alignment(Alignment::Center),
                     image_area,
                 );
             }
-        } else {
-            frame.render_widget(
-                Paragraph::new(sticker.emoji).alignment(Alignment::Center),
-                image_area,
-            );
         }
         app.hit_targets.push((tile, Target::Sticker(index)));
+    }
+    if !animated_selected {
+        app.media.stop_animation();
     }
     let search = Layout::horizontal([
         Constraint::Length(2),
@@ -4125,20 +4184,24 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         .style(Style::default().fg(palette().muted)),
         footer[0],
     );
-    let favorite = app
-        .sticker_items()
-        .get(app.sticker_cursor)
-        .is_some_and(|s| {
-            app.store
-                .favorite_stickers
-                .iter()
-                .any(|f| f.file_id == s.file_id)
-        });
+    let is_gif_tab = app.sticker_panel.tab == crate::stickers::Tab::Gifs;
+    let favorite = !is_gif_tab
+        && app
+            .sticker_items()
+            .get(app.sticker_cursor)
+            .is_some_and(|s| {
+                app.store
+                    .favorite_stickers
+                    .iter()
+                    .any(|f| f.file_id == s.file_id)
+            });
     button(
         frame,
         app,
         footer[1],
-        if favorite {
+        if is_gif_tab {
+            "[×移除GIF]"
+        } else if favorite {
             "[★取消收藏]"
         } else {
             "[☆收藏]"
@@ -6351,6 +6414,8 @@ pub(crate) mod tests {
                 emoji: "👋".into(),
                 width: 100,
                 height: 100,
+                duration: 0,
+                is_animation: false,
                 preview: MediaRef {
                     file_id: 10,
                     path: None,
@@ -6899,6 +6964,8 @@ pub(crate) mod tests {
                             emoji: "👋".into(),
                             width: 100,
                             height: 100,
+                            duration: 0,
+                            is_animation: false,
                             preview: MediaRef {
                                 file_id: 10,
                                 path: None,
@@ -7180,6 +7247,8 @@ pub(crate) mod tests {
             emoji: "👋".into(),
             width: 100,
             height: 100,
+            duration: 0,
+            is_animation: false,
             preview: MediaRef {
                 file_id: 10,
                 path: None,

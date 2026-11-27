@@ -191,6 +191,18 @@ pub fn recent_stickers() -> Value {
         "@extra": "recent-stickers"})
 }
 
+pub fn saved_animations() -> Value {
+    json!({"@type": "getSavedAnimations", "@extra": "saved-animations"})
+}
+
+pub fn remove_saved_animation(file_id: i32) -> Value {
+    json!({
+        "@type": "removeSavedAnimation",
+        "animation": {"@type": "inputFileId", "id": file_id},
+        "@extra": "refresh-saved-animations"
+    })
+}
+
 pub fn send_sticker(chat_id: i64, file_id: i32, emoji: &str, width: i32, height: i32) -> Value {
     json!({
         "@type": "sendMessage", "chat_id": chat_id, "topic_id": null,
@@ -199,6 +211,25 @@ pub fn send_sticker(chat_id: i64, file_id: i32, emoji: &str, width: i32, height:
             "@type": "inputMessageSticker",
             "sticker": {"@type": "inputFileId", "id": file_id},
             "thumbnail": null, "width": width, "height": height, "emoji": emoji
+        }
+    })
+}
+
+pub fn send_animation(chat_id: i64, file_id: i32, width: i32, height: i32, duration: i32) -> Value {
+    json!({
+        "@type": "sendMessage", "chat_id": chat_id, "topic_id": null,
+        "reply_to": null, "options": null, "reply_markup": null,
+        "input_message_content": {
+            "@type": "inputMessageAnimation",
+            "animation": {"@type": "inputFileId", "id": file_id},
+            "thumbnail": null,
+            "added_sticker_file_ids": [],
+            "duration": duration,
+            "width": width,
+            "height": height,
+            "caption": null,
+            "show_caption_above_media": false,
+            "has_spoiler": false
         }
     })
 }

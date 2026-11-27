@@ -63,12 +63,15 @@ with tempfile.TemporaryDirectory(prefix='tg-attachments-smoke-') as folder:
         terminal.send(b'\x1b[19~')  # F8. PNG should be prepared as JPEG.
         terminal.wait('.jpg')
         terminal.send(b't')
-        terminal.wait('贴纸 · 点击发送')
+        terminal.wait('贴纸 / GIF · 点击发送')
         terminal.read(.5)
         terminal.click(48,26) # First thumbnail above the composer
         terminal.wait('贴纸已提交')
         terminal.read(.3)
-        terminal.click(68,21) # Installed pack tab above the status row
+        terminal.click(68,21) # GIF tab above the status row
+        terminal.wait('已保存的 GIF')
+        terminal.read(.3)
+        terminal.click(78,21) # Installed pack tab above the status row
         terminal.wait('演示贴纸包')
         terminal.read(.3)
         terminal.send(b'/')

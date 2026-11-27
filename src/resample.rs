@@ -73,7 +73,7 @@ pub fn jpeg_pixels(source: &DynamicImage, width: u32, height: u32) -> image::Rgb
         I: GenericImageView,
         I::Pixel: Pixel<Subpixel = u8>,
     {
-        type Pixel = Rgba<u8>;
+        type Pixel = image::Rgb<u8>;
 
         fn dimensions(&self) -> (u32, u32) {
             self.0.dimensions()
@@ -85,7 +85,7 @@ pub fn jpeg_pixels(source: &DynamicImage, width: u32, height: u32) -> image::Rgb
             let blend = |channel: u8| {
                 ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8
             };
-            Rgba([blend(r), blend(g), blend(b), 255])
+            image::Rgb([blend(r), blend(g), blend(b)])
         }
     }
 
@@ -96,14 +96,30 @@ pub fn jpeg_pixels(source: &DynamicImage, width: u32, height: u32) -> image::Rgb
     {
         let source = OnWhite(source);
         if source.dimensions() == (width, height) {
-            image::RgbImage::from_fn(width, height, |x, y| source.get_pixel(x, y).to_rgb())
+            image::RgbImage::from_fn(width, height, |x, y| source.get_pixel(x, y))
         } else {
-            DynamicImage::ImageRgba8(resize_into(&source, width, height, width, height)).into_rgb8()
+            image::imageops::resize(
+                &source,
+                width,
+                height,
+                image::imageops::FilterType::CatmullRom,
+            )
         }
     }
 
     match source {
-        DynamicImage::ImageRgb8(image) => sample_white(image, width, height),
+        DynamicImage::ImageRgb8(image) => {
+            if image.dimensions() == (width, height) {
+                image.clone()
+            } else {
+                image::imageops::resize(
+                    image,
+                    width,
+                    height,
+                    image::imageops::FilterType::CatmullRom,
+                )
+            }
+        }
         DynamicImage::ImageRgba8(image) => sample_white(image, width, height),
         DynamicImage::ImageLuma8(image) => sample_white(image, width, height),
         DynamicImage::ImageLumaA8(image) => sample_white(image, width, height),

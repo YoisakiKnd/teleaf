@@ -144,7 +144,10 @@ struct Finished {
 pub struct MediaManager {
     picker: Picker,
     pub animation: crate::animation::Player,
-    animation_image: Option<(usize, Size, Protocol)>,
+    animation_image: Option<(i32, usize, Size, Protocol)>,
+    pub inline_animations: crate::animation::InlinePool,
+    inline_animation_images:
+        [Option<(i32, usize, Size, SlicedProtocol)>; crate::animation::MAX_INLINE_SLOTS],
     jobs: SyncSender<Work>,
     epochs: Arc<Epochs>,
     prune_next_frame: bool,
@@ -242,6 +245,8 @@ impl MediaManager {
             picker: animation_picker,
             animation: Default::default(),
             animation_image: None,
+            inline_animations: Default::default(),
+            inline_animation_images: std::array::from_fn(|_| None),
             jobs,
             epochs,
             prune_next_frame: false,
@@ -264,10 +269,14 @@ impl MediaManager {
     pub fn begin_frame(&mut self) {
         self.frame_pinning = true;
         self.visible.clear();
+        self.inline_animations.begin_frame();
     }
 
     pub fn end_frame(&mut self) {
         self.idle_deadline = Some(Instant::now() + Duration::from_secs(60));
+        for slot in self.inline_animations.finish_frame() {
+            self.inline_animation_images[slot] = None;
+        }
         if std::mem::take(&mut self.prune_next_frame) {
             self.prune_hidden();
         } else {
@@ -280,6 +289,30 @@ impl MediaManager {
         self.animation.stop();
         self.animation_image = None;
         was_requested
+    }
+
+    pub fn stop_inline_animations(&mut self) -> bool {
+        let stopped = self.inline_animations.stop_all();
+        for slot in &mut self.inline_animation_images {
+            *slot = None;
+        }
+        stopped
+    }
+
+    pub fn stop_all_animations(&mut self) -> bool {
+        self.stop_animation() | self.stop_inline_animations()
+    }
+
+    pub fn poll_animations(&mut self, now: Instant) -> bool {
+        self.animation.poll(now) | self.inline_animations.poll(now)
+    }
+
+    pub fn animation_deadline(&self) -> Option<Instant> {
+        self.animation
+            .deadline()
+            .into_iter()
+            .chain(self.inline_animations.deadline())
+            .min()
     }
 
     pub fn animation_view(&mut self, file: i32, path: &str, size: Size) -> Option<&Protocol> {
@@ -299,7 +332,9 @@ impl MediaManager {
         if self
             .animation_image
             .as_ref()
-            .is_none_or(|(frame, area, _)| *frame != index || *area != size)
+            .is_none_or(|(cached_file, frame, area, _)| {
+                *cached_file != file || *frame != index || *area != size
+            })
         {
             self.animation_image = None;
             let image = self.animation.image()?;
@@ -313,9 +348,7 @@ impl MediaManager {
                 let mut pixels = image::RgbaImage::new(max_width, max_height);
                 image::imageops::replace(&mut pixels, &image.into_rgba8(), 0, 0);
                 let id = std::process::id().wrapping_shl(8) | 33;
-                let tmux = std::env::var_os("TMUX").is_some()
-                    || std::env::var("TERM").is_ok_and(|s| s.starts_with("tmux"))
-                    || std::env::var("TERM_PROGRAM").as_deref() == Ok("tmux");
+                let tmux = is_tmux();
                 ratatui_image::protocol::kitty::Kitty::new(
                     image::DynamicImage::ImageRgba8(pixels),
                     canvas,
@@ -326,9 +359,72 @@ impl MediaManager {
             } else {
                 self.picker.new_protocol(image, size, Resize::Fit(None))
             };
-            self.animation_image = encoded.ok().map(|image| (index, size, image));
+            self.animation_image = encoded.ok().map(|image| (file, index, size, image));
         }
-        self.animation_image.as_ref().map(|(_, _, image)| image)
+        self.animation_image.as_ref().map(|(_, _, _, image)| image)
+    }
+
+    pub fn inline_animation_view(
+        &mut self,
+        file: i32,
+        path: &str,
+        full_size: Size,
+    ) -> Option<&SlicedProtocol> {
+        if file <= 0 || full_size.width == 0 || full_size.height == 0 {
+            return None;
+        }
+        let font = self.picker.font_size();
+        let bounds = (
+            (u32::from(full_size.width) * u32::from(font.width).max(1)).min(256),
+            (u32::from(full_size.height) * u32::from(font.height).max(1)).min(192),
+        );
+        let (slot, index) = self.inline_animations.request(file, path, bounds)?;
+        if self.inline_animation_images[slot].as_ref().is_none_or(
+            |(cached_file, frame, area, _)| {
+                *cached_file != file || *frame != index || *area != full_size
+            },
+        ) {
+            self.inline_animation_images[slot] = None;
+            let image = self.inline_animations.image(slot)?;
+            let size = fitted_cells(image.width(), image.height(), font, full_size);
+            let encoded = if self.picker.protocol_type() == ProtocolType::Halfblocks {
+                let pixels = image::DynamicImage::ImageRgba8(crate::resample::crop_canvas(
+                    &image,
+                    (0, 0, image.width(), image.height()),
+                    u32::from(size.width),
+                    u32::from(size.height) * 2,
+                ));
+                ratatui_image::protocol::halfblocks::Halfblocks::new(pixels, size)
+                    .map(SlicedProtocol::Halfblocks)
+            } else if self.is_kitty {
+                let canvas_width = u32::from(size.width) * u32::from(font.width).max(1);
+                let canvas_height = u32::from(size.height) * u32::from(font.height).max(1);
+                let pixels = image::DynamicImage::ImageRgba8(crate::resample::crop_canvas(
+                    &image,
+                    (0, 0, image.width(), image.height()),
+                    canvas_width,
+                    canvas_height,
+                ));
+                let id = std::process::id().wrapping_shl(8) | (34 + slot as u32);
+                ratatui_image::protocol::kitty::Kitty::new(pixels, size, id, is_tmux())
+                    .map(SlicedProtocol::Kitty)
+            } else {
+                let canvas_width = u32::from(size.width) * u32::from(font.width).max(1);
+                let canvas_height = u32::from(size.height) * u32::from(font.height).max(1);
+                let pixels = image::DynamicImage::ImageRgba8(crate::resample::crop_canvas(
+                    &image,
+                    (0, 0, image.width(), image.height()),
+                    canvas_width,
+                    canvas_height,
+                ));
+                SlicedProtocol::new_with_resize(&self.picker, pixels, size, Resize::Crop(None))
+            };
+            self.inline_animation_images[slot] =
+                encoded.ok().map(|image| (file, index, full_size, image));
+        }
+        self.inline_animation_images[slot]
+            .as_ref()
+            .map(|(_, _, _, image)| image)
     }
 
     pub fn close_preview(&mut self) {
@@ -342,7 +438,7 @@ impl MediaManager {
     }
 
     pub fn switch_chat(&mut self) {
-        self.stop_animation();
+        self.stop_all_animations();
         self.epochs.chat.fetch_add(1, Ordering::Relaxed);
         let _ = self.jobs.try_send(Work::Wake);
         self.visible.clear();
@@ -739,10 +835,7 @@ fn prepare(
         canvas_height,
     ));
     if picker.protocol_type() == ProtocolType::Kitty {
-        let is_tmux = std::env::var_os("TMUX").is_some()
-            || std::env::var("TERM").is_ok_and(|s| s.starts_with("tmux"))
-            || std::env::var("TERM_PROGRAM").as_deref() == Ok("tmux");
-        ratatui_image::protocol::kitty::Kitty::new(pixels, size, kitty_id, is_tmux)
+        ratatui_image::protocol::kitty::Kitty::new(pixels, size, kitty_id, is_tmux())
             .map(|image| {
                 if view.inline {
                     Encoded::Inline(SlicedProtocol::Kitty(image), bytes)
@@ -762,6 +855,12 @@ fn prepare(
             .map(|protocol| Encoded::Regular(protocol, bytes))
             .map_err(|error| error.to_string())
     }
+}
+
+fn is_tmux() -> bool {
+    std::env::var_os("TMUX").is_some()
+        || std::env::var("TERM").is_ok_and(|s| s.starts_with("tmux"))
+        || std::env::var("TERM_PROGRAM").as_deref() == Ok("tmux")
 }
 
 fn reserve_decoded(decoded: &mut Decoded, incoming: usize) {
