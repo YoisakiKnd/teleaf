@@ -142,6 +142,9 @@ struct Finished {
 }
 
 pub struct MediaManager {
+    picker: Picker,
+    pub animation: crate::animation::Player,
+    animation_image: Option<(usize, Size, Protocol)>,
     jobs: SyncSender<Work>,
     epochs: Arc<Epochs>,
     prune_next_frame: bool,
@@ -169,6 +172,7 @@ impl MediaManager {
     pub(crate) fn from_picker(picker: Picker) -> Self {
         let protocol_name = format!("{:?}", picker.protocol_type());
         let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
+        let animation_picker = picker.clone();
         let (jobs, job_receiver) = mpsc::sync_channel::<Work>(2);
         let (result_sender, finished) = mpsc::sync_channel::<Finished>(2);
         let epochs = Arc::new(Epochs::default());
@@ -235,6 +239,9 @@ impl MediaManager {
             }
         });
         Self {
+            picker: animation_picker,
+            animation: Default::default(),
+            animation_image: None,
             jobs,
             epochs,
             prune_next_frame: false,
@@ -268,7 +275,64 @@ impl MediaManager {
         }
     }
 
+    pub fn stop_animation(&mut self) -> bool {
+        let was_requested = self.animation.is_requested();
+        self.animation.stop();
+        self.animation_image = None;
+        was_requested
+    }
+
+    pub fn animation_view(&mut self, file: i32, path: &str, size: Size) -> Option<&Protocol> {
+        if size.width == 0 || size.height == 0 {
+            return None;
+        }
+        let font = self.picker.font_size();
+        let bounds = (
+            (u32::from(size.width) * u32::from(font.width).max(1)).min(384),
+            (u32::from(size.height) * u32::from(font.height).max(1)).min(288),
+        );
+        self.animation.request(file, path, bounds);
+        let Some(index) = self.animation.frame_index() else {
+            self.animation_image = None;
+            return None;
+        };
+        if self
+            .animation_image
+            .as_ref()
+            .is_none_or(|(frame, area, _)| *frame != index || *area != size)
+        {
+            self.animation_image = None;
+            let image = self.animation.image()?;
+            let encoded = if self.is_kitty {
+                let canvas = Size::new(
+                    image.width().div_ceil(u32::from(font.width).max(1)) as u16,
+                    image.height().div_ceil(u32::from(font.height).max(1)) as u16,
+                );
+                let max_width = u32::from(canvas.width) * u32::from(font.width).max(1);
+                let max_height = u32::from(canvas.height) * u32::from(font.height).max(1);
+                let mut pixels = image::RgbaImage::new(max_width, max_height);
+                image::imageops::replace(&mut pixels, &image.into_rgba8(), 0, 0);
+                let id = std::process::id().wrapping_shl(8) | 33;
+                let tmux = std::env::var_os("TMUX").is_some()
+                    || std::env::var("TERM").is_ok_and(|s| s.starts_with("tmux"))
+                    || std::env::var("TERM_PROGRAM").as_deref() == Ok("tmux");
+                ratatui_image::protocol::kitty::Kitty::new(
+                    image::DynamicImage::ImageRgba8(pixels),
+                    canvas,
+                    id,
+                    tmux,
+                )
+                .map(Protocol::Kitty)
+            } else {
+                self.picker.new_protocol(image, size, Resize::Fit(None))
+            };
+            self.animation_image = encoded.ok().map(|image| (index, size, image));
+        }
+        self.animation_image.as_ref().map(|(_, _, image)| image)
+    }
+
     pub fn close_preview(&mut self) {
+        self.stop_animation();
         self.epochs.preview.fetch_add(1, Ordering::Relaxed);
         let _ = self.jobs.try_send(Work::Wake);
         self.failed.retain(|key| !key.3.preview);
@@ -278,6 +342,7 @@ impl MediaManager {
     }
 
     pub fn switch_chat(&mut self) {
+        self.stop_animation();
         self.epochs.chat.fetch_add(1, Ordering::Relaxed);
         let _ = self.jobs.try_send(Work::Wake);
         self.visible.clear();

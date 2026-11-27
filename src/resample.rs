@@ -64,6 +64,53 @@ pub fn crop_canvas(
     )
 }
 
+/// Composite before filtering so the hidden colors of transparent source pixels
+/// do not leave a fringe along opaque edges.
+pub fn jpeg_pixels(source: &DynamicImage, width: u32, height: u32) -> image::RgbImage {
+    struct OnWhite<'a, I>(&'a I);
+    impl<I> GenericImageView for OnWhite<'_, I>
+    where
+        I: GenericImageView,
+        I::Pixel: Pixel<Subpixel = u8>,
+    {
+        type Pixel = Rgba<u8>;
+
+        fn dimensions(&self) -> (u32, u32) {
+            self.0.dimensions()
+        }
+
+        fn get_pixel(&self, x: u32, y: u32) -> Self::Pixel {
+            let [r, g, b, a] = self.0.get_pixel(x, y).to_rgba().0;
+            let alpha = u16::from(a);
+            let blend = |channel: u8| {
+                ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8
+            };
+            Rgba([blend(r), blend(g), blend(b), 255])
+        }
+    }
+
+    fn sample_white<I>(source: &I, width: u32, height: u32) -> image::RgbImage
+    where
+        I: GenericImageView,
+        I::Pixel: Pixel<Subpixel = u8>,
+    {
+        let source = OnWhite(source);
+        if source.dimensions() == (width, height) {
+            image::RgbImage::from_fn(width, height, |x, y| source.get_pixel(x, y).to_rgb())
+        } else {
+            DynamicImage::ImageRgba8(resize_into(&source, width, height, width, height)).into_rgb8()
+        }
+    }
+
+    match source {
+        DynamicImage::ImageRgb8(image) => sample_white(image, width, height),
+        DynamicImage::ImageRgba8(image) => sample_white(image, width, height),
+        DynamicImage::ImageLuma8(image) => sample_white(image, width, height),
+        DynamicImage::ImageLumaA8(image) => sample_white(image, width, height),
+        _ => sample_white(source, width, height),
+    }
+}
+
 fn crop_into(
     source: &DynamicImage,
     region: (u32, u32, u32, u32),

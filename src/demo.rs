@@ -252,6 +252,12 @@ pub(crate) fn serve(events: SyncSender<TdEvent>, commands: Receiver<TdCommand>) 
                     break;
                 }
             }
+            if extra
+                .as_str()
+                .is_some_and(|tag| tag.starts_with("attachment:"))
+            {
+                send(json!({"@type":"ok","@extra":extra}));
+            }
             continue;
         }
         let response = match request["@type"].as_str().unwrap_or("") {
@@ -441,6 +447,12 @@ pub(crate) fn serve(events: SyncSender<TdEvent>, commands: Receiver<TdCommand>) 
                     posted.pop_front();
                 }
                 posted.push_back(message.clone());
+                if extra
+                    .as_str()
+                    .is_some_and(|tag| tag.starts_with("attachment:"))
+                {
+                    send(json!({"@type":"ok","@extra":extra}));
+                }
                 json!({"@type":"updateNewMessage","message":message})
             }
             "searchChatMessages" => {

@@ -70,6 +70,11 @@ const CHAT: &[Item] = &[
         action: Action::History,
     },
     Item {
+        label: "清除全部 @ 提及",
+        key: '\0',
+        action: Action::ClearMentions,
+    },
+    Item {
         label: "回到最新消息",
         key: 'G',
         action: Action::Bottom,
@@ -203,6 +208,11 @@ pub fn items(app: &App) -> impl Iterator<Item = Item> + '_ {
         }
         let message = app.selected_message();
         match item.action {
+            Action::ClearMentions => app
+                .store
+                .active_chat
+                .and_then(|id| app.store.chat(id))
+                .is_some_and(|chat| chat.mention_count > 0),
             Action::Copy => {
                 crate::selection::active(app) || message.is_some_and(|m| !m.text.is_empty())
             }

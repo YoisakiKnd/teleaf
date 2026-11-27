@@ -37,7 +37,11 @@ pub struct Sync {
     read: ReadSync,
     details_generation: u64,
     details_requested: bool,
-    details_status_updated: bool,
+    mention_clear: Option<(i64, u64)>,
+    presence_request: Option<(i64, u64)>,
+    presence_updated: bool,
+    summary_peer: Option<ChatPeer>,
+    chat_list_load: Option<String>,
     toggles: Vec<ChatToggle>,
     draft: DraftSync,
     media: Vec<FileOperation>,
@@ -55,6 +59,9 @@ struct ReadSync {
     reported: i64,
     retried: bool,
     pending: Option<(u64, i64)>,
+    stable: bool,
+    initialized: bool,
+    at_bottom: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -652,7 +659,7 @@ impl App {
         self.sync.draft.cloud_update_seen = false;
         self.sync.details_generation = self.next_sync_generation();
         self.sync.details_requested = false;
-        self.sync.details_status_updated = false;
+        self.sync.summary_peer = None;
         self.reset_draft_snapshot();
         let mut request =
             json!({"@type":"getChat","chat_id":id,"@extra":format!("open-chat:{id}")});
@@ -1144,26 +1151,55 @@ impl App {
 
     pub fn record_viewport(&mut self, visible: Vec<i64>, now: Instant) {
         let read = &mut self.sync.read;
-        if read.visible != visible {
+        let at_bottom = self.timeline_top >= self.timeline_max;
+        if !read.initialized || read.visible != visible || read.at_bottom != at_bottom {
+            read.initialized = true;
+            read.at_bottom = at_bottom;
+            read.stable = false;
             read.visible = visible;
             read.retried = false;
-            read.deadline = (!read.visible.is_empty()).then_some(now + Duration::from_millis(300));
+            read.deadline = Some(now + Duration::from_millis(300));
         }
+    }
+
+    pub fn hide_viewport(&mut self) {
+        self.sync.read.initialized = false;
+        self.sync.read.stable = false;
+        self.sync.read.deadline = None;
+    }
+
+    pub fn restart_viewport_stability(&mut self, now: Instant) {
+        self.sync.read.stable = false;
+        self.sync.read.deadline = self
+            .sync
+            .read
+            .initialized
+            .then_some(now + Duration::from_millis(300));
     }
 
     pub fn report_viewport(&mut self, worker: &TdWorker, now: Instant) -> bool {
         let Some(chat) = self.store.active_chat else {
+            self.sync.read.deadline = None;
             return false;
         };
         if self.demo || self.has_overlay() || self.show_search || self.history_loading {
-            self.record_viewport(Vec::new(), now);
+            self.hide_viewport();
+            return false;
+        }
+        if !self.terminal_focused {
+            self.sync.read.stable = false;
+            self.sync.read.deadline = None;
             return false;
         }
         let read = &mut self.sync.read;
-        if read.pending.is_some() || read.deadline.is_none_or(|deadline| deadline > now) {
+        if read.pending.is_some() {
             return false;
         }
+        if read.deadline.is_none_or(|deadline| deadline > now) {
+            return self.maybe_clear_mentions(worker);
+        }
         read.deadline = None;
+        read.stable = true;
         let read_through = self
             .store
             .chat(chat)
@@ -1176,7 +1212,7 @@ impl App {
             .filter(|id| *id > read_through)
             .collect();
         let Some(&newest) = ids.last() else {
-            return false;
+            return self.maybe_clear_mentions(worker);
         };
         let generation = self.next_sync_generation();
         let mut request = actions::view_messages(chat, ids);
@@ -1186,6 +1222,118 @@ impl App {
             false
         } else {
             true
+        }
+    }
+
+    fn maybe_clear_mentions(&mut self, worker: &TdWorker) -> bool {
+        let read = &self.sync.read;
+        if !read.stable
+            || self.store.context_window
+            || self.store.message_scope.is_some()
+            || self.timeline_top < self.timeline_max
+        {
+            return false;
+        }
+        let Some(chat) = self.store.active_chat.and_then(|id| self.store.chat(id)) else {
+            return false;
+        };
+        let latest = chat
+            .latest_message_id
+            .max(self.store.messages.last().map_or(0, |message| message.id));
+        let at_latest = self
+            .store
+            .messages
+            .last()
+            .is_some_and(|message| message.id >= latest)
+            || read.visible.last().is_some_and(|id| *id >= latest);
+        let empty_read_chat =
+            read.visible.is_empty() && self.store.messages.is_empty() && chat.unread == 0;
+        let read_confirmed = chat.unread == 0 || read.reported.max(chat.read_inbox) >= latest;
+        if (at_latest || empty_read_chat) && read_confirmed {
+            return self.clear_mentions(worker);
+        }
+        false
+    }
+
+    pub fn clear_mentions(&mut self, worker: &TdWorker) -> bool {
+        let Some(chat) = self.store.active_chat.and_then(|id| self.store.chat(id)) else {
+            return false;
+        };
+        if chat.mention_count <= 0 || chat.mentions_requested || self.sync.mention_clear.is_some() {
+            return false;
+        }
+        let id = chat.id;
+        let generation = self.next_sync_generation();
+        let mut request = actions::read_all_chat_mentions(id);
+        request["@extra"] = json!(format!("clear-mentions:{id}:{generation}"));
+        if send_request(self, worker, request) {
+            self.sync.mention_clear = Some((id, generation));
+            self.store.chat_mut_by_id(id).unwrap().mentions_requested = true;
+            return false;
+        }
+        self.sync.read.stable = false;
+        true
+    }
+
+    pub fn load_chat_list(&mut self, worker: &TdWorker, list: ChatList) -> bool {
+        if self.store.exhausted_lists.contains(&list) {
+            return false;
+        }
+        let request = actions::load_chat_list(list);
+        let tag = request["@extra"].as_str().unwrap();
+        if self.sync.chat_list_load.is_some() {
+            return false;
+        }
+        let tag = tag.to_owned();
+        if send_request(self, worker, request) {
+            self.sync.chat_list_load = Some(tag);
+        }
+        true
+    }
+
+    pub fn pending_presence_user(&self) -> Option<i64> {
+        self.sync.presence_request.map(|(user, _)| user)
+    }
+
+    pub fn request_chat_summary(&mut self, worker: &TdWorker) {
+        if self.demo {
+            return;
+        }
+        let Some((chat, peer)) = self.store.active_chat.and_then(|id| {
+            self.store
+                .chat(id)
+                .and_then(|chat| chat.peer.map(|peer| (id, peer)))
+        }) else {
+            return;
+        };
+        if self.sync.summary_peer == Some(peer) {
+            return;
+        }
+        let request = match peer {
+            ChatPeer::Private(id) => {
+                if self.store.user_status(id) != crate::store::UserStatus::Unknown {
+                    self.sync.summary_peer = Some(peer);
+                    return;
+                }
+                if self.sync.presence_request.is_some() || self.store.sender_pending(id) {
+                    return;
+                }
+                let generation = self.next_sync_generation();
+                let request = json!({"@type":"getUser", "user_id":id, "@extra":format!("presence:{id}:{generation}")});
+                if send_request(self, worker, request) {
+                    self.sync.presence_request = Some((id, generation));
+                    self.sync.presence_updated = false;
+                    self.sync.summary_peer = Some(peer);
+                }
+                return;
+            }
+            ChatPeer::BasicGroup(id) => json!({"@type":"getBasicGroup", "basic_group_id":id}),
+            ChatPeer::Supergroup(id) => json!({"@type":"getSupergroup", "supergroup_id":id}),
+        };
+        let mut request = request;
+        request["@extra"] = json!(format!("details:{chat}:{}", self.sync.details_generation));
+        if send_request(self, worker, request) {
+            self.sync.summary_peer = Some(peer);
         }
     }
 
@@ -1211,6 +1359,7 @@ impl App {
     }
 
     pub fn request_chat_info(&mut self, worker: &TdWorker) {
+        self.request_chat_summary(worker);
         for request in self.chat_info_requests() {
             send_request(self, worker, request);
         }
@@ -1224,22 +1373,13 @@ impl App {
             return Vec::new();
         };
         self.sync.details_requested = true;
-        self.sync.details_generation = self.next_sync_generation();
-        self.sync.details_status_updated = false;
         let generation = self.sync.details_generation;
-        let (field, id, summary, full) = match peer {
-            ChatPeer::Private(id) => ("user_id", id, Some("getUser"), "getUserFullInfo"),
-            ChatPeer::BasicGroup(id) => ("basic_group_id", id, None, "getBasicGroupFullInfo"),
-            ChatPeer::Supergroup(id) => (
-                "supergroup_id",
-                id,
-                Some("getSupergroup"),
-                "getSupergroupFullInfo",
-            ),
+        let (field, id, full) = match peer {
+            ChatPeer::Private(id) => ("user_id", id, "getUserFullInfo"),
+            ChatPeer::BasicGroup(id) => ("basic_group_id", id, "getBasicGroupFullInfo"),
+            ChatPeer::Supergroup(id) => ("supergroup_id", id, "getSupergroupFullInfo"),
         };
-        summary.into_iter().chain([full]).map(|kind|
-            json!({"@type":kind, field:id, "@extra":format!("details:{chat}:{generation}")})
-        ).collect()
+        vec![json!({"@type":full, field:id, "@extra":format!("details:{chat}:{generation}")})]
     }
 
     fn apply_chat_details(
@@ -1253,27 +1393,10 @@ impl App {
             return false;
         };
         match (peer, kind) {
-            (ChatPeer::Private(id), "user" | "updateUserStatus") => {
-                let status = &value["status"];
-                if kind == "updateUserStatus" || !self.sync.details_status_updated {
-                    chat.subtitle = match status["@type"].as_str() {
-                        Some("userStatusOnline") => "在线".into(),
-                        Some("userStatusRecently") => "最近上线".into(),
-                        Some("userStatusLastWeek") => "一周内上线".into(),
-                        Some("userStatusLastMonth") => "一个月内上线".into(),
-                        Some("userStatusOffline") => status["was_online"]
-                            .as_i64()
-                            .and_then(crate::calendar::local)
-                            .map_or_else(
-                                || "离线".into(),
-                                |stamp| format!("上次上线 {} {}", stamp.date(), stamp.time()),
-                            ),
-                        _ => String::new(),
-                    };
-                }
-                if kind == "user" && value["id"].as_i64() == Some(id) {
-                    chat.username = chat_username(value);
-                }
+            (ChatPeer::BasicGroup(id), "basicGroup") if value["id"].as_i64() == Some(id) => {
+                chat.member_count = value["member_count"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok());
             }
             (ChatPeer::Private(_), "userFullInfo") => {
                 chat.bio = limited(value["bio"]["text"].as_str(), 512);
@@ -1281,13 +1404,13 @@ impl App {
             (ChatPeer::BasicGroup(_), "basicGroupFullInfo") => {
                 chat.bio = limited(value["description"].as_str(), 512);
                 if let Some(members) = value["members"].as_array() {
-                    chat.subtitle = format!("{} 位成员", members.len());
+                    chat.member_count = u32::try_from(members.len()).ok();
                 }
             }
             (ChatPeer::Supergroup(_), "supergroupFullInfo") => {
                 chat.bio = limited(value["description"].as_str(), 512);
                 if let Some(count) = value["member_count"].as_i64().filter(|count| *count > 0) {
-                    chat.subtitle = format!("{count} 位成员");
+                    chat.member_count = u32::try_from(count).ok();
                 }
             }
             (ChatPeer::Supergroup(id), "supergroup") if value["id"].as_i64() == Some(id) => {
@@ -1296,7 +1419,7 @@ impl App {
                     chat.is_forum = is_forum;
                 }
                 if let Some(count) = value["member_count"].as_i64().filter(|count| *count > 0) {
-                    chat.subtitle = format!("{count} 位成员");
+                    chat.member_count = u32::try_from(count).ok();
                 }
             }
             _ => return false,
@@ -1376,10 +1499,17 @@ impl App {
                 fields.next()?.parse::<u64>().ok()?,
             ))
         };
+        if self.sync.chat_list_load.as_deref() == value["@extra"].as_str()
+            && self.sync.chat_list_load.is_some()
+        {
+            self.sync.chat_list_load = None;
+        }
         if matches!(
             route,
             "view"
                 | "details"
+                | "presence"
+                | "clear-mentions"
                 | "mute"
                 | "pin"
                 | "draft"
@@ -1392,6 +1522,30 @@ impl App {
             };
             let active = self.store.active_chat == Some(id);
             let changed = match route {
+                "presence" if self.sync.presence_request == Some((id, generation)) => {
+                    self.sync.presence_request = None;
+                    if kind == "user" && value["id"].as_i64() == Some(id) {
+                        self.store
+                            .apply_user(value, id, !self.sync.presence_updated)
+                    } else {
+                        false
+                    }
+                }
+                "clear-mentions" if self.sync.mention_clear == Some((id, generation)) => {
+                    self.sync.mention_clear = None;
+                    if kind == "error" {
+                        if let Some(chat) = self.store.chat_mut_by_id(id) {
+                            chat.mentions_requested = false;
+                        }
+                        if active {
+                            self.sync.read.stable = false;
+                        }
+                        self.sync_error(value, "无法清除未读提及");
+                        true
+                    } else {
+                        false
+                    }
+                }
                 "view" if active => {
                     if let Some((pending, newest)) = self.sync.read.pending
                         && pending == generation
@@ -1452,14 +1606,13 @@ impl App {
             };
             return Some((None, changed));
         }
-        if kind == "updateUserStatus"
-            && let Some(chat) = self.store.active_chat
-            && let Some(peer @ ChatPeer::Private(id)) =
-                self.store.chat(chat).and_then(|chat| chat.peer)
-            && value["user_id"].as_i64() == Some(id)
+        if let Some((id, _)) = self.sync.presence_request
+            && ((kind == "updateUserStatus" && value["user_id"].as_i64() == Some(id))
+                || (kind == "updateUser"
+                    && value["user"]["id"].as_i64() == Some(id)
+                    && value["user"].get("status").is_some()))
         {
-            self.sync.details_status_updated = true;
-            return Some((None, self.apply_chat_details(chat, peer, value, kind)));
+            self.sync.presence_updated = true;
         }
         if let Some(chat) = value["chat_id"].as_i64() {
             if kind == "updateChatDraftMessage" {
@@ -1836,7 +1989,7 @@ fn limited(value: Option<&str>, max: usize) -> String {
     value.unwrap_or_default().chars().take(max).collect()
 }
 
-fn chat_username(value: &Value) -> String {
+pub(crate) fn chat_username(value: &Value) -> String {
     limited(
         value
             .pointer("/usernames/active_usernames/0")
@@ -2046,7 +2199,7 @@ mod tests {
             "action":{"@type":"chatActionTyping"}})
         };
         assert!(store.apply(&typing(1)));
-        assert_eq!(store.sender_requests()[0].1["user_id"], 1);
+        assert_eq!(store.sender_requests(None)[0].1["user_id"], 1);
         store.apply(&json!({"@type":"updateUser","user":{"id":1,"first_name":"小林"}}));
         assert_eq!(store.chat(-10).unwrap().typing, "小林 正在输入…");
         store.apply(&typing(2));
@@ -2282,6 +2435,74 @@ mod tests {
     }
 
     #[test]
+    fn mentions_clear_once_after_latest_read_or_stable_mentions_only_view() {
+        for unread in [0, 1] {
+            let mut app = live_app();
+            let (worker, commands) = TdWorker::test_pair();
+            let now = Instant::now();
+            let chat = app.store.chat_mut_by_id(1).unwrap();
+            chat.mention_count = 2;
+            chat.unread = unread;
+            chat.latest_message_id = 2;
+            app.timeline_max = 1;
+            app.record_viewport(if unread == 0 { vec![] } else { vec![2] }, now);
+            app.report_viewport(&worker, now + Duration::from_millis(200));
+            assert!(commands.try_recv().is_err());
+            app.report_viewport(&worker, now + Duration::from_millis(301));
+            if unread > 0 {
+                let view = request(&commands);
+                assert_eq!(view["@type"], "viewMessages");
+                assert!(commands.try_recv().is_err());
+                deliver(&mut app, &view, json!({"@type":"ok"}));
+            }
+            assert!(commands.try_recv().is_err(), "scrolled back must not clear");
+            app.timeline_top = 1;
+            app.record_viewport(
+                if unread == 0 { vec![] } else { vec![2] },
+                now + Duration::from_millis(310),
+            );
+            app.report_viewport(&worker, now + Duration::from_millis(611));
+            let clear = request(&commands);
+            assert_eq!(clear["@type"], "readAllChatMentions");
+            assert_eq!(clear["chat_id"], 1);
+            app.clear_mentions(&worker);
+            deliver(&mut app, &clear, json!({"@type":"ok"}));
+            app.report_viewport(&worker, now + Duration::from_secs(1));
+            assert!(commands.try_recv().is_err());
+            assert_eq!(app.store.chat(1).unwrap().mention_count, 2);
+            app.apply(TdEvent::Update(json!({"@type":"updateChatUnreadMentionCount","chat_id":1,"unread_mention_count":0})));
+            assert_eq!(app.store.chat(1).unwrap().mention_count, 0);
+            assert!(
+                !crate::menu::items(&app)
+                    .any(|item| item.action == crate::ui::Action::ClearMentions)
+            );
+        }
+    }
+
+    #[test]
+    fn private_summary_fetch_is_shared_and_only_one_request_is_in_flight() {
+        let mut app = live_app();
+        app.store.add_chat(
+            &json!({"id":1,"title":"小林","type":{"@type":"chatTypePrivate","user_id":5}}),
+        );
+        let (worker, commands) = TdWorker::test_pair();
+        app.request_chat_summary(&worker);
+        let user = request(&commands);
+        assert_eq!(user["@type"], "getUser");
+        app.request_chat_summary(&worker);
+        app.request_chat_info(&worker);
+        assert_eq!(request(&commands)["@type"], "getUserFullInfo");
+        assert!(commands.try_recv().is_err());
+        deliver(
+            &mut app,
+            &user,
+            json!({"@type":"user","id":5,"status":{"@type":"userStatusRecently"}}),
+        );
+        app.request_chat_summary(&worker);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
     fn private_details_respect_live_status_and_chat_generation() {
         let mut app = live_app();
         app.store.add_chat(
@@ -2295,7 +2516,7 @@ mod tests {
         assert_eq!(full["@type"], "getUserFullInfo");
         app.apply(TdEvent::Update(
             json!({"@type":"updateUserStatus","user_id":5,
-            "status":{"@type":"userStatusOnline"}}),
+            "status":{"@type":"userStatusOnline","expires":crate::store::unix_now()+100}}),
         ));
         deliver(
             &mut app,
@@ -2303,7 +2524,7 @@ mod tests {
             json!({"@type":"user","id":5,"usernames":{"active_usernames":["xiaolin"]},
             "status":{"@type":"userStatusOffline"}}),
         );
-        assert_eq!(app.store.chat(1).unwrap().subtitle, "在线");
+        assert!(app.store.user_status(5).is_online(crate::store::unix_now()));
         assert_eq!(app.store.chat(1).unwrap().username, "xiaolin");
         app.selected_chat = Some(2);
         app.open_selected();

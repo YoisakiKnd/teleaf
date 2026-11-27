@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.3.3 · 2026-11-27
+
+- 优化图片发送速度并重构附件窗口：图片模式改为后台线程压缩（长边 `> 1600px` 等比缩放、透明背景白底合成、处理 EXIF 方向并编码为 JPEG 85，向 `inputMessagePhoto` 传递真实宽高；本身 `<= 1600px` 且 `<= 512 KiB` 的 JPEG 与原文件模式直接透传），剪贴板暂存 PNG 在 JPEG 编码后立即释放，已提交暂存文件在收到 TDLib 上传成功/失败事件后自动清理；底部工具栏拆分为 `[图片]` / `[文件]` / `[贴纸]`，附件弹窗支持分段模式切换（`[● 压缩图片]` / `[○ 原文件]`）、动态标题与按钮、文件大小/尺寸与压缩方式预估，以及剪贴板图片粘贴后回车快速发送。
+- 新增动图与视频贴纸支持（`src/animation.rs`）：时间线内联展示 `messageAnimation`（`[GIF]`）与 `stickerFormatWebm` 视频贴纸缩略图，全屏预览支持原生多帧 GIF 解码及按需调用系统 `ffmpeg` 播放 MP4 GIF / WebM 视频贴纸（`8 MiB` 帧池上限、最多 60 帧、10 fps、5 秒超时、严格 `protocol_whitelist`/`format_whitelist`、独立 Kitty 槽位避免冲突与泄漏）；支持 `Space` 暂停/继续，关闭预览、切换会话或终端失焦时立即停播并释放帧池，未安装 `ffmpeg` 时保留静态图与提示。
+- 新增实时在线状态显示：复用有界用户缓存记录 `UserStatus`（在线含过期时间、最近上线、本周、本月、离线时间戳）并按需去重请求私聊资料、监听群组 `updateChatOnlineMemberCount`；会话列表显示绿色 `●` 在线点，聊天标题栏与会话信息实时展示在线状态及群成员/在线人数，并按精准到期时间刷新，空闲零轮询。
+- 自动清除 `@` 未读提及角标：在会话视口稳定（300 ms）、终端聚焦、无弹窗且位于最新底部时自动调用 `readAllChatMentions`（翻看历史时不误清），并在 `Space` 会话菜单补充「清除全部 `@` 提及」入口。
+- 修复 Bot 内联按钮更新/清空不消失的问题：`updateMessageEdited` 改为无条件依据 `reply_markup` 覆盖 `inline_keyboard`（当 TDLib 省略字段时立即清空按钮并清理 `extras`），并同步失效对应消息的 `timeline_heights` 布局高度缓存。
+- 精简主界面多余元素：移除会话列表底部的 `[更多会话]` 按钮，改为触底自动分页加载（合并并发请求，保留 `m` 快捷键）；普通写消息模式隐藏冗余的 `写消息` 标题和 `[×]` 按钮，回复/编辑/搜索/表态等子模式继续保留标题摘要与 `[×]`。
+
 ## 0.3.2 · 2026-11-24
 
 - 重构跨平台通知架构并彻底移除 macOS `Teleaf Notifications.app` 与 Swift 助手编译/打包链路：macOS 与 Linux 支持终端原生 OSC 协议（Kitty 走 `OSC 99` 含按会话替换与已读关闭、Ghostty / WezTerm / Foot / VTE 走 `OSC 777`、iTerm2 走 `OSC 9`），支持 `tmux` / `screen` DCS 透传与严格控制字符清洗；Windows 默认保留原生 WinRT Toast，Linux 非 OSC 终端保留纯 Rust 直连 D-Bus，macOS 非 OSC 终端退化为终端 BEL；新增终端焦点感知（`FocusGained` / `FocusLost`，活跃会话聚焦自动抑制与重聚焦撤回、空闲零重绘）、`TG_NOTIFY_BACKEND` 覆盖及安全 stdin JSON 外部命令钩子（`notify_command` / `TG_NOTIFY_CMD`）。

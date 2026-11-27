@@ -115,7 +115,9 @@ pub(crate) enum Action {
     Folders,
     ClearSearch,
     Back,
-    AttachmentMode,
+    AttachmentPhotos,
+    AttachmentFiles,
+    ClearMentions,
     AttachmentParent,
     PasteClipboard,
     StickerPrevious,
@@ -447,12 +449,16 @@ fn anchor_at(app: &mut App, top: usize) {
 }
 
 fn panel_with_style(title: String, focused: bool, base: Style) -> Block<'static> {
-    let label = if focused {
+    let label = if focused && !title.is_empty() {
         format!("▸ {title}")
     } else {
         title
     };
-    let title = Line::from(label).style(
+    panel_with_title(Line::from(label), focused, base)
+}
+
+fn panel_with_title(title: Line<'static>, focused: bool, base: Style) -> Block<'static> {
+    let title = title.style(
         Style::default()
             .fg(if focused {
                 palette().accent
@@ -1074,6 +1080,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.media.begin_frame();
     app.visible_media.clear();
     app.visible_read_ids.clear();
+    app.presence_deadline = None;
     app.hit_targets.clear();
     app.scrollbars.clear();
     let area = frame.area();
@@ -1268,7 +1275,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let zoomable = media
             .as_ref()
             .is_some_and(|m| matches!(m.kind, MediaKind::Photo | MediaKind::Sticker));
-        media_view(frame, app, rows[0], media);
+        match media {
+            Some(media) if media.kind == MediaKind::Animation => {
+                animation_view(frame, app, rows[0], media)
+            }
+            media => {
+                app.media.stop_animation();
+                media_view(frame, app, rows[0], media);
+            }
+        }
         if zoomable {
             if rows[1].width >= 48 {
                 let tools = Layout::horizontal([
@@ -1755,7 +1770,18 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
         let active_topic_name = active_chat_ref
             .and_then(|c| c.active_topic.as_ref())
             .map(|(_, name)| name.clone());
-        let subtitle = active_chat_ref.map(|c| c.subtitle.as_str()).unwrap_or("");
+        let status = active_chat_ref.map_or(crate::store::UserStatus::Unknown, |chat| {
+            app.store.chat_status(chat)
+        });
+        let now = crate::store::unix_now();
+        let subtitle =
+            active_chat_ref.map_or_else(String::new, |chat| app.store.chat_status_label(chat, now));
+        let normal_title = !app.show_search
+            && app.active_thread.is_none()
+            && active_topic_name.is_none()
+            && !(app.history_loading && rows[0].width >= 32);
+        crate::track_presence(&mut app.presence_deadline, status);
+        let online_title = normal_title && status.is_online(now);
         let title = if app.show_search {
             format!(
                 "搜索 · {}「{}」· {} 条",
@@ -1769,7 +1795,7 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
             format!("{base_title} · #{topic}")
         } else if app.history_loading && rows[0].width >= 32 {
             format!("{base_title} · 加载中…")
-        } else if !subtitle.is_empty() && rows[0].width >= 52 {
+        } else if !subtitle.is_empty() && !online_title {
             format!("{base_title} · {subtitle}")
         } else {
             base_title
@@ -1782,17 +1808,27 @@ fn chat_page(frame: &mut Frame, app: &mut App, area: Rect) {
             + u16::from(show_info_btn) * 6
             + u16::from(show_topic_btn) * 6;
         let focused_timeline = app.focus_messages && app.input_mode == InputMode::Off;
-        let block = panel(
-            crate::text::ellipsize(
-                &title,
-                usize::from(
-                    rows[0]
-                        .width
-                        .saturating_sub(control_width + 3 + u16::from(focused_timeline) * 2),
-                ),
-            ),
-            focused_timeline,
+        let budget = usize::from(
+            rows[0]
+                .width
+                .saturating_sub(control_width + 3 + u16::from(focused_timeline) * 2),
         );
+        let prefix = if focused_timeline { "▸ " } else { "" };
+        let title = if online_title && budget > 11 {
+            Line::from(vec![
+                Span::raw(format!(
+                    "{prefix}{} · ",
+                    crate::text::ellipsize(&title, budget - 10)
+                )),
+                Span::styled(subtitle, Style::default().fg(palette().accent)),
+            ])
+        } else {
+            Line::from(format!(
+                "{prefix}{}",
+                crate::text::ellipsize(&title, budget)
+            ))
+        };
+        let block = panel_with_title(title, focused_timeline, palette().base());
         let inner = block.inner(rows[0]);
         frame.render_widget(block, rows[0]);
         app.hit_targets
@@ -1879,23 +1915,8 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
     app.hit_targets.push((area, Target::Panel(Pane::Chats)));
     let ids: Vec<_> = app.store.chat_ids().collect();
     let inner = if bordered {
-        let parts = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
         folder_tabs(frame, app, parts[0]);
-        if !ids.is_empty() && app.store.exhausted_lists.contains(&app.store.selected_list) {
-            frame.render_widget(
-                Paragraph::new(format!("已加载全部 · {} 个会话", ids.len()))
-                    .style(Style::default().fg(palette().muted))
-                    .alignment(Alignment::Center),
-                parts[2],
-            );
-        } else {
-            button(frame, app, parts[2], "[更多会话]", Action::MoreChats);
-        }
         parts[1]
     } else {
         inner
@@ -1909,7 +1930,7 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
             } else {
                 "正在加载会话…"
             },
-            "点击更多会话加载",
+            "按 m 加载会话",
         );
         return;
     }
@@ -1929,6 +1950,7 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
     }
     app.chat_offset = app.chat_offset.min(ids.len().saturating_sub(visible));
     let start = app.chat_offset;
+    let mut presence_deadline = app.presence_deadline;
     let items: Vec<_> = ids
         .iter()
         .skip(start)
@@ -1970,13 +1992,25 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
                 text_width(time_tag.as_str()) + text_width(pin_tag) + text_width(mention);
             let right_width = meta_width + badge_width;
             let active_prefix = if is_active { "· " } else { "" };
+            let status = app.store.chat_status(chat);
+            crate::track_presence(&mut presence_deadline, status);
+            let online = if status.is_online(crate::store::unix_now()) && width >= right_width + 6 {
+                " ●"
+            } else {
+                ""
+            };
+            let online_width = text_width(online);
             let title_text = crate::text::ellipsize(
                 &chat.title,
                 width.saturating_sub(
-                    right_width + usize::from(right_width > 0) + text_width(active_prefix),
+                    right_width
+                        + usize::from(right_width > 0)
+                        + text_width(active_prefix)
+                        + online_width,
                 ),
             );
-            let title_width = text_width(active_prefix) + text_width(title_text.as_str());
+            let title_width =
+                text_width(active_prefix) + text_width(title_text.as_str()) + online_width;
             let padding = width.saturating_sub(title_width + right_width);
             let title_style = if is_active {
                 Style::default()
@@ -2000,6 +2034,7 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
                 title_spans.push(Span::styled(active_prefix, title_style));
             }
             title_spans.push(Span::styled(title_text, title_style));
+            title_spans.push(Span::styled(online, Style::default().fg(palette().accent)));
             title_spans.push(Span::raw(" ".repeat(padding)));
             if !time_tag.is_empty() {
                 title_spans.push(Span::styled(time_tag, meta_style));
@@ -2052,6 +2087,7 @@ fn chat_list(frame: &mut Frame, app: &mut App, area: Rect, focused: bool, border
             })
         })
         .collect();
+    app.presence_deadline = presence_deadline;
     let mut state = ListState::default().with_selected(
         (selected >= start && selected < start + visible).then_some(selected.saturating_sub(start)),
     );
@@ -2098,6 +2134,10 @@ fn message_body(message: &Message) -> &str {
             .strip_prefix("[图片] ")
             .unwrap_or(&message.text),
         Some(MediaKind::Sticker) if message.text.starts_with("[贴纸]") => "",
+        Some(MediaKind::Animation) => message
+            .text
+            .strip_prefix("[GIF]")
+            .map_or(&message.text, |caption| caption.trim_start()),
         _ => &message.text,
     }
 }
@@ -2137,7 +2177,7 @@ fn inline_media(message: &Message) -> Option<&MediaRef> {
     message
         .media
         .as_ref()
-        .filter(|media| matches!(media.kind, MediaKind::Photo | MediaKind::Sticker))
+        .filter(|media| media.kind.is_inline_image())
 }
 
 fn has_media_card(message: &Message) -> bool {
@@ -2622,6 +2662,7 @@ fn message_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 .map(|media| match media.kind {
                     MediaKind::Photo => " · 图片",
                     MediaKind::Sticker => " · 贴纸",
+                    MediaKind::Animation => " · [GIF]",
                     MediaKind::Document => " · 文件",
                     MediaKind::Video => " · 视频",
                     MediaKind::Voice => " · 语音",
@@ -3332,7 +3373,7 @@ fn multi_select_bar(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = match app.input_mode {
-        InputMode::Off | InputMode::Send => "写消息",
+        InputMode::Off | InputMode::Send => "",
         InputMode::Reply(_) => "回复消息",
         InputMode::Edit(_) => "编辑消息",
         InputMode::Search => "搜索",
@@ -3357,6 +3398,7 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
         String::new()
     };
     let max_title = usize::from(area.width.saturating_sub(8 + u16::from(focused) * 2));
+    let submode = !title.is_empty();
     let title = if let InputMode::Reply(id) | InputMode::Edit(id) = app.input_mode {
         app.store
             .messages
@@ -3374,7 +3416,12 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
             })
             .unwrap_or_else(|| crate::text::ellipsize(&format!("{title}{row_hint}"), max_title))
     } else if !row_hint.is_empty() {
-        crate::text::ellipsize(&format!("{title}{row_hint}"), max_title)
+        let hint = if submode {
+            row_hint.as_str()
+        } else {
+            row_hint.trim_start_matches(" · ")
+        };
+        crate::text::ellipsize(&format!("{title}{hint}"), max_title)
     } else {
         title.to_owned()
     };
@@ -3382,7 +3429,7 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.hit_targets.push((area, Target::Composer));
-    if app.input_mode != InputMode::Off {
+    if submode {
         button(
             frame,
             app,
@@ -3407,11 +3454,23 @@ fn composer(frame: &mut Frame, app: &mut App, area: Rect) {
         let filter = Rect::new(tools.x, tools.y, (tools.width - submit_width).min(18), 1);
         button(frame, app, filter, &label, Action::CycleMediaFilter);
     } else {
-        let left_width = (tools.width - submit_width).min(20);
-        let first = Rect::new(tools.x, tools.y, left_width / 2, 1);
-        let second = Rect::new(first.right(), tools.y, left_width - first.width, 1);
-        button(frame, app, first, "[附件]", Action::File);
-        button(frame, app, second, "[贴纸]", Action::Stickers);
+        let left_width = (tools.width - submit_width).min(27);
+        let first = Rect::new(tools.x, tools.y, left_width / 3, 1);
+        let second = Rect::new(first.right(), tools.y, left_width / 3, 1);
+        let third = Rect::new(
+            second.right(),
+            tools.y,
+            left_width - first.width - second.width,
+            1,
+        );
+        let labels = if first.width >= 6 {
+            ["[图片]", "[文件]", "[贴纸]"]
+        } else {
+            ["图", "件", "贴"]
+        };
+        button(frame, app, first, labels[0], Action::Photo);
+        button(frame, app, second, labels[1], Action::File);
+        button(frame, app, third, labels[2], Action::Stickers);
     }
     button(frame, app, submit, submit_label, Action::Submit);
 
@@ -3516,15 +3575,17 @@ fn inline_media_view(
         return;
     }
     let Some(path) = &media.path else {
-        let label = if media.kind == MediaKind::Sticker {
-            "[贴纸]"
-        } else {
-            "[图片]"
+        let label = match media.kind {
+            MediaKind::Sticker => "[贴纸]",
+            MediaKind::Animation => "[GIF]",
+            _ => "[图片]",
         };
         frame.render_widget(
             Paragraph::new(format!(
                 "{label} {}",
-                if app.failed_files.contains(&media.file_id) {
+                if media.file_id == 0 {
+                    "点击预览动图"
+                } else if app.failed_files.contains(&media.file_id) {
                     "下载失败 · 点击重试"
                 } else if app.requested_files.contains(&media.file_id) {
                     "↓ 正在下载 · 点击查看"
@@ -3547,10 +3608,10 @@ fn inline_media_view(
         );
         finish_sixel(frame, area, &app.media.protocol_name);
     } else {
-        let label = if media.kind == MediaKind::Sticker {
-            "[贴纸]"
-        } else {
-            "[图片]"
+        let label = match media.kind {
+            MediaKind::Sticker => "[贴纸]",
+            MediaKind::Animation => "[GIF]",
+            _ => "[图片]",
         };
         frame.render_widget(
             Paragraph::new(format!(
@@ -3582,6 +3643,46 @@ fn finish_sixel(frame: &mut Frame, area: Rect, protocol: &str) {
         let _ = write!(payload, "\x1b[{};{next_column}H", area.y + 1);
         cell.set_symbol(&payload);
     }
+}
+
+fn animation_view(frame: &mut Frame, app: &mut App, area: Rect, media: MediaRef) {
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let viewport = centered(rows[0], 160, 60);
+    let size = Size::new(viewport.width, viewport.height);
+    let (file, path) = media.detail_file();
+    let mut playing = false;
+    let hint = if !app.terminal_focused {
+        "动图已停止 · o 用系统程序打开"
+    } else if let Some(path) = path {
+        if let Some(image) = app.media.animation_view(file, path, size) {
+            let image_area = centered(viewport, image.size().width, image.size().height);
+            frame.render_widget(Image::new(image).allow_clipping(true), image_area);
+            finish_sixel(frame, image_area, &app.media.protocol_name);
+            playing = true;
+        }
+        app.media.animation.hint()
+    } else if app.failed_files.contains(&file) {
+        "下载失败 · 关闭后按 v 重试"
+    } else {
+        "正在下载动图…"
+    };
+    if !playing {
+        let view = crate::media::View {
+            preview: true,
+            ..Default::default()
+        };
+        if let Some(path) = &media.path {
+            app.media.request_view(media.file_id, path, size, view);
+        }
+        if let Some(image) = app.media.get_view(media.file_id, size, view) {
+            let image_area = centered(viewport, image.size().width, image.size().height);
+            frame.render_widget(Image::new(image).allow_clipping(true), image_area);
+            finish_sixel(frame, image_area, &app.media.protocol_name);
+        } else {
+            empty(frame, rows[0], "[GIF]", "");
+        }
+    }
+    draw_line(frame, rows[1], &muted(hint), palette().base());
 }
 
 fn media_view(frame: &mut Frame, app: &mut App, area: Rect, media: Option<MediaRef>) {
@@ -4047,17 +4148,20 @@ fn sticker_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
-    let title = if app
-        .attachments
-        .as_ref()
-        .is_some_and(|picker| picker.reply_to.is_some())
-    {
-        "发送附件 · 回复"
+    let picker = app.attachments.as_ref().unwrap();
+    let photos = picker.photos;
+    let mode = if photos {
+        "发送图片"
     } else {
-        "发送附件"
+        "发送原文件"
     };
-    let inner = modal(frame, app, centered(area, 86, 25), title);
-    let compact_tools = inner.width < 34;
+    let title = if picker.reply_to.is_some() {
+        format!("{mode} · 回复")
+    } else {
+        mode.to_owned()
+    };
+    let inner = modal(frame, app, centered(area, 86, 25), &title);
+    let compact_tools = inner.width < 42;
     let wide = inner.width >= 48;
     let parts = Layout::vertical([
         Constraint::Length(1),
@@ -4069,43 +4173,23 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(1),
     ])
     .split(inner);
-    let tools = if compact_tools {
-        Layout::horizontal([
-            Constraint::Percentage(35),
-            Constraint::Percentage(35),
-            Constraint::Percentage(30),
-        ])
-        .split(parts[0])
-    } else {
-        Layout::horizontal([
-            Constraint::Length(12),
-            Constraint::Min(1),
-            Constraint::Length(8),
-        ])
-        .split(parts[0])
-    };
+    let tools = Layout::horizontal([
+        Constraint::Length(if compact_tools { 8 } else { 14 }),
+        Constraint::Length(if compact_tools { 8 } else { 12 }),
+        Constraint::Length(if compact_tools { 6 } else { 10 }),
+        Constraint::Length(if compact_tools { 6 } else { 9 }),
+        Constraint::Min(0),
+    ])
+    .split(parts[0]);
     let picker = app.attachments.as_mut().unwrap();
     let focus = picker.focus;
-    let mode = match (picker.photos, compact_tools) {
-        (true, true) => "[图片]",
-        (false, true) => "[文件]",
-        (true, false) => "[图片 F5]",
-        (false, false) => "[原文件 F5]",
-    };
-    let paste_label = if compact_tools {
-        "[粘贴]"
-    } else {
-        "[粘贴 F7]"
-    };
-    let parent_label = if compact_tools {
-        "[上级]"
-    } else {
-        "[上一级]"
-    };
     let directory = crate::text::ellipsize(
         &picker.directory.to_string_lossy(),
         usize::from(parts[1].width),
     );
+    let preparing = picker.preparing.is_some();
+    let quick = picker.quick_confirm;
+    let count = picker.selected.len();
     let path = picker.path.clone();
     let path_cursor = picker.path_cursor;
     let caption = picker.caption.clone();
@@ -4120,13 +4204,43 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     picker.offset = picker
         .offset
         .min(picker.entries.len().saturating_sub(picker.visible));
-    button(frame, app, tools[0], mode, Action::AttachmentMode);
-    button(frame, app, tools[1], paste_label, Action::PasteClipboard);
-    button(frame, app, tools[2], parent_label, Action::AttachmentParent);
-    frame.render_widget(
-        Paragraph::new(directory).style(Style::default().fg(palette().muted)),
-        parts[1],
+    let segments = match (photos, compact_tools) {
+        (true, false) => ["[● 压缩图片]", "[○ 原文件]"],
+        (false, false) => ["[○ 压缩图片]", "[● 原文件]"],
+        (true, true) => ["[● 图]", "[○ 件]"],
+        (false, true) => ["[○ 图]", "[● 件]"],
+    };
+    button(frame, app, tools[0], segments[0], Action::AttachmentPhotos);
+    button(frame, app, tools[1], segments[1], Action::AttachmentFiles);
+    button(
+        frame,
+        app,
+        tools[2],
+        if compact_tools {
+            "[粘贴]"
+        } else {
+            "[粘贴 F7]"
+        },
+        Action::PasteClipboard,
     );
+    button(
+        frame,
+        app,
+        tools[3],
+        if compact_tools {
+            "[上级]"
+        } else {
+            "[上一级]"
+        },
+        Action::AttachmentParent,
+    );
+    let hint = if photos {
+        "自动缩放转 JPEG"
+    } else {
+        "保持原画质与原格式"
+    };
+    draw_line(frame, tools[4], &muted(hint), palette().base());
+    draw_line(frame, parts[1], &muted(directory), palette().base());
     let path_focused = focus == crate::attachments::Focus::Path;
     if path_focused {
         frame.buffer_mut().set_style(parts[2], palette().base());
@@ -4233,10 +4347,16 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 " "
             };
-            (i, format!("{mark} {name}"), i == picker.cursor)
+            (
+                i,
+                format!("{mark} {name}"),
+                i == picker.cursor,
+                e.bytes.map(crate::attachments::display_size),
+                !e.directory && crate::attachments::photo_paths(std::slice::from_ref(&e.path)),
+            )
         })
         .collect();
-    for (row, (index, label, selected)) in entries.into_iter().enumerate() {
+    for (row, (index, label, selected, bytes, photo)) in entries.into_iter().enumerate() {
         let rect = Rect::new(browser_area.x, browser_area.y + row as u16, entry_width, 1);
         let style = if selected && browser_focused {
             palette()
@@ -4250,10 +4370,7 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::default()
         };
-        frame.render_widget(
-            Paragraph::new(crate::text::ellipsize(&label, usize::from(rect.width))).style(style),
-            rect,
-        );
+        attachment_file_line(frame, rect, &label, bytes.as_deref(), photo, style);
         app.hit_targets.push((rect, Target::AttachmentEntry(index)));
     }
     if has_browser_scroll {
@@ -4285,10 +4402,30 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
                 picker
                     .selected
                     .get(queue_offset)
-                    .filter(|p| crate::attachments::photo_paths(&[(*p).clone()]))
+                    .filter(|p| crate::attachments::photo_paths(std::slice::from_ref(*p)))
                     .cloned()
             })
             .flatten();
+        let photo_detail = if photos {
+            preview_path.as_ref().and_then(|path| {
+                if picker
+                    .photo_summary
+                    .as_ref()
+                    .is_none_or(|(cached, _)| cached != path)
+                {
+                    picker.photo_summary = Some((
+                        path.clone(),
+                        crate::attachments::photo_description(path).unwrap_or_default(),
+                    ));
+                }
+                picker
+                    .photo_summary
+                    .as_ref()
+                    .map(|(_, summary)| summary.clone())
+            })
+        } else {
+            None
+        };
         let selected: Vec<_> = picker
             .selected
             .iter()
@@ -4300,6 +4437,9 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned(),
+                    std::fs::metadata(p)
+                        .ok()
+                        .map(|meta| crate::attachments::display_size(meta.len())),
                 )
             })
             .collect();
@@ -4311,7 +4451,7 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
             );
             app.hit_targets.push((queue_col, Target::AttachmentQueue));
             let queue_rows = selected.len().min(queue_visible);
-            for (row, (index, name)) in selected
+            for (row, (index, name, bytes)) in selected
                 .into_iter()
                 .skip(queue_offset)
                 .take(queue_rows)
@@ -4323,22 +4463,35 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
                     queue_col.width,
                     1,
                 );
-                frame.render_widget(
-                    Paragraph::new(crate::text::ellipsize(
-                        &format!("× {name}"),
-                        usize::from(rect.width),
-                    )),
+                attachment_file_line(
+                    frame,
                     rect,
+                    &format!("× {name}"),
+                    bytes.as_deref(),
+                    false,
+                    palette().base(),
                 );
                 app.hit_targets
                     .push((rect, Target::AttachmentRemove(index)));
             }
             if let Some(path) = preview_path {
+                let info_row = queue_col.y + 1 + queue_rows as u16;
+                let has_info = photo_detail.is_some() && info_row < queue_col.bottom();
+                if let Some(summary) = photo_detail.filter(|_| has_info) {
+                    draw_line(
+                        frame,
+                        Rect::new(queue_col.x, info_row, queue_col.width, 1),
+                        &muted(summary),
+                        palette().base(),
+                    );
+                }
                 let preview = Rect::new(
                     queue_col.x,
-                    queue_col.y + 1 + queue_rows as u16,
+                    info_row + u16::from(has_info),
                     queue_col.width,
-                    queue_col.height.saturating_sub(1 + queue_rows as u16),
+                    queue_col
+                        .height
+                        .saturating_sub(1 + queue_rows as u16 + u16::from(has_info)),
                 );
                 let size = Size::new(preview.width, preview.height);
                 let id = crate::attachments::preview_id(&path);
@@ -4350,7 +4503,7 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
         } else {
-            let summary = if let Some((_, first)) = selected.first() {
+            let summary = if let Some((_, first, _)) = selected.first() {
                 if selected.len() > 1 {
                     format!("已选 {}/10 · × {first} 等", selected.len())
                 } else {
@@ -4359,17 +4512,14 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 "已选 0/10 · 点击文件选择".into()
             };
-            frame.render_widget(
-                Paragraph::new(crate::text::ellipsize(
+            draw_line(
+                frame,
+                queue_col,
+                &muted(crate::text::ellipsize(
                     &summary,
                     usize::from(queue_col.width),
-                ))
-                .style(Style::default().fg(if selected.is_empty() {
-                    palette().muted
-                } else {
-                    palette().accent
-                })),
-                queue_col,
+                )),
+                palette().base(),
             );
             if !selected.is_empty() {
                 app.hit_targets
@@ -4427,9 +4577,15 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     frame.render_widget(
         Paragraph::new(crate::text::ellipsize(
-            error
-                .as_deref()
-                .unwrap_or("Enter 选择 · Space 多选 · F5 切换模式 · F8 发送"),
+            if preparing {
+                "正在压缩图片…"
+            } else {
+                error.as_deref().unwrap_or(if quick {
+                    "Enter / F8 发送 · F5 切换模式"
+                } else {
+                    "Enter 选择 · Space 多选 · F5 切换模式 · F8 发送"
+                })
+            },
             usize::from(parts[5].width),
         ))
         .style(Style::default().fg(
@@ -4443,8 +4599,51 @@ fn attachment_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     let footer = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(parts[6]);
-    button(frame, app, footer[0], "[发送附件]", Action::Confirm);
+    button(
+        frame,
+        app,
+        footer[0],
+        &format!("[{mode} ({count})]"),
+        Action::Confirm,
+    );
     button(frame, app, footer[1], "[取消]", Action::Cancel);
+}
+
+fn attachment_file_line(
+    frame: &mut Frame,
+    rect: Rect,
+    name: &str,
+    bytes: Option<&str>,
+    photo: bool,
+    style: Style,
+) {
+    let mut name_rect = rect;
+    if let Some(bytes) = bytes {
+        let width = text_width(bytes) as u16;
+        if rect.width > width + 5 {
+            name_rect.width -= width + 1;
+            draw_line(
+                frame,
+                Rect::new(rect.right() - width, rect.y, width, 1),
+                &muted(bytes),
+                style,
+            );
+        }
+    }
+    let marker = if photo && name_rect.width >= 12 {
+        " ▧"
+    } else {
+        ""
+    };
+    let name = crate::text::ellipsize(
+        name,
+        usize::from(name_rect.width).saturating_sub(text_width(marker)),
+    );
+    let line = Line::from(vec![
+        Span::raw(name),
+        Span::styled(marker, Style::default().fg(palette().muted)),
+    ]);
+    draw_line(frame, name_rect, &line, style);
 }
 
 fn quick_switcher_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -4664,8 +4863,18 @@ fn chat_info_body(frame: &mut Frame, app: &mut App, area: Rect) {
             .fg(palette().accent)
             .add_modifier(Modifier::BOLD),
     )];
-    if !chat.subtitle.is_empty() {
-        lines.push(muted(chat.subtitle.clone()));
+    let status = app.store.chat_status(&chat);
+    let now = crate::store::unix_now();
+    let subtitle = app.store.chat_status_label(&chat, now);
+    if !subtitle.is_empty() {
+        lines.push(Line::styled(
+            subtitle,
+            Style::default().fg(if status.is_online(now) {
+                palette().accent
+            } else {
+                palette().muted
+            }),
+        ));
     }
     if !chat.username.is_empty() {
         lines.push(Line::styled(
@@ -5659,6 +5868,118 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn presence_dots_titles_and_mention_badge_follow_store_updates() {
+        let mut app = fixture();
+        app.store.chat_mut_by_id(1).unwrap().peer = Some(crate::store::ChatPeer::Private(7));
+        app.store.chat_mut_by_id(2).unwrap().peer = Some(crate::store::ChatPeer::BasicGroup(8));
+        app.store
+            .apply(&json!({"@type":"updateUserStatus","user_id":7,
+            "status":{"@type":"userStatusOnline","expires":crate::store::unix_now()+30}}));
+        app.store.apply(
+            &json!({"@type":"updateChatUnreadMentionCount","chat_id":1,"unread_mention_count":1}),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(130, 34)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let list = app
+            .hit_targets
+            .iter()
+            .find(|(_, target)| *target == Target::Chat(1))
+            .unwrap()
+            .0;
+        let timeline = app
+            .hit_targets
+            .iter()
+            .find(|(_, target)| *target == Target::Panel(Pane::Timeline))
+            .unwrap()
+            .0;
+        for rect in [list, timeline] {
+            let buffer = terminal.backend().buffer();
+            assert!((rect.x..rect.right()).any(|x| {
+                let cell = &buffer[(x, rect.y)];
+                cell.symbol() == "●" && cell.fg == palette().accent
+            }));
+        }
+        assert!(
+            (list.x..list.right())
+                .any(|x| terminal.backend().buffer()[(x, list.y)].symbol() == "@")
+        );
+        assert!(app.presence_deadline.is_some());
+        app.store
+            .apply(&json!({"@type":"updateUserStatus","user_id":7,
+            "status":{"@type":"userStatusOnline","expires":1}}));
+        app.store.apply(
+            &json!({"@type":"updateChatUnreadMentionCount","chat_id":1,"unread_mention_count":0}),
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        for rect in [list, timeline] {
+            assert!((rect.x..rect.right()).all(|x| {
+                !matches!(terminal.backend().buffer()[(x, rect.y)].symbol(), "●" | "@")
+            }));
+        }
+        assert!(snapshot(&mut app, 130, 34).contains("产品讨论 · 离线"));
+        app.store
+            .apply(&json!({"@type":"updateBasicGroup","basic_group":{"id":8,"member_count":128}}));
+        app.store.apply(
+            &json!({"@type":"updateChatOnlineMemberCount","chat_id":2,"online_member_count":14}),
+        );
+        app.store.open(2);
+        assert!(snapshot(&mut app, 130, 34).contains("128 人 · 14 人在线"));
+    }
+
+    #[test]
+    fn composer_border_and_attachment_controls_reflect_context() {
+        let mut app = fixture();
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        for (mode, expected) in [
+            (InputMode::Off, ""),
+            (InputMode::Send, ""),
+            (InputMode::Reply(2), "回复消息"),
+            (InputMode::Edit(2), "编辑消息"),
+            (InputMode::Search, "搜索"),
+            (InputMode::React(2), "表情回应"),
+        ] {
+            app.input_mode = mode;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let rect = app
+                .hit_targets
+                .iter()
+                .find(|(_, target)| *target == Target::Composer)
+                .unwrap()
+                .0;
+            let mut row = String::new();
+            let mut x = rect.x;
+            while x < rect.right() {
+                let symbol = terminal.backend().buffer()[(x, rect.y)].symbol();
+                row.push_str(symbol);
+                x += text_width(symbol).max(1) as u16;
+            }
+            assert!(!row.contains("写消息"));
+            assert!(row.contains(expected));
+            assert_eq!(row.contains("[×]"), !expected.is_empty());
+        }
+        assert!(
+            !app.hit_targets
+                .iter()
+                .any(|(_, target)| *target == Target::Command(Action::MoreChats))
+        );
+        app.attachments = Some(crate::attachments::Picker::new(true, Some(2)));
+        let text = snapshot(&mut app, 120, 34);
+        assert!(
+            text.contains("发送图片 · 回复")
+                && text.contains("[● 压缩图片]")
+                && text.contains("[发送图片 (0)]")
+        );
+        let (worker, _commands) = crate::TdWorker::test_pair();
+        crate::interaction::perform(&mut app, &worker, Action::AttachmentFiles);
+        let text = snapshot(&mut app, 120, 34);
+        assert!(
+            text.contains("发送原文件 · 回复")
+                && text.contains("[● 原文件]")
+                && text.contains("[发送原文件 (0)]")
+        );
+    }
+
+    #[test]
     fn bot_keyboards_share_emoji_width_background_and_hit_areas() {
         use crate::store::{InlineButton, InlineButtonKind};
         let mut app = fixture();
@@ -5889,7 +6210,12 @@ pub(crate) mod tests {
                 .unwrap()
                 .0;
             assert!(composer.height >= 5);
-            for action in [Action::File, Action::Stickers, Action::Submit] {
+            for action in [
+                Action::Photo,
+                Action::File,
+                Action::Stickers,
+                Action::Submit,
+            ] {
                 let rect = app
                     .hit_targets
                     .iter()
@@ -6059,7 +6385,10 @@ pub(crate) mod tests {
                     .all(|(r, _)| r.right() <= width && r.bottom() <= height)
             );
             assert!(
-                output.contains("[附件]") && output.contains("[贴纸]") && output.contains("[发送]")
+                output.contains("[图片]")
+                    && output.contains("[文件]")
+                    && output.contains("[贴纸]")
+                    && output.contains("[发送]")
             );
             if height == 12 {
                 assert!(!app.sticker_panel.preview_visible);

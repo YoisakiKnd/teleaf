@@ -3,7 +3,13 @@ use crate::{actions, text};
 use crossterm::event::KeyCode;
 use serde_json::{Value, json};
 use std::fs;
+use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver},
+};
 
 pub const MAX_FILES: usize = 10;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -16,6 +22,7 @@ pub enum Focus {
 pub struct Entry {
     pub path: PathBuf,
     pub directory: bool,
+    pub bytes: Option<u64>,
 }
 pub struct Picker {
     pub directory: PathBuf,
@@ -24,7 +31,10 @@ pub struct Picker {
     pub offset: usize,
     pub visible: usize,
     pub selected: Vec<PathBuf>,
-    pub clipboard_images: Vec<crate::clipboard::TemporaryImage>,
+    pub clipboard_images: Vec<Arc<crate::clipboard::TemporaryImage>>,
+    pub quick_confirm: bool,
+    pub preparing: Option<Preparation>,
+    pub photo_summary: Option<(PathBuf, String)>,
     pub queue_offset: usize,
     pub queue_visible: usize,
     pub consume_path_draft: bool,
@@ -37,6 +47,16 @@ pub struct Picker {
     pub error: Option<String>,
     pub reply_to: Option<i64>,
 }
+pub struct Preparation {
+    pub result: Receiver<Result<Vec<PreparedPhoto>, String>>,
+    cancelled: Arc<AtomicBool>,
+}
+impl Drop for Preparation {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Picker {
     pub fn new(photos: bool, reply_to: Option<i64>) -> Self {
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -48,6 +68,9 @@ impl Picker {
             visible: 1,
             selected: vec![],
             clipboard_images: vec![],
+            quick_confirm: false,
+            preparing: None,
+            photo_summary: None,
             queue_offset: 0,
             queue_visible: 1,
             consume_path_draft: false,
@@ -64,6 +87,10 @@ impl Picker {
         picker
     }
     pub fn navigate(&mut self, path: PathBuf) {
+        if self.preparing.is_some() {
+            return;
+        }
+        self.quick_confirm = false;
         let result = fs::read_dir(&path).map(|entries| {
             let mut list: Vec<_> = entries
                 .filter_map(Result::ok)
@@ -74,6 +101,9 @@ impl Picker {
                     (directory || kind.is_file() || kind.is_symlink()).then(|| Entry {
                         path: entry.path(),
                         directory,
+                        bytes: (!directory)
+                            .then(|| entry.metadata().ok().map(|m| m.len()))
+                            .flatten(),
                     })
                 })
                 .collect();
@@ -88,6 +118,7 @@ impl Picker {
                     Entry {
                         path: parent.to_path_buf(),
                         directory: true,
+                        bytes: None,
                     },
                 );
             }
@@ -105,6 +136,10 @@ impl Picker {
         }
     }
     pub fn activate(&mut self, index: usize) {
+        if self.preparing.is_some() {
+            return;
+        }
+        self.quick_confirm = false;
         if let Some(entry) = self.entries.get(index).cloned() {
             self.cursor = index;
             self.focus = Focus::Browser;
@@ -140,6 +175,10 @@ impl Picker {
         Ok(())
     }
     pub fn remove(&mut self, index: usize) {
+        if self.preparing.is_some() {
+            return;
+        }
+        self.quick_confirm = false;
         if index < self.selected.len() {
             let removed = self.selected.remove(index);
             self.clipboard_images
@@ -163,11 +202,23 @@ impl Picker {
             }
         }
     }
+    pub fn set_photos(&mut self, photos: bool) {
+        if self.preparing.is_none() {
+            self.photos = photos;
+            self.error = None;
+        }
+    }
+
     pub fn key(&mut self, key: KeyCode) {
+        if self.preparing.is_some() {
+            return;
+        }
+        if key != KeyCode::F(5) {
+            self.quick_confirm = false;
+        }
         match key {
             KeyCode::F(5) => {
-                self.photos = !self.photos;
-                self.error = None;
+                self.set_photos(!self.photos);
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match (self.focus, key) {
@@ -229,42 +280,78 @@ impl Picker {
             self.offset = self.cursor + 1 - self.visible;
         }
     }
-    pub fn request(&self, chat_id: i64) -> Result<Value, String> {
+    fn validate(&self) -> Result<(), String> {
         if self.selected.is_empty() {
             return Err("先选择文件，再点击发送或按 F8".into());
         }
         if self.caption.chars().count() > 1024 {
             return Err("说明文字最多 1024 个字符".into());
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn request(&self, chat_id: i64) -> Result<Value, String> {
+        let photos = if self.photos {
+            prepare_photos(
+                &self.selected,
+                (256 * 1024 * 1024, MAX_FILES),
+                &AtomicBool::default(),
+            )?
+        } else {
+            Vec::new()
+        };
+        self.send_request(chat_id, &photos)
+    }
+
+    pub fn start_preparation(
+        &mut self,
+        busy: &Arc<AtomicBool>,
+        budget: (u64, usize),
+    ) -> Result<std::thread::JoinHandle<()>, String> {
+        self.validate()?;
+        if busy.swap(true, Ordering::AcqRel) {
+            return Err("上一批图片仍在处理，请稍后重试".into());
+        }
+        let paths = self.selected.clone();
+        let sources = self.clipboard_images.clone();
+        let busy = Arc::clone(busy);
+        let (sender, result) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.error = None;
+        self.preparing = Some(Preparation {
+            result,
+            cancelled: Arc::clone(&cancelled),
+        });
+        Ok(std::thread::spawn(move || {
+            let result = prepare_photos(&paths, budget, &cancelled);
+            drop(sources);
+            let _ = sender.send(result);
+            busy.store(false, Ordering::Release);
+        }))
+    }
+
+    pub fn send_request(&self, chat_id: i64, photos: &[PreparedPhoto]) -> Result<Value, String> {
+        self.validate()?;
         let mut contents = vec![];
         for (index, path) in self.selected.iter().enumerate() {
-            if !path.is_file() || fs::File::open(path).is_err() {
-                return Err(format!("文件已移动或无法读取：{}", path.display()));
-            }
-            let path = path.to_str().ok_or("文件名不是有效的 UTF-8")?;
-            if self.photos {
-                let reader = image::ImageReader::open(path)
-                    .map_err(|e| e.to_string())?
-                    .with_guessed_format()
-                    .map_err(|e| e.to_string())?;
-                if !matches!(
-                    reader.format(),
-                    Some(
-                        image::ImageFormat::Jpeg
-                            | image::ImageFormat::Png
-                            | image::ImageFormat::WebP
-                    )
-                ) {
-                    return Err("图片模式支持 JPEG / PNG / WebP；其他格式请切换为原文件".into());
-                }
-                reader
-                    .into_dimensions()
-                    .map_err(|_| "图片无法读取，请检查文件或切换为原文件")?;
-            }
             let request = if self.photos {
-                actions::send_photo(chat_id, path)
+                let image = photos.get(index).ok_or("图片尚未准备好")?;
+                let path = image
+                    .staged
+                    .as_ref()
+                    .map_or(path.as_path(), |file| &file.path);
+                actions::send_photo(
+                    chat_id,
+                    path.to_str().ok_or("文件名不是有效的 UTF-8")?,
+                    image.width,
+                    image.height,
+                )
             } else {
-                actions::send_file(chat_id, path)
+                if !path.is_file() || fs::File::open(path).is_err() {
+                    return Err(format!("文件已移动或无法读取：{}", path.display()));
+                }
+                actions::send_file(chat_id, path.to_str().ok_or("文件名不是有效的 UTF-8")?)
             };
             let mut content = request["input_message_content"].clone();
             if index == 0 && !self.caption.is_empty() {
@@ -279,6 +366,169 @@ impl Picker {
             json!({"@type":"sendMessageAlbum","chat_id":chat_id,"topic_id":null,"reply_to":reply,"options":null,"input_message_contents":contents})
         })
     }
+}
+
+const PHOTO_EDGE: u32 = 1600;
+const DIRECT_JPEG_BYTES: u64 = 512 * 1024;
+const PHOTO_PIXELS: u64 = 24_000_000;
+const PHOTO_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
+const PHOTO_HEADER_BYTES: u64 = 512 * 1024;
+
+pub struct PreparedPhoto {
+    pub staged: Option<Arc<crate::clipboard::TemporaryImage>>,
+    width: u32,
+    height: u32,
+}
+
+fn photo_reader<R: BufRead + Seek>(source: R) -> Result<image::ImageReader<R>, String> {
+    let mut reader = image::ImageReader::new(source)
+        .with_guessed_format()
+        .map_err(|e| format!("无法读取图片：{e}"))?;
+    if !matches!(
+        reader.format(),
+        Some(image::ImageFormat::Jpeg | image::ImageFormat::Png | image::ImageFormat::WebP)
+    ) {
+        return Err("图片模式支持 JPEG / PNG / WebP，请将其他格式作为原文件发送".into());
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(32768);
+    limits.max_image_height = Some(32768);
+    limits.max_alloc = Some(96 * 1024 * 1024);
+    reader.limits(limits);
+    Ok(reader)
+}
+
+fn direct_jpeg(format: Option<image::ImageFormat>, size: (u32, u32), bytes: u64) -> bool {
+    format == Some(image::ImageFormat::Jpeg)
+        && size.0.max(size.1) <= PHOTO_EDGE
+        && bytes <= DIRECT_JPEG_BYTES
+}
+
+pub fn photo_description(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let bytes = file.metadata().ok()?.len();
+    let mut header = Vec::new();
+    file.take(PHOTO_HEADER_BYTES)
+        .read_to_end(&mut header)
+        .ok()?;
+    let reader = photo_reader(Cursor::new(header)).ok()?;
+    let format = reader.format();
+    let (w, h) = reader.into_dimensions().ok()?;
+    let mode = if direct_jpeg(format, (w, h), bytes) {
+        "直接发送"
+    } else {
+        "压缩 JPEG"
+    };
+    Some(format!("{w}×{h} · {} → {mode}", display_size(bytes)))
+}
+
+pub fn display_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+struct StagingWriter {
+    file: fs::File,
+    remaining: u64,
+}
+impl Write for StagingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(io::Error::other("图片暂存已达 256 MiB"));
+        }
+        let written = self.file.write(bytes)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn prepare_photos(
+    paths: &[PathBuf],
+    (mut bytes, mut slots): (u64, usize),
+    cancelled: &AtomicBool,
+) -> Result<Vec<PreparedPhoto>, String> {
+    use image::{ColorType, ImageDecoder};
+
+    let mut photos = Vec::with_capacity(paths.len());
+    for path in paths {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("图片压缩已取消".into());
+        }
+        let file = fs::File::open(path).map_err(|e| format!("无法读取图片：{e}"))?;
+        let metadata = file.metadata().map_err(|e| format!("无法读取图片：{e}"))?;
+        if !metadata.is_file() || metadata.len() > PHOTO_SOURCE_BYTES {
+            return Err("图片超过 32 MiB，或已无法读取，请作为原文件发送".into());
+        }
+        let reader = photo_reader(BufReader::new(file))?;
+        let format = reader.format();
+        let mut decoder = reader
+            .into_decoder()
+            .map_err(|e| format!("无法读取图片：{e}"))?;
+        let (mut width, mut height) = decoder.dimensions();
+        if direct_jpeg(format, (width, height), metadata.len()) {
+            photos.push(PreparedPhoto {
+                staged: None,
+                width,
+                height,
+            });
+            continue;
+        }
+        if u64::from(width) * u64::from(height) > PHOTO_PIXELS
+            || decoder.total_bytes() > 96 * 1024 * 1024
+        {
+            return Err("图片像素超出压缩限制，请作为原文件发送".into());
+        }
+        if slots == 0 || bytes == 0 {
+            return Err("图片暂存已满，请等待上传完成".into());
+        }
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let source =
+            image::DynamicImage::from_decoder(decoder).map_err(|e| format!("无法解码图片：{e}"))?;
+        let (target_w, target_h) = if width.max(height) > PHOTO_EDGE {
+            crate::resample::fit(width, height, PHOTO_EDGE, PHOTO_EDGE)
+        } else {
+            (width, height)
+        };
+        let rgb = crate::resample::jpeg_pixels(&source, target_w, target_h);
+        drop(source);
+        let mut output = image::DynamicImage::ImageRgb8(rgb);
+        output.apply_orientation(orientation);
+        let rgb = output.into_rgb8();
+        (width, height) = rgb.dimensions();
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("图片压缩已取消".into());
+        }
+        let (mut staged, file) = crate::clipboard::temporary_file("jpg")?;
+        let writer = StagingWriter {
+            file,
+            remaining: bytes,
+        };
+        image::codecs::jpeg::JpegEncoder::new_with_quality(writer, 85)
+            .encode(&rgb, width, height, ColorType::Rgb8.into())
+            .map_err(|e| format!("无法编码 JPEG：{e}"))?;
+        staged.bytes = fs::metadata(&staged.path).map_err(|e| e.to_string())?.len();
+        bytes -= staged.bytes;
+        slots -= 1;
+        photos.push(PreparedPhoto {
+            staged: Some(Arc::new(staged)),
+            width,
+            height,
+        });
+    }
+    Ok(photos)
 }
 
 fn decode_uri(value: &str) -> Result<String, String> {
@@ -471,7 +721,7 @@ mod tests {
         let path = image.path.clone();
         let mut picker = Picker::new(true, None);
         picker.add(vec![path.clone()]).unwrap();
-        picker.clipboard_images.push(image);
+        picker.clipboard_images.push(Arc::new(image));
         picker.remove(0);
         assert!(picker.selected.is_empty());
         assert!(picker.clipboard_images.is_empty());
@@ -565,6 +815,74 @@ mod tests {
         );
         fs::remove_dir_all(folder).unwrap();
     }
+    #[test]
+    fn png_scales_to_rgb_jpeg_and_small_jpeg_and_documents_keep_their_bytes() {
+        let folder = fixture("compression");
+        let png = folder.join("transparent.png");
+        let jpeg = folder.join("small.jpg");
+        image::RgbaImage::from_pixel(2000, 1000, image::Rgba([0, 40, 80, 0]))
+            .save(&png)
+            .unwrap();
+        image::RgbImage::from_pixel(40, 20, image::Rgb([0, 40, 80]))
+            .save(&jpeg)
+            .unwrap();
+        let jpeg_bytes = fs::read(&jpeg).unwrap();
+        let png_bytes = fs::read(&png).unwrap();
+        let mut picker = Picker::new(true, None);
+        picker.add(vec![png.clone(), jpeg.clone()]).unwrap();
+        let prepared = prepare_photos(
+            &picker.selected,
+            (256 * 1024 * 1024, 10),
+            &AtomicBool::default(),
+        )
+        .unwrap();
+        let staged = &prepared[0].staged.as_ref().unwrap().path;
+        assert!(prepared[1].staged.is_none());
+        let image = image::open(staged).unwrap().to_rgb8();
+        assert_eq!(image.dimensions(), (1600, 800));
+        assert!(
+            image
+                .get_pixel(800, 400)
+                .0
+                .iter()
+                .all(|value| *value >= 250)
+        );
+        let request = picker.send_request(7, &prepared).unwrap();
+        let contents = request["input_message_contents"].as_array().unwrap();
+        assert_eq!(
+            (
+                contents[0]["width"].as_u64(),
+                contents[0]["height"].as_u64()
+            ),
+            (Some(1600), Some(800))
+        );
+        assert_eq!(
+            contents[1]["photo"]["path"],
+            picker.selected[1].to_str().unwrap()
+        );
+        assert_eq!(
+            (
+                contents[1]["width"].as_u64(),
+                contents[1]["height"].as_u64()
+            ),
+            (Some(40), Some(20))
+        );
+        assert!(prepare_photos(&picker.selected[..1], (100, 1), &AtomicBool::default()).is_err());
+        picker.set_photos(false);
+        let documents = picker.send_request(7, &[]).unwrap();
+        let contents = documents["input_message_contents"].as_array().unwrap();
+        assert_eq!(
+            contents[0]["document"]["path"],
+            picker.selected[0].to_str().unwrap()
+        );
+        assert_eq!(fs::read(&png).unwrap(), png_bytes);
+        assert_eq!(fs::read(&jpeg).unwrap(), jpeg_bytes);
+        let staged = staged.clone();
+        drop(prepared);
+        assert!(!staged.exists());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
     #[test]
     fn selection_is_atomic_and_unsupported_photo_can_be_sent_as_file() {
         let folder = fixture("bounds");

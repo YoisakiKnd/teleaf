@@ -47,7 +47,7 @@ pub fn edit_text(chat_id: i64, message_id: i64, text: String) -> Value {
     })
 }
 
-pub fn send_photo(chat_id: i64, path: &str) -> Value {
+pub fn send_photo(chat_id: i64, path: &str, width: u32, height: u32) -> Value {
     json!({
         "@type": "sendMessage", "chat_id": chat_id, "topic_id": null,
         "reply_to": null, "options": null, "reply_markup": null,
@@ -55,7 +55,7 @@ pub fn send_photo(chat_id: i64, path: &str) -> Value {
             "@type": "inputMessagePhoto",
             "photo": {"@type": "inputFileLocal", "path": path},
             "thumbnail": null, "added_sticker_file_ids": [],
-            "width": 0, "height": 0, "caption": null,
+            "width": width, "height": height, "caption": null,
             "show_caption_above_media": false, "self_destruct_type": null,
             "has_spoiler": false
         }
@@ -331,6 +331,10 @@ pub fn scoped_history(chat: i64, scope: crate::store::MessageScope, from: i64) -
         }),
         crate::store::MessageScope::Discussion(id) => get_message_thread_history(chat, id, from),
     }
+}
+
+pub fn read_all_chat_mentions(chat_id: i64) -> Value {
+    json!({"@type":"readAllChatMentions", "chat_id":chat_id})
 }
 
 #[cfg(test)]

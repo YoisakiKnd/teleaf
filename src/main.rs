@@ -1,4 +1,5 @@
 mod actions;
+mod animation;
 mod attachments;
 mod auth;
 mod calendar;
@@ -209,8 +210,11 @@ struct App {
     sticker_panel: stickers::Panel,
     attachments: Option<attachments::Picker>,
     clipboard: clipboard::State,
+    photo_worker_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    photo_worker: Option<std::thread::JoinHandle<()>>,
     notifications: notifications::State,
     terminal_focused: bool,
+    presence_deadline: Option<Instant>,
     show_help: bool,
     show_settings: bool,
     show_chat_info: bool,
@@ -306,8 +310,11 @@ impl App {
             sticker_panel: stickers::Panel::default(),
             attachments: None,
             clipboard: clipboard::State::default(),
+            photo_worker_busy: Default::default(),
+            photo_worker: None,
             notifications: notifications::State::default(),
             terminal_focused: true,
+            presence_deadline: None,
             show_help: false,
             show_settings: false,
             show_chat_info: false,
@@ -398,6 +405,7 @@ impl App {
                 (None, true)
             }
             TdEvent::Update(value) => {
+                self.clipboard.observe_upload(&value);
                 if let Some(result) = quick_message::receive(self, &value) {
                     return result;
                 }
@@ -480,7 +488,7 @@ impl App {
                 // Invalidate only affected layout heights; file and chat updates keep them.
                 match self.last_update.as_str() {
                     "messages" | "foundChatMessages" => self.timeline_heights.clear(),
-                    "updateMessageContent" | "updateMessageSendFailed" => {
+                    "updateMessageContent" | "updateMessageEdited" | "updateMessageSendFailed" => {
                         let id = value["message_id"]
                             .as_i64()
                             .or_else(|| value["old_message_id"].as_i64());
@@ -654,6 +662,13 @@ impl App {
             || self.confirm_delete.is_some()
             || self.forward_message.is_some()
             || self.preview_message.is_some()
+    }
+
+    fn finish_photo_worker(&mut self) {
+        self.attachments = None;
+        if let Some(worker) = self.photo_worker.take() {
+            let _ = worker.join();
+        }
     }
 
     fn close_overlays(&mut self) {
@@ -944,6 +959,25 @@ impl App {
         })
     }
 
+    fn set_terminal_focus(&mut self, focused: bool) -> bool {
+        if self.terminal_focused != focused && focused {
+            self.restart_viewport_stability(Instant::now());
+        }
+        self.terminal_focused = focused;
+        self.sync_notification_view();
+        if !focused {
+            return self.media.stop_animation();
+        }
+        self.preview_message
+            .and_then(|id| {
+                self.active_messages()
+                    .iter()
+                    .find(|message| message.id == id)
+            })
+            .and_then(|message| message.media.as_ref())
+            .is_some_and(|media| media.kind == store::MediaKind::Animation)
+    }
+
     fn close_preview(&mut self) {
         if self.preview_message.take().is_some() {
             self.media.close_preview();
@@ -955,7 +989,11 @@ impl App {
         let media = message.media.as_ref()?;
         let (file_id, path) = media.detail_file();
         let missing = path.is_none();
-        self.preview_message = Some(message.id);
+        let id = message.id;
+        if self.preview_message != Some(id) {
+            self.close_preview();
+        }
+        self.preview_message = Some(id);
         self.selection = None;
         self.preview_view = media::View::default();
         self.drag = None;
@@ -967,6 +1005,30 @@ impl App {
             return Some(actions::download(file_id));
         }
         None
+    }
+
+    fn pending_preview_download(&mut self) -> Option<Value> {
+        let message = self.preview_message?;
+        let media = self
+            .active_messages()
+            .iter()
+            .find(|item| item.id == message)?
+            .media
+            .as_ref()?;
+        if media.kind != store::MediaKind::Animation {
+            return None;
+        }
+        let (id, path) = media.detail_file();
+        if id > 0
+            && path.is_none()
+            && self.requested_files.len() < 4
+            && !self.failed_files.contains(&id)
+            && self.requested_files.insert(id)
+        {
+            Some(actions::download(id))
+        } else {
+            None
+        }
     }
 
     fn visible_media_download(&mut self) -> Option<Value> {
@@ -1051,12 +1113,9 @@ impl App {
             .active_messages()
             .iter()
             .filter(|m| {
-                m.media.as_ref().is_some_and(|media| {
-                    matches!(
-                        media.kind,
-                        store::MediaKind::Photo | store::MediaKind::Sticker
-                    )
-                })
+                m.media
+                    .as_ref()
+                    .is_some_and(|media| media.kind.is_inline_image())
             })
             .map(|m| m.id)
             .collect();
@@ -1150,6 +1209,21 @@ fn export_file(
     Err("目标目录中同名文件过多".into())
 }
 
+fn track_presence(deadline: &mut Option<Instant>, status: store::UserStatus) {
+    let store::UserStatus::Online { expires } = status else {
+        return;
+    };
+    let Some(expires) = u64::try_from(expires)
+        .ok()
+        .and_then(|seconds| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+        .and_then(|expires| expires.duration_since(std::time::SystemTime::now()).ok())
+        .and_then(|remaining| Instant::now().checked_add(remaining))
+    else {
+        return;
+    };
+    *deadline = Some(deadline.map_or(expires, |old| old.min(expires)));
+}
+
 fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
     let synchronized = terminal::sync_output();
     if synchronized {
@@ -1157,7 +1231,15 @@ fn render(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> i
     }
     let draw_result = terminal.draw(|frame| ui::draw(frame, app)).map(|_| ());
     let visible = std::mem::take(&mut app.visible_read_ids);
-    app.record_viewport(visible, Instant::now());
+    if app
+        .hit_targets
+        .iter()
+        .any(|(_, target)| *target == ui::Target::Panel(ui::Pane::Timeline))
+    {
+        app.record_viewport(visible, Instant::now());
+    } else {
+        app.hide_viewport();
+    }
     let end_result = if synchronized {
         execute!(terminal.backend_mut(), EndSynchronizedUpdate)
     } else {
@@ -1245,6 +1327,13 @@ fn send_request(app: &mut App, worker: &TdWorker, mut request: Value) -> bool {
 }
 
 fn start_clipboard_paste(app: &mut App) {
+    if app
+        .photo_worker_busy
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        app.notice = Some("图片正在压缩，请稍后粘贴".into());
+        return;
+    }
     if app.auth.setup.is_some() || app.auth.state != "authorizationStateReady" {
         return;
     }
@@ -1293,6 +1382,12 @@ fn accept_clipboard(
             clipboard::Content::Files(paths) => (paths, None),
             clipboard::Content::Image(image) => (vec![image.path.clone()], Some(image)),
         };
+        if app
+            .photo_worker_busy
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err("图片正在压缩，请稍后粘贴".into());
+        }
         if let Some(image) = &image
             && !app.clipboard.can_stage(
                 app.attachments
@@ -1303,13 +1398,15 @@ fn accept_clipboard(
         {
             return Err("本次运行的剪贴板暂存已达 256 MiB；请改用已保存的文件".into());
         }
-        if app.attachments.is_none() {
-            interaction::open_attachments(app, attachments::photo_paths(&paths));
+        let opened = app.attachments.is_none();
+        if opened {
+            interaction::open_attachments(app, image.is_some() || attachments::photo_paths(&paths));
         }
         let picker = app.attachments.as_mut().unwrap();
         picker.add(paths)?;
         if let Some(image) = image {
-            picker.clipboard_images.push(image);
+            picker.clipboard_images.push(std::sync::Arc::new(image));
+            picker.quick_confirm = opened;
         }
         app.notice = Some("已加入附件；确认后按 F8 发送".into());
         Ok(())
@@ -1366,6 +1463,10 @@ fn paste_text(app: &mut App, text: &str) {
         switcher.scroll = 0;
     } else if app.attachments.is_some() {
         if let Some(picker) = &mut app.attachments {
+            if picker.preparing.is_some() {
+                return;
+            }
+            picker.quick_confirm = false;
             if picker.focus == attachments::Focus::Caption {
                 let clean: String = text
                     .chars()
@@ -1842,7 +1943,9 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
         return false;
     }
     if app.attachments.is_some() {
-        if code == KeyCode::F(8) {
+        if code == KeyCode::F(8)
+            || (code == KeyCode::Enter && app.attachments.as_ref().is_some_and(|p| p.quick_confirm))
+        {
             interaction::perform(app, worker, ui::Action::Confirm);
         } else if code == KeyCode::Esc {
             app.attachments = None;
@@ -1858,6 +1961,9 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
     if app.preview_message.is_some() {
         match code {
             KeyCode::Esc | KeyCode::Char('v') => app.close_preview(),
+            KeyCode::Char(' ') => {
+                app.media.animation.toggle(Instant::now());
+            }
             KeyCode::Char('o') => app.open_selected_external(),
             KeyCode::Char('E') => {
                 interaction::perform(app, worker, ui::Action::SaveFileAs);
@@ -1999,6 +2105,9 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
                 }
             } else {
                 app.move_selected(1);
+                if app.selected_chat == app.store.chat_ids().last() {
+                    app.load_chat_list(worker, app.store.selected_list);
+                }
             }
         }
         KeyCode::Char('o')
@@ -2006,7 +2115,12 @@ fn handle_ready_key(app: &mut App, worker: &TdWorker, code: KeyCode) -> bool {
                 && app
                     .selected_message()
                     .and_then(|message| message.media.as_ref())
-                    .is_some_and(|media| media.kind == store::MediaKind::Photo) =>
+                    .is_some_and(|media| {
+                        matches!(
+                            media.kind,
+                            store::MediaKind::Photo | store::MediaKind::Animation
+                        )
+                    }) =>
         {
             interaction::perform(app, worker, ui::Action::Preview);
         }
@@ -2076,14 +2190,28 @@ fn run(demo: bool) -> io::Result<()> {
         dirty |= app.service_global_search(&worker, Instant::now());
         dirty |= app.service_storage(&worker);
         dirty |= app.store.expire_typing(Instant::now());
+        if app
+            .presence_deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            app.presence_deadline = None;
+            dirty = true;
+        }
         dirty |= app.expire_proxy_connection(Instant::now());
         dirty |= drain_events(&worker.events, &mut app, &worker);
-        for (sender, request) in app.store.sender_requests() {
+        if app.auth.state == "authorizationStateReady" {
+            app.request_chat_summary(&worker);
+        }
+        let pending_presence = app.pending_presence_user();
+        for (sender, request) in app.store.sender_requests(pending_presence) {
             if !send_request(&mut app, &worker, request) {
                 app.store.retry_sender(sender);
             }
         }
-        if let Some(request) = app.visible_media_download() {
+        if let Some(request) = app
+            .pending_preview_download()
+            .or_else(|| app.visible_media_download())
+        {
             let file_id = request
                 .get("file_id")
                 .and_then(Value::as_i64)
@@ -2095,6 +2223,8 @@ fn run(demo: bool) -> io::Result<()> {
         stickers::download_visible(&mut app, &worker);
         app.media.prune_idle(Instant::now());
         dirty |= app.media.poll();
+        dirty |= app.media.animation.poll(Instant::now());
+        dirty |= interaction::poll_attachments(&mut app, &worker);
         if let Some((chat, mode, result)) = app.clipboard.poll() {
             accept_clipboard(&mut app, chat, mode, result);
             dirty = true;
@@ -2110,6 +2240,7 @@ fn run(demo: bool) -> io::Result<()> {
             dirty = true;
         }
         if app.auth.take_restart() {
+            app.finish_photo_worker();
             worker.shutdown();
             let focused = app.terminal_focused;
             app = App::new();
@@ -2149,9 +2280,15 @@ fn run(demo: bool) -> io::Result<()> {
         } else {
             Duration::from_millis(100)
         };
-        let timeout = app.next_sync_deadline(!dirty).map_or(timeout, |deadline| {
-            timeout.min(deadline.saturating_duration_since(Instant::now()))
-        });
+        let timeout = app
+            .next_sync_deadline(!dirty)
+            .into_iter()
+            .chain(app.presence_deadline)
+            .chain(app.media.animation.deadline())
+            .min()
+            .map_or(timeout, |deadline| {
+                timeout.min(deadline.saturating_duration_since(Instant::now()))
+            });
         if event::poll(timeout)? {
             for _ in 0..64 {
                 match event::read()? {
@@ -2259,16 +2396,19 @@ fn run(demo: bool) -> io::Result<()> {
                                 sw.selected = 0;
                                 sw.scroll = 0;
                             } else if let Some(picker) = &mut app.attachments {
-                                match picker.focus {
-                                    attachments::Focus::Path => {
-                                        picker.path.clear();
-                                        picker.path_cursor = 0;
+                                if picker.preparing.is_none() {
+                                    picker.quick_confirm = false;
+                                    match picker.focus {
+                                        attachments::Focus::Path => {
+                                            picker.path.clear();
+                                            picker.path_cursor = 0;
+                                        }
+                                        attachments::Focus::Caption => {
+                                            picker.caption.clear();
+                                            picker.caption_cursor = 0;
+                                        }
+                                        attachments::Focus::Browser => {}
                                     }
-                                    attachments::Focus::Caption => {
-                                        picker.caption.clear();
-                                        picker.caption_cursor = 0;
-                                    }
-                                    attachments::Focus::Browser => {}
                                 }
                             } else if app.sticker_picker {
                                 app.sticker_panel.query.clear();
@@ -2324,6 +2464,7 @@ fn run(demo: bool) -> io::Result<()> {
                                 && app.attachments.is_some()
                             {
                                 if let Some(picker) = &mut app.attachments
+                                    && picker.preparing.is_none()
                                     && picker.focus == attachments::Focus::Caption
                                 {
                                     text::insert(
@@ -2383,8 +2524,7 @@ fn run(demo: bool) -> io::Result<()> {
                         dirty = true;
                     }
                     event @ (Event::FocusGained | Event::FocusLost) => {
-                        app.terminal_focused = matches!(event, Event::FocusGained);
-                        app.sync_notification_view();
+                        dirty |= app.set_terminal_focus(matches!(event, Event::FocusGained));
                     }
                     Event::Paste(text) => {
                         paste_text(&mut app, &text);
@@ -2419,6 +2559,7 @@ fn run(demo: bool) -> io::Result<()> {
     if let Some(request) = app.flush_draft(Instant::now(), true) {
         send_request(&mut app, &worker, request);
     }
+    app.finish_photo_worker();
     worker.shutdown();
     Ok(())
 }
@@ -2636,6 +2777,68 @@ mod interaction_tests {
     use tdlib::TdCommand;
 
     #[test]
+    fn bottom_keyboard_loads_more_chats_and_coalesces_until_response() {
+        let mut app = ui::tests::fixture();
+        app.focus_messages = false;
+        app.selected_chat = Some(2);
+        let (worker, commands) = TdWorker::test_pair();
+        handle_ready_key(&mut app, &worker, KeyCode::Down);
+        assert_eq!(app.selected_chat, Some(3));
+        let TdCommand::Request(request) = commands.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(request["@type"], "loadChats");
+        handle_ready_key(&mut app, &worker, KeyCode::Down);
+        assert!(commands.try_recv().is_err());
+        app.apply(TdEvent::Update(
+            json!({"@type":"error","code":404,"@extra":request["@extra"]}),
+        ));
+        handle_ready_key(&mut app, &worker, KeyCode::Down);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn edits_without_markup_invalidate_timeline_height() {
+        let mut app = ui::tests::fixture();
+        app.timeline_heights.insert(2, 12);
+        app.apply(TdEvent::Update(
+            json!({"@type":"updateMessageEdited","chat_id":1,"message_id":2}),
+        ));
+        assert!(!app.timeline_heights.contains_key(&2));
+    }
+
+    #[test]
+    fn animation_pause_close_and_focus_loss_release_the_frame_pool() {
+        let file = crate::animation::tests::gif_fixture();
+        let mut app = ui::tests::fixture();
+        let (worker, _) = TdWorker::test_pair();
+        for close in [true, false] {
+            app.preview_message = Some(2);
+            app.media
+                .animation
+                .request(40, file.path.to_str().unwrap(), (24, 12));
+            let timeout = Instant::now() + Duration::from_secs(3);
+            while !app.media.animation.poll(Instant::now()) {
+                assert!(Instant::now() < timeout);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let next = app.media.animation.deadline().unwrap();
+            assert!(app.media.animation.poll(next));
+            assert_eq!(app.media.animation.frame_index(), Some(1));
+            handle_ready_key(&mut app, &worker, KeyCode::Char(' '));
+            assert!(app.media.animation.deadline().is_none());
+            assert!(!app.media.animation.poll(next + Duration::from_secs(1)));
+            if close {
+                app.close_preview();
+            } else {
+                assert!(app.set_terminal_focus(false));
+            }
+            assert!(app.media.animation.image().is_none());
+            assert!(app.media.animation.deadline().is_none());
+        }
+    }
+
+    #[test]
     fn clipboard_image_requires_confirmation_preserves_reply_and_cleans_up() {
         let mut app = ui::tests::fixture();
         let (worker, requests) = TdWorker::test_pair();
@@ -2663,7 +2866,13 @@ mod interaction_tests {
             InputMode::Reply(2),
             Ok(clipboard::Content::Image(image)),
         );
-        interaction::perform(&mut app, &worker, ui::Action::Confirm);
+        assert!(app.attachments.as_ref().unwrap().quick_confirm);
+        handle_ready_key(&mut app, &worker, KeyCode::Enter);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !interaction::poll_attachments(&mut app, &worker) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let TdCommand::Request(request) = requests.try_recv().unwrap() else {
             panic!("send request")
         };
@@ -2674,9 +2883,25 @@ mod interaction_tests {
         );
         assert!(app.attachments.is_none());
         assert_eq!(app.draft, "保留草稿");
-        assert!(path.exists(), "TDLib can read source after submission");
-        drop(app);
-        assert!(!path.exists());
+        assert!(!path.exists(), "PNG source is released after JPEG encoding");
+        let jpeg = std::path::PathBuf::from(
+            request["input_message_content"]["photo"]["path"]
+                .as_str()
+                .unwrap(),
+        );
+        assert!(
+            jpeg.exists(),
+            "TDLib can read the prepared JPEG after submission"
+        );
+        app.apply(TdEvent::Update(json!({
+            "@type":"message","@extra":request["@extra"],"id":7,"chat_id":1,
+            "sending_state":{"@type":"messageSendingStatePending"}
+        })));
+        assert!(jpeg.exists());
+        app.apply(TdEvent::Update(json!({
+            "@type":"updateMessageSendSucceeded","old_message_id":7,"message":{"id":8,"chat_id":1}
+        })));
+        assert!(!jpeg.exists());
     }
 
     #[test]

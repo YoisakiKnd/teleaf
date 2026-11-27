@@ -22,7 +22,7 @@ pub enum Content {
 
 pub struct TemporaryImage {
     pub path: PathBuf,
-    bytes: u64,
+    pub bytes: u64,
 }
 impl Drop for TemporaryImage {
     fn drop(&mut self) {
@@ -35,10 +35,16 @@ type ResultMessage = (i64, InputMode, Result<Content, String>);
 pub struct State {
     pending: Option<Receiver<ResultMessage>>,
     busy: Arc<AtomicBool>,
-    // TDLib reads inputFileLocal asynchronously. Keep submitted files until its
-    // worker has shut down, rather than deleting them when the picker closes.
-    submitted: Vec<TemporaryImage>,
+    submitted: Vec<Upload>,
+    upload_id: u64,
 }
+struct Upload {
+    tag: String,
+    chat: i64,
+    files: Vec<Arc<TemporaryImage>>,
+    pending: Vec<i64>,
+}
+
 impl State {
     #[cfg(test)]
     pub fn queued(chat: i64, mode: InputMode, content: Content) -> Self {
@@ -81,19 +87,78 @@ impl State {
             Err(TryRecvError::Empty) => None,
         }
     }
-    pub fn can_stage(&self, queue: &[TemporaryImage], image: &TemporaryImage) -> bool {
-        // Disk budget only: no pixels or encoded PNGs remain in App memory.
-        self.submitted
+    pub fn budget(&self, queue: &[Arc<TemporaryImage>]) -> (u64, usize) {
+        let files = self
+            .submitted
             .iter()
-            .chain(queue)
-            .map(|i| i.bytes)
-            .sum::<u64>()
-            + image.bytes
-            <= 256 * 1024 * 1024
-            && self.submitted.len() + queue.len() < 1024
+            .flat_map(|upload| &upload.files)
+            .chain(queue);
+        let (bytes, count) = files.fold((0, 0), |(bytes, count), file| {
+            (bytes + file.bytes, count + 1)
+        });
+        (
+            (256_u64 * 1024 * 1024).saturating_sub(bytes),
+            1024_usize.saturating_sub(count),
+        )
     }
-    pub fn submitted(&mut self, images: Vec<TemporaryImage>) {
-        self.submitted.extend(images);
+
+    pub fn can_stage(&self, queue: &[Arc<TemporaryImage>], image: &TemporaryImage) -> bool {
+        let (bytes, count) = self.budget(queue);
+        count > 0 && image.bytes <= bytes
+    }
+
+    pub fn upload_tag(&mut self) -> String {
+        self.upload_id = self.upload_id.wrapping_add(1);
+        format!("attachment:{}", self.upload_id)
+    }
+
+    pub fn submitted(&mut self, tag: String, files: Vec<Arc<TemporaryImage>>) {
+        self.submitted.push(Upload {
+            tag,
+            files,
+            chat: 0,
+            pending: Vec::new(),
+        });
+    }
+
+    pub fn observe_upload(&mut self, value: &serde_json::Value) {
+        let kind = value["@type"].as_str();
+        if let Some(tag) = value["@extra"].as_str()
+            && let Some(index) = self.submitted.iter().position(|upload| upload.tag == tag)
+        {
+            let upload = &mut self.submitted[index];
+            let messages: &[serde_json::Value] = match kind {
+                Some("message") => std::slice::from_ref(value),
+                Some("messages") => value["messages"].as_array().map_or(&[], Vec::as_slice),
+                _ => &[],
+            };
+            for message in messages {
+                if message["sending_state"]["@type"] == "messageSendingStatePending"
+                    && let (Some(chat), Some(id)) =
+                        (message["chat_id"].as_i64(), message["id"].as_i64())
+                {
+                    upload.chat = chat;
+                    upload.pending.push(id);
+                }
+            }
+            if upload.pending.is_empty() {
+                self.submitted.swap_remove(index);
+            }
+        } else if matches!(
+            kind,
+            Some("updateMessageSendSucceeded" | "updateMessageSendFailed")
+        ) && let (Some(chat), Some(id)) = (
+            value["message"]["chat_id"].as_i64(),
+            value["old_message_id"].as_i64(),
+        ) {
+            self.submitted.retain_mut(|upload| {
+                if upload.chat == chat && !upload.pending.is_empty() {
+                    upload.pending.retain(|pending| *pending != id);
+                    return !upload.pending.is_empty();
+                }
+                true
+            });
+        }
     }
 }
 
@@ -172,7 +237,7 @@ function readClipboard(pb, destination) {
     }
     if (present(data)) {
         if (data.length > 67108864) return {error: '剪贴板图片过大；请以原文件发送'};
-        if (!data.writeToFileAtomically(destination, false)) return {error: '无法暂存剪贴板图片'};
+        if (!data.writeToFileAtomically(destination, false)) return {error: '无法暂存图片'};
         return {kind: 'image'};
     }
     var text = pb.stringForType('public.utf8-plain-text');
@@ -193,7 +258,7 @@ fn read_local() -> Result<Content, String> {
 
 #[cfg(target_os = "macos")]
 fn read_macos(script: &str, arguments: &[&std::path::Path]) -> Result<Content, String> {
-    let (mut staged, file) = temporary_file()?;
+    let (mut staged, file) = temporary_file("png")?;
     drop(file);
     let output = std::process::Command::new("/usr/bin/osascript")
         .args(["-l", "JavaScript", "-e", script, "--"])
@@ -267,7 +332,7 @@ fn stage_pixels(
     if pixels.len() != count * usize::from(color.channel_count()) {
         return Err("剪贴板图片像素数据不完整".into());
     }
-    let (mut staged, file) = temporary_file()?;
+    let (mut staged, file) = temporary_file("png")?;
     use image::ImageEncoder;
     image::codecs::png::PngEncoder::new(file)
         .write_image(pixels, width as u32, height as u32, color.into())
@@ -276,11 +341,16 @@ fn stage_pixels(
     Ok(staged)
 }
 
-fn temporary_file() -> Result<(TemporaryImage, fs::File), String> {
+pub fn temporary_file(extension: &str) -> Result<(TemporaryImage, fs::File), String> {
     let mut random = [0u8; 16];
     getrandom::getrandom(&mut random).map_err(|e| e.to_string())?;
     let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let path = std::env::temp_dir().join(format!("teleaf-clipboard-{name}.png"));
+    let prefix = if extension == "png" {
+        "teleaf-clipboard"
+    } else {
+        "teleaf-attachment"
+    };
+    let path = std::env::temp_dir().join(format!("{prefix}-{name}.{extension}"));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -290,7 +360,7 @@ fn temporary_file() -> Result<(TemporaryImage, fs::File), String> {
     }
     let file = options
         .open(&path)
-        .map_err(|e| format!("无法暂存剪贴板图片：{e}"))?;
+        .map_err(|e| format!("无法暂存图片：{e}"))?;
     Ok((TemporaryImage { path, bytes: 0 }, file))
 }
 
@@ -383,7 +453,7 @@ mod tests {
         }
         let mut state = State::default();
         assert!(state.can_stage(&[], &image));
-        state.submitted(vec![image]);
+        state.submitted("attachment:1".into(), vec![Arc::new(image)]);
         assert!(path.exists());
         drop(state);
         assert!(!path.exists());

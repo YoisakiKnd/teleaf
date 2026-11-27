@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix='teleaf-clipboard-keys-') as folder:
         # Diff output can reuse the space after SSH from the preceding frame.
         terminal.wait('无法读取本机图片剪贴板')
         terminal.send(b'\x0f')  # Ctrl+O
-        terminal.wait('发送附件')
+        terminal.wait('发送原文件')
         terminal.read(.3)
         plain = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', terminal.output)
         assert '粘贴'.encode() in plain and b'F7' in plain

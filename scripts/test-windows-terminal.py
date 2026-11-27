@@ -174,7 +174,7 @@ def clipboard_regression():
                     # F7 and a directly forwarded Ctrl+V both use the worker.
                     terminal.send('\x1b[18~' if index == 0 else '\x16')
                     terminal.wait('已加入附件')
-                    terminal.wait('发送附件')
+                    terminal.wait('发送图片')
                     images = staged() - before
                     assert len(images) == 1, f'expected one staged image, got {len(images)}'
                     image = images.pop()

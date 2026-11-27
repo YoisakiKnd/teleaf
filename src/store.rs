@@ -86,6 +86,10 @@ pub struct Chat {
     pub pinned: bool,
     pub muted: bool,
     pub mention_count: i64,
+    pub mentions_requested: bool,
+    pub online_count: u32,
+    online_count_known: bool,
+    pub member_count: Option<u32>,
     pub draft_preview: String,
     pub typing: String,
     pub subtitle: String,
@@ -99,6 +103,78 @@ pub struct Chat {
     pub notifications: NotificationSettings,
     orders: HashMap<ChatList, i64>,
     pinned_lists: HashSet<ChatList>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UserStatus {
+    Online {
+        expires: i64,
+    },
+    Recently,
+    LastWeek,
+    LastMonth,
+    Offline {
+        was_online: i64,
+    },
+    #[default]
+    Unknown,
+}
+
+impl UserStatus {
+    fn parse(value: &Value) -> Self {
+        match kind(value) {
+            "userStatusOnline" => Self::Online {
+                expires: integer(value.get("expires")),
+            },
+            "userStatusRecently" => Self::Recently,
+            "userStatusLastWeek" => Self::LastWeek,
+            "userStatusLastMonth" => Self::LastMonth,
+            "userStatusOffline" => Self::Offline {
+                was_online: integer(value.get("was_online")),
+            },
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn is_online(self, now: i64) -> bool {
+        matches!(self, Self::Online { expires } if expires > now)
+    }
+
+    pub fn label(self, now: i64) -> &'static str {
+        match self {
+            Self::Online { .. } if self.is_online(now) => "● 在线",
+            Self::Recently => "最近上线",
+            Self::LastWeek => "一周内上线",
+            Self::LastMonth => "一个月内上线",
+            Self::Offline { .. } | Self::Online { .. } => "离线",
+            Self::Unknown => "",
+        }
+    }
+
+    pub fn description(self, now: i64) -> String {
+        if let Self::Offline { was_online } = self
+            && let Some(stamp) = crate::calendar::local(was_online)
+        {
+            return if crate::calendar::local(now).is_some_and(|today| today.same_date(stamp)) {
+                format!("上次上线 {}", stamp.time())
+            } else {
+                format!("上次上线 {} {}", stamp.date(), stamp.time())
+            };
+        }
+        self.label(now).into()
+    }
+}
+
+#[derive(Default)]
+struct SenderMetadata {
+    name: Option<String>,
+    status: UserStatus,
+}
+
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
 // Preserve the chat's existing overrides when changing only mute duration.
@@ -632,12 +708,17 @@ impl Sender {
 pub enum MediaKind {
     Photo,
     Sticker,
+    Animation,
     Document,
     Video,
     Voice,
 }
 
 impl MediaKind {
+    pub fn is_inline_image(self) -> bool {
+        matches!(self, Self::Photo | Self::Sticker | Self::Animation)
+    }
+
     pub fn is_large_file(self) -> bool {
         matches!(self, Self::Document | Self::Video | Self::Voice)
     }
@@ -707,7 +788,7 @@ pub struct Store {
     pub history_exhausted: bool,
     pub context_window: bool,
     chat_actions: VecDeque<ChatAction>,
-    sender_names: HashMap<Sender, String>,
+    sender_names: HashMap<Sender, SenderMetadata>,
     recent_senders: VecDeque<Sender>,
     requested_senders: HashSet<Sender>,
 }
@@ -864,7 +945,7 @@ impl Store {
             .or_else(|| {
                 self.sender_names
                     .get(&Sender::Chat(id))
-                    .map(String::as_str)
+                    .and_then(|entry| entry.name.as_deref())
                     .filter(|title| !title.is_empty())
             })
     }
@@ -876,7 +957,10 @@ impl Store {
         }
         let sender = message.get("sender_id").and_then(Sender::parse);
         let name = match sender {
-            Some(Sender::User(id)) => self.sender_names.get(&Sender::User(id)).cloned(),
+            Some(Sender::User(id)) => self
+                .sender_names
+                .get(&Sender::User(id))
+                .and_then(|entry| entry.name.clone()),
             Some(Sender::Chat(id)) if id != chat_id => {
                 self.notification_chat_title(id).map(str::to_owned)
             }
@@ -901,7 +985,11 @@ impl Store {
             .get(&id)
             .map(|chat| chat.title.as_str())
             .filter(|title| !title.is_empty())
-            .or_else(|| self.sender_names.get(&Sender::Chat(id)).map(String::as_str))
+            .or_else(|| {
+                self.sender_names
+                    .get(&Sender::Chat(id))
+                    .and_then(|entry| entry.name.as_deref())
+            })
             .map(str::to_owned)
             .unwrap_or_else(|| format!("会话 {id}"))
     }
@@ -915,7 +1003,7 @@ impl Store {
                 Some(sender @ Sender::User(id)) => self
                     .sender_names
                     .get(&sender)
-                    .cloned()
+                    .and_then(|entry| entry.name.clone())
                     .unwrap_or_else(|| format!("用户 {id}")),
                 None => "对方".into(),
             }
@@ -932,7 +1020,7 @@ impl Store {
             ForwardOrigin::Sender(sender) => self
                 .sender_names
                 .get(sender)
-                .cloned()
+                .and_then(|entry| entry.name.clone())
                 .unwrap_or_else(|| match sender {
                     Sender::Chat(id) => self.chat_title(*id),
                     Sender::User(id) => format!("用户 {id}"),
@@ -945,7 +1033,7 @@ impl Store {
     }
 
     // Only resolve senders in the bounded active message window. Never fetch group members.
-    pub fn sender_requests(&mut self) -> Vec<(Sender, Value)> {
+    pub fn sender_requests(&mut self, pending_presence: Option<i64>) -> Vec<(Sender, Value)> {
         if self.requested_senders.len() >= 1024 {
             self.requested_senders.retain(|sender| {
                 self.messages
@@ -984,7 +1072,13 @@ impl Store {
                     }),
             )
         {
-            if self.sender_names.contains_key(&sender)
+            if pending_presence.map(Sender::User) == Some(sender) {
+                continue;
+            }
+            if self
+                .sender_names
+                .get(&sender)
+                .is_some_and(|entry| entry.name.is_some())
                 || matches!(sender, Sender::Chat(id) if self.chats.get(&id).is_some_and(|chat| !chat.title.is_empty()))
             {
                 continue;
@@ -1006,20 +1100,100 @@ impl Store {
         self.requested_senders.remove(&sender);
     }
 
+    pub fn user_status(&self, id: i64) -> UserStatus {
+        self.sender_names
+            .get(&Sender::User(id))
+            .map_or(UserStatus::Unknown, |entry| entry.status)
+    }
+
+    pub fn chat_status(&self, chat: &Chat) -> UserStatus {
+        if let Some(ChatPeer::Private(id)) = chat.peer {
+            self.user_status(id)
+        } else {
+            UserStatus::Unknown
+        }
+    }
+
+    pub fn chat_status_label(&self, chat: &Chat, now: i64) -> String {
+        if matches!(chat.peer, Some(ChatPeer::Private(_))) {
+            return self.chat_status(chat).description(now);
+        }
+        match (
+            chat.member_count,
+            chat.online_count_known.then_some(chat.online_count),
+        ) {
+            (Some(members), Some(online)) => format!("{members} 人 · {online} 人在线"),
+            (Some(members), None) => format!("{members} 人"),
+            (None, Some(online)) => format!("{online} 人在线"),
+            (None, None) => chat.subtitle.clone(),
+        }
+    }
+
+    pub fn sender_pending(&self, user: i64) -> bool {
+        self.requested_senders.contains(&Sender::User(user))
+    }
+
+    fn touch_sender(&mut self, sender: Sender) -> &mut SenderMetadata {
+        self.recent_senders.retain(|old| *old != sender);
+        self.recent_senders.push_back(sender);
+        if self.recent_senders.len() > 1024
+            && let Some(old) = self.recent_senders.pop_front()
+        {
+            self.sender_names.remove(&old);
+        }
+        self.sender_names.entry(sender).or_default()
+    }
+
+    fn save_status(&mut self, id: i64, status: UserStatus) -> bool {
+        let entry = self.touch_sender(Sender::User(id));
+        let changed = entry.status != status;
+        entry.status = status;
+        changed
+            && self
+                .chats
+                .values()
+                .any(|chat| chat.peer == Some(ChatPeer::Private(id)))
+    }
+
+    pub fn apply_user(&mut self, user: &Value, id: i64, use_status: bool) -> bool {
+        let name = [
+            string(user.get("first_name")),
+            string(user.get("last_name")),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+        let name = if !name.is_empty() {
+            name.chars().take(128).collect()
+        } else if user.pointer("/type/@type").and_then(Value::as_str) == Some("userTypeDeleted") {
+            "已注销账号".into()
+        } else {
+            format!("用户 {id}")
+        };
+        let mut changed = self.save_sender(Sender::User(id), name);
+        if let Some(chat) = self.active_chat.and_then(|chat| self.chats.get_mut(&chat))
+            && chat.peer == Some(ChatPeer::Private(id))
+            && user.get("usernames").is_some()
+        {
+            let handle = crate::sync::chat_username(user);
+            changed |= chat.username != handle;
+            chat.username = handle;
+        }
+        if use_status && let Some(status) = user.get("status") {
+            return self.save_status(id, UserStatus::parse(status)) | changed;
+        }
+        changed
+    }
+
     fn save_sender(&mut self, sender: Sender, name: String) -> bool {
         if name.is_empty() {
             return false;
         }
         self.requested_senders.remove(&sender);
-        let changed = self.sender_names.get(&sender) != Some(&name);
-        self.sender_names.insert(sender, name);
-        self.recent_senders.retain(|old| *old != sender);
-        self.recent_senders.push_back(sender);
-        while self.recent_senders.len() > 1024 {
-            if let Some(old) = self.recent_senders.pop_front() {
-                self.sender_names.remove(&old);
-            }
-        }
+        let entry = self.touch_sender(sender);
+        let changed = entry.name.as_ref() != Some(&name);
+        entry.name = Some(name);
         let mut typing_changed = false;
         if changed {
             let chats: Vec<_> = self
@@ -1162,7 +1336,7 @@ impl Store {
                     let name = self
                         .sender_names
                         .get(&action.sender)
-                        .cloned()
+                        .and_then(|entry| entry.name.clone())
                         .unwrap_or_else(|| match action.sender {
                             Sender::Chat(id) => self.chat_title(id),
                             Sender::User(id) => format!("用户 {id}"),
@@ -1273,6 +1447,12 @@ impl Store {
             if let Some(value) = value[field].as_i64() {
                 *target = value;
             }
+        }
+        if let Some(count) = value["unread_mention_count"].as_i64()
+            && chat.mention_count != count
+        {
+            chat.mention_count = count;
+            chat.mentions_requested = false;
         }
         if let Some(id) = value.pointer("/last_message/id").and_then(Value::as_i64) {
             chat.latest_message_id = chat.latest_message_id.max(id);
@@ -1400,29 +1580,54 @@ impl Store {
                 if let Some(user) = user
                     && let Some(id) = user.get("id").and_then(Value::as_i64)
                 {
-                    let name = [
-                        string(user.get("first_name")),
-                        string(user.get("last_name")),
-                    ]
-                    .into_iter()
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                    return self.save_sender(
-                        Sender::User(id),
-                        if name.is_empty() {
-                            if user.pointer("/type/@type").and_then(Value::as_str)
-                                == Some("userTypeDeleted")
-                            {
-                                "已注销账号".into()
-                            } else {
-                                format!("用户 {id}")
-                            }
-                        } else {
-                            name
-                        },
-                    );
+                    return self.apply_user(user, id, true);
                 }
+            }
+            "updateUserStatus" => {
+                return update["user_id"]
+                    .as_i64()
+                    .is_some_and(|id| self.save_status(id, UserStatus::parse(&update["status"])));
+            }
+            "updateBasicGroup" | "updateSupergroup" => {
+                let (group, peer) = if update_kind == "updateBasicGroup" {
+                    (
+                        &update["basic_group"],
+                        ChatPeer::BasicGroup as fn(i64) -> ChatPeer,
+                    )
+                } else {
+                    (
+                        &update["supergroup"],
+                        ChatPeer::Supergroup as fn(i64) -> ChatPeer,
+                    )
+                };
+                let Some(peer) = group["id"].as_i64().map(peer) else {
+                    return false;
+                };
+                let count = group["member_count"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok());
+                let mut changed = false;
+                for chat in self
+                    .chats
+                    .values_mut()
+                    .filter(|chat| chat.peer == Some(peer))
+                {
+                    changed |= chat.member_count != count;
+                    chat.member_count = count;
+                }
+                return changed;
+            }
+            "updateChatOnlineMemberCount" => {
+                return self.chat_mut(update).is_some_and(|chat| {
+                    let count = update["online_member_count"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or_default();
+                    let changed = !chat.online_count_known || chat.online_count != count;
+                    chat.online_count_known = true;
+                    chat.online_count = count;
+                    changed
+                });
             }
             "chat" => {
                 if let Some(id) = update.get("id").and_then(Value::as_i64) {
@@ -1522,7 +1727,11 @@ impl Store {
             }
             "updateChatUnreadMentionCount" => {
                 if let Some(chat) = self.chat_mut(update) {
-                    chat.mention_count = integer(update.get("unread_mention_count"));
+                    let count = integer(update.get("unread_mention_count"));
+                    if chat.mention_count != count {
+                        chat.mentions_requested = false;
+                    }
+                    chat.mention_count = count;
                 }
             }
             "updateChatPosition" => {
@@ -1647,32 +1856,35 @@ impl Store {
                 let chat_id = integer(update.get("chat_id"));
                 let id = integer(update.get("message_id"));
                 if Some(chat_id) == self.active_chat {
+                    let keyboard = (update_kind == "updateMessageEdited")
+                        .then(|| parse_inline_keyboard(update.get("reply_markup")));
                     for message in self
                         .messages
                         .iter_mut()
                         .chain(&mut self.search_results)
                         .filter(|message| message.id == id)
                     {
-                        if update_kind == "updateMessageEdited" {
+                        if let Some(keyboard) = &keyboard {
                             message.info.edited = integer(update.get("edit_date")) > 0;
-                            if let Some(markup) = update.get("reply_markup") {
-                                let keyboard = parse_inline_keyboard(Some(markup));
-                                if !keyboard.is_empty() || message.info.extras.is_some() {
-                                    message.info.extras_mut().inline_keyboard = keyboard;
-                                    message.info.prune_extras();
-                                }
+                            if !keyboard.is_empty() || message.info.extras.is_some() {
+                                message
+                                    .info
+                                    .extras_mut()
+                                    .inline_keyboard
+                                    .clone_from(keyboard);
+                                message.info.prune_extras();
                             }
                         } else {
                             message.info.pinned = update["is_pinned"] == true;
                         }
                     }
-                }
-                if update_kind == "updateMessageEdited"
-                    && Some(chat_id) == self.active_chat
-                    && update.get("reply_markup").is_some()
-                {
-                    trim_messages(&mut self.messages, 6 * 1024 * 1024, false);
-                    trim_messages(&mut self.search_results, 2 * 1024 * 1024, true);
+                    if keyboard
+                        .as_ref()
+                        .is_some_and(|keyboard| !keyboard.is_empty())
+                    {
+                        trim_messages(&mut self.messages, 6 * 1024 * 1024, false);
+                        trim_messages(&mut self.search_results, 2 * 1024 * 1024, true);
+                    }
                 }
                 if update_kind == "updateMessageIsPinned"
                     && let Some(chat) = self.chats.get_mut(&chat_id)
@@ -1902,6 +2114,10 @@ impl Store {
                 pinned: false,
                 muted: integer(value.pointer("/notification_settings/mute_for")) > 0,
                 mention_count: integer(value.get("unread_mention_count")),
+                mentions_requested: false,
+                online_count: 0,
+                online_count_known: false,
+                member_count: None,
                 draft_preview: bounded_text(
                     value.pointer("/draft_message/input_message_text/text/text"),
                     160,
@@ -2402,7 +2618,7 @@ fn caption_prefix(content_kind: &str) -> Option<&'static str> {
         "messageVideo" => "[视频] ",
         "messageDocument" => "[文件] ",
         "messageAudio" => "[音频] ",
-        "messageAnimation" => "[动画] ",
+        "messageAnimation" => "[GIF] ",
         "messageVoiceNote" => "[语音消息] ",
         _ => return None,
     })
@@ -2535,20 +2751,29 @@ fn trim_messages(messages: &mut Vec<Message>, budget: usize, keep_oldest: bool) 
 }
 
 fn media_ref(content: &Value) -> Option<MediaRef> {
-    let detail = if kind(content) == "messagePhoto" {
-        content
+    let detail_file = match kind(content) {
+        "messagePhoto" => content
             .pointer("/photo/sizes")?
             .as_array()?
             .iter()
             .max_by_key(|size| integer(size.get("width")) * integer(size.get("height")).max(1))
-            .and_then(|size| size.get("photo"))
-            .map(|file| MediaFile {
-                file_id: integer(file.get("id")) as i32,
-                path: local_path(file),
-            })
-    } else {
-        None
+            .and_then(|size| size.get("photo")),
+        "messageAnimation" => content.pointer("/animation/animation"),
+        "messageSticker"
+            if content
+                .pointer("/sticker/format/@type")
+                .and_then(Value::as_str)
+                == Some("stickerFormatWebm") =>
+        {
+            content.pointer("/sticker/sticker")
+        }
+        _ => None,
     };
+    let detail = detail_file.map(|file| MediaFile {
+        file_id: integer(file.get("id")) as i32,
+        path: local_path(file),
+    });
+    let no_thumbnail = Value::Null;
     let (kind, file) = match kind(content) {
         "messagePhoto" => {
             let sizes = content.pointer("/photo/sizes")?.as_array()?;
@@ -2562,13 +2787,26 @@ fn media_ref(content: &Value) -> Option<MediaRef> {
         "messageSticker" => {
             let sticker = content.get("sticker")?;
             let format = sticker.pointer("/format/@type").and_then(Value::as_str);
-            let file = if format == Some("stickerFormatWebp") {
-                sticker.get("sticker")?
+            if format == Some("stickerFormatWebm") {
+                (
+                    MediaKind::Animation,
+                    sticker.pointer("/thumbnail/file").unwrap_or(&no_thumbnail),
+                )
             } else {
-                sticker.pointer("/thumbnail/file")?
-            };
-            (MediaKind::Sticker, file)
+                let file = if format == Some("stickerFormatWebp") {
+                    sticker.get("sticker")?
+                } else {
+                    sticker.pointer("/thumbnail/file")?
+                };
+                (MediaKind::Sticker, file)
+            }
         }
+        "messageAnimation" => (
+            MediaKind::Animation,
+            content
+                .pointer("/animation/thumbnail/file")
+                .unwrap_or(&no_thumbnail),
+        ),
         "messageDocument" => (MediaKind::Document, content.pointer("/document/document")?),
         "messageVideo" => (MediaKind::Video, content.pointer("/video/video")?),
         "messageVoiceNote" => (MediaKind::Voice, content.pointer("/voice_note/voice")?),
@@ -2667,7 +2905,7 @@ fn content_text(content: Option<&Value>) -> String {
         "messageVideo" => "[视频] ".into(),
         "messageVoiceNote" => "[语音消息]".into(),
         "messageAudio" => "[音频]".into(),
-        "messageAnimation" => "[动画]".into(),
+        "messageAnimation" => "[GIF]".into(),
         "messageDocument" => format!("[文件] {}", string(content.pointer("/document/file_name"))),
         other if !other.is_empty() => format!("[{other}]"),
         _ => "[未知消息]".into(),
@@ -2812,6 +3050,72 @@ mod tests {
     }
 
     #[test]
+    fn presence_and_group_counts_update_without_extra_user_cache() {
+        let mut store = Store::default();
+        store.add_chat(&json!({"id":1,"type":{"@type":"chatTypePrivate","user_id":5}}));
+        store.add_chat(&json!({"id":2,"type":{"@type":"chatTypeBasicGroup","basic_group_id":6}}));
+        assert!(store.apply(
+            &json!({"@type":"updateUser","user":{"id":5,"first_name":"小林",
+            "status":{"@type":"userStatusOnline","expires":100}}})
+        ));
+        assert!(store.user_status(5).is_online(99));
+        assert!(!store.user_status(5).is_online(100));
+        assert_eq!(store.user_status(5).description(100), "离线");
+        assert!(store.apply(
+            &json!({"@type":"updateUserStatus","user_id":5,"status":{"@type":"userStatusLastWeek"}})
+        ));
+        assert_eq!(store.user_status(5), UserStatus::LastWeek);
+        assert_eq!(
+            store.sender_names[&Sender::User(5)].name.as_deref(),
+            Some("小林")
+        );
+        assert!(
+            store.apply(
+                &json!({"@type":"updateBasicGroup","basic_group":{"id":6,"member_count":128}})
+            )
+        );
+        assert!(store.apply(
+            &json!({"@type":"updateChatOnlineMemberCount","chat_id":2,"online_member_count":14})
+        ));
+        let group = store.chat(2).unwrap();
+        assert_eq!(group.online_count, 14);
+        assert_eq!(store.chat_status_label(group, 100), "128 人 · 14 人在线");
+        for id in 1_000..2_100 {
+            store.apply(&json!({"@type":"updateUserStatus","user_id":id,"status":{"@type":"userStatusRecently"}}));
+        }
+        assert_eq!(store.sender_names.len(), 1024);
+    }
+
+    #[test]
+    fn animation_and_webm_sticker_keep_thumbnail_and_download_main_file() {
+        let mut store = Store {
+            active_chat: Some(1),
+            ..Store::default()
+        };
+        let animation = json!({"id":10,"chat_id":1,"content":{"@type":"messageAnimation",
+            "animation":{"animation":{"id":42},"thumbnail":{"file":{"id":41,"local":{
+                "is_downloading_completed":true,"path":"/cover.jpg"}}}}}});
+        store.apply(&json!({"@type":"updateNewMessage","message":animation}));
+        let message = &store.messages[0];
+        assert_eq!(message.text, "[GIF]");
+        let media = message.media.as_ref().unwrap();
+        assert!(media.kind == MediaKind::Animation);
+        assert_eq!(media.path.as_deref(), Some("/cover.jpg"));
+        assert_eq!(media.detail_file(), (42, None));
+        assert!(store.apply(&json!({"@type":"updateFile","file":{"id":42,"local":{"is_downloading_completed":true,"path":"/clip.mp4"}}})));
+        assert_eq!(
+            store.messages[0].media.as_ref().unwrap().detail_file(),
+            (42, Some("/clip.mp4"))
+        );
+        let sticker = media_ref(&json!({"@type":"messageSticker","sticker":{
+            "format":{"@type":"stickerFormatWebm"},"sticker":{"id":53}}}))
+        .unwrap();
+        assert!(sticker.kind == MediaKind::Animation);
+        assert_eq!(sticker.file_id, 0);
+        assert_eq!(sticker.detail_file(), (53, None));
+    }
+
+    #[test]
     fn edited_messages_refresh_and_remove_inline_markup() {
         let mut store = Store {
             active_chat: Some(1),
@@ -2833,6 +3137,17 @@ mod tests {
             &json!({"@type":"updateMessageEdited","chat_id":1,"message_id":5,"reply_markup":null}),
         );
         assert!(store.messages[0].info.extras().inline_keyboard.is_empty());
+        store.apply(
+            &json!({"@type":"updateMessageEdited","chat_id":1,"message_id":5,
+            "reply_markup":{"@type":"replyMarkupInlineKeyboard","rows":[[
+                {"text":"按钮","type":{"@type":"inlineKeyboardButtonTypeCallback","data":"YQ=="}}
+            ]]}}),
+        );
+        store.apply(
+            &json!({"@type":"updateMessageEdited","chat_id":1,"message_id":5,"edit_date":9}),
+        );
+        assert!(store.messages[0].info.edited);
+        assert!(store.messages[0].info.extras.is_none());
     }
 
     #[test]
@@ -2849,7 +3164,7 @@ mod tests {
             store.apply(&json!({"@type":"message","chat_id":8,"id":index+1,"is_outgoing":true,
                 "forward_info":{"origin":origin},"content":{"@type":"messageText","text":{"text":"hello"}}}));
         }
-        let requests = store.sender_requests();
+        let requests = store.sender_requests(None);
         for sender in [Sender::User(12), Sender::Chat(-10), Sender::Chat(-20)] {
             assert!(requests.iter().any(|(key, _)| *key == sender));
         }
@@ -3049,7 +3364,7 @@ mod tests {
         ]}));
         assert_eq!(store.sender_label(&store.messages[0]), "小林 同学");
         assert_eq!(store.sender_label(&store.messages[2]), "用户 8");
-        let requests = store.sender_requests();
+        let requests = store.sender_requests(None);
         assert_eq!(requests.len(), 2);
         assert!(
             requests
@@ -3062,7 +3377,7 @@ mod tests {
                 .any(|(_, request)| request["@type"] == "getUser" && request["user_id"] == 8)
         );
         assert!(
-            store.sender_requests().is_empty(),
+            store.sender_requests(None).is_empty(),
             "missing senders must not flood requests"
         );
         assert!(store.apply(&json!({"@type":"chat","id":-100,"title":"开发群"})));
@@ -3092,7 +3407,7 @@ mod tests {
         store.apply(&json!({"@type":"updateNewMessage","message":{"id":1,"chat_id":1,"sender_id":{"@type":"messageSenderUser","user_id":1}}}));
         assert!(
             store
-                .sender_requests()
+                .sender_requests(None)
                 .iter()
                 .any(|(_, request)| request["user_id"] == 1)
         );

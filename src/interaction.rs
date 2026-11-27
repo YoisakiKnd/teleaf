@@ -92,6 +92,80 @@ fn open_message_url(app: &mut App, url: &str) -> bool {
     true
 }
 
+pub fn poll_attachments(app: &mut App, worker: &TdWorker) -> bool {
+    let Some(picker) = &mut app.attachments else {
+        return false;
+    };
+    let Some(job) = &picker.preparing else {
+        return false;
+    };
+    let result = match job.result.try_recv() {
+        Ok(result) => result,
+        Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("图片压缩已中断".into()),
+    };
+    picker.preparing = None;
+    match result {
+        Ok(photos) => submit_attachments(app, worker, photos),
+        Err(error) => picker.error = Some(error),
+    }
+    true
+}
+
+fn submit_attachments(
+    app: &mut App,
+    worker: &TdWorker,
+    photos: Vec<crate::attachments::PreparedPhoto>,
+) {
+    let Some(chat) = app.store.active_chat else {
+        return;
+    };
+    let picker = app.attachments.as_mut().unwrap();
+    let mut request = match picker.send_request(chat, &photos) {
+        Ok(request) => request,
+        Err(error) => {
+            picker.error = Some(error);
+            return;
+        }
+    };
+    let tag = app.clipboard.upload_tag();
+    request["@extra"] = serde_json::json!(tag);
+    if send_request(app, worker, request) {
+        let picker = app.attachments.take().unwrap();
+        let mut staged = picker
+            .clipboard_images
+            .into_iter()
+            .filter(|file| request_uses_source(&picker.selected, &photos, &file.path))
+            .collect::<Vec<_>>();
+        staged.extend(photos.into_iter().filter_map(|photo| photo.staged));
+        if !staged.is_empty() {
+            app.clipboard.submitted(tag, staged);
+        }
+        if picker.consume_path_draft {
+            finish_input(app);
+            if app.input_mode == InputMode::Off {
+                app.input_mode = InputMode::Send;
+                app.composer_focus = true;
+            }
+        }
+        app.notice = Some("附件已提交，上传结果见聊天记录".into());
+    }
+}
+
+fn request_uses_source(
+    selected: &[std::path::PathBuf],
+    photos: &[crate::attachments::PreparedPhoto],
+    path: &std::path::Path,
+) -> bool {
+    photos.is_empty()
+        || std::fs::canonicalize(path).is_ok_and(|path| {
+            selected
+                .iter()
+                .zip(photos)
+                .any(|(source, photo)| *source == path && photo.staged.is_none())
+        })
+}
+
 pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
     if app.show_settings
         && matches!(
@@ -130,25 +204,18 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
         }
         Action::Confirm => {
             if app.attachments.is_some() {
-                if let Some(chat) = app.store.active_chat {
-                    match app.attachments.as_ref().unwrap().request(chat) {
-                        Ok(request) => {
-                            if send_request(app, worker, request) {
-                                let consume = app.attachments.as_ref().unwrap().consume_path_draft;
-                                let picker = app.attachments.take().unwrap();
-                                app.clipboard.submitted(picker.clipboard_images);
-                                if consume {
-                                    finish_input(app);
-                                    if app.input_mode == InputMode::Off {
-                                        app.input_mode = InputMode::Send;
-                                        app.composer_focus = true;
-                                    }
-                                }
-                                app.notice = Some("附件已提交，上传结果见聊天记录".into());
-                            }
-                        }
-                        Err(error) => app.attachments.as_mut().unwrap().error = Some(error),
+                let picker = app.attachments.as_mut().unwrap();
+                if picker.preparing.is_some() {
+                    return false;
+                }
+                if picker.photos {
+                    let budget = app.clipboard.budget(&picker.clipboard_images);
+                    match picker.start_preparation(&app.photo_worker_busy, budget) {
+                        Ok(worker) => app.photo_worker = Some(worker),
+                        Err(error) => picker.error = Some(error),
                     }
+                } else {
+                    submit_attachments(app, worker, Vec::new());
                 }
             } else if (app.confirm_delete_many && app.confirm_delete.is_some())
                 || (app.forward_many && app.forward_message.is_some())
@@ -210,10 +277,9 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
                 return submit_composer(app, worker);
             }
         }
-        Action::AttachmentMode => {
+        Action::AttachmentPhotos | Action::AttachmentFiles => {
             if let Some(picker) = &mut app.attachments {
-                picker.photos = !picker.photos;
-                picker.error = None;
+                picker.set_photos(action == Action::AttachmentPhotos);
             }
         }
         Action::PasteClipboard => {
@@ -530,12 +596,11 @@ pub fn perform(app: &mut App, worker: &TdWorker, action: Action) -> bool {
             if app.store.exhausted_lists.contains(&app.store.selected_list) {
                 app.notice = Some("这个分组的会话已全部加载".into());
             } else {
-                send_request(
-                    app,
-                    worker,
-                    actions::load_chat_list(app.store.selected_list),
-                );
+                app.load_chat_list(worker, app.store.selected_list);
             }
+        }
+        Action::ClearMentions => {
+            app.clear_mentions(worker);
         }
         Action::ZoomIn => return app.preview_view.step(1),
         Action::ZoomOut => return app.preview_view.step(-1),
@@ -1312,7 +1377,15 @@ pub fn mouse(app: &mut App, worker: &TdWorker, mouse: MouseEvent) -> bool {
                             .count()
                             .saturating_sub(app.chat_visible),
                     );
-                    before != app.chat_offset
+                    let at_end = app.chat_offset
+                        >= app
+                            .store
+                            .chat_ids()
+                            .count()
+                            .saturating_sub(app.chat_visible);
+                    let loading =
+                        delta > 0 && at_end && app.load_chat_list(worker, app.store.selected_list);
+                    before != app.chat_offset || loading
                 }
                 Some(
                     Target::Action(_)
@@ -1739,6 +1812,7 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
         }
         Target::Cursor(Editor::AttachmentPath, position) => {
             if let Some(picker) = &mut app.attachments {
+                picker.quick_confirm = false;
                 picker.focus = crate::attachments::Focus::Path;
                 picker.path_cursor = position;
             }
@@ -1746,6 +1820,7 @@ fn activate(app: &mut App, worker: &TdWorker, target: Target) -> bool {
         }
         Target::Cursor(Editor::AttachmentCaption, position) => {
             if let Some(picker) = &mut app.attachments {
+                picker.quick_confirm = false;
                 picker.focus = crate::attachments::Focus::Caption;
                 picker.caption_cursor = position;
             }
